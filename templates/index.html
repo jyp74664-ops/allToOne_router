@@ -1553,7 +1553,8 @@
         <div class="provider-card">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 6px; flex-wrap: wrap;">
             <div class="p-name ${(p.provider_status === 'error' || !p.models || p.models.length === 0) ? 'provider-error' : ''}" style="margin-bottom: 0;" title="${(p.provider_status === 'error' ? '上游 API 不可用' : '') + (!p.models || p.models.length === 0 ? (p.provider_status === 'error' ? '；' : '上游模型列表为空') : '')}">${p.name} Configuration</div>
-            <div style="display: flex; gap: 6px; flex-shrink: 0;">
+            <div style="display: flex; gap: 6px; flex-shrink: 0; align-items: center;">
+              ${p.free_only === false ? '<span style="font-size:11px;color:var(--warning);background:rgba(255,204,0,0.15);padding:2px 6px;border-radius:4px;" title="包含收费模型">含收费</span>' : ''}
               <button class="btn" style="padding: 4px 8px; font-size: 11px;" onclick="openModelManager('${p.name}')">⚙️ 模型</button>
               <button class="btn" style="padding: 4px 8px; font-size: 11px;" onclick="openProviderEditor('${p.name}')">✏️ 编辑</button>
               <button class="btn" style="padding: 4px 8px; font-size: 11px; color: var(--danger);" onclick="deleteProvider('${p.name}')">🗑 删除</button>
@@ -2117,6 +2118,7 @@
         const pData = pList.find(p => p.name === provider);
         const currentModels = new Set(pData ? (pData.models || []) : []);
         const disabledModels = new Set(pData ? (pData.disabled_models || []) : []);
+        const freeOnly = pData ? pData.free_only !== false : true;
 
         // 使用 AbortController 控制超时（10秒）
         const controller = new AbortController();
@@ -2149,23 +2151,29 @@
           console.warn('获取稳定性数据失败:', e);
         }
 
+        // 如果获取失败，显示错误信息并返回
+        if (!fetchOk) {
+          document.getElementById('modalStatusText').innerText = fetchError || '远端列表获取失败';
+          document.getElementById('modalModelList').innerHTML = `<div class="empty">⚠️ ${fetchError || '获取模型列表失败'}<br><br>请检查 API Key 是否正确，或稍后重试</div>`;
+          return;
+        }
+
         // 合并已保存的模型
         currentModels.forEach(m => { if (!allModels.includes(m)) allModels.push(m); });
+        
+        // 若未开启"仅免费模型"，则把新获取到的收费模型也默认加入监控列表
+        if (!freeOnly) {
+          allModels.forEach(m => { if (!currentModels.has(m)) currentModels.add(m); });
+        }
         allModels.sort();
 
         // 显示状态信息
-        if (!fetchOk) {
-          document.getElementById('modalStatusText').innerText = fetchError || '远端列表获取失败';
-        } else if (allModels.length === 0) {
-          document.getElementById('modalStatusText').innerText = '暂无可用模型';
-        } else {
-          document.getElementById('modalStatusText').innerText = `共加载了 ${allModels.length} 个模型`;
-        }
-
-        // 渲染模型列表
         if (allModels.length === 0) {
+          document.getElementById('modalStatusText').innerText = '暂无可用模型';
           document.getElementById('modalModelList').innerHTML = '<div class="empty">暂无模型数据<br><br>请检查上游服务是否在线，或手动添加模型</div>';
         } else {
+          document.getElementById('modalStatusText').innerText = `共加载了 ${allModels.length} 个模型`;
+          
           // 按排序列排序（默认按名称升序）
           if (modalSortCol === 'size') {
             allModels.sort((a, b) => {
