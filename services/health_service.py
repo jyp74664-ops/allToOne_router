@@ -326,52 +326,77 @@ async def fetch_models(
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
     url = base_url.rstrip("/") + "/models"
-    headers = {"Authorization": f"Bearer {api_key}"}
     max_retries = 2
     retry_delay = 1.0
     last_error = ""
-    for attempt in range(1, max_retries + 1):
-        try:
-            resp = await client.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                data = resp.json()
-                model_list = data.get("data", data) if isinstance(data, dict) else data
-                if not isinstance(model_list, list):
-                    return []
-                seen: set[str] = set()
-                result: list[str] = []
-                for m in model_list:
-                    if not isinstance(m, dict) or "id" not in m:
-                        continue
-                    raw_id = m["id"]
-                    model_id = raw_id.removeprefix("models/")
-                    if model_id in seen:
-                        continue
-                    seen.add(model_id)
-                    # 过滤非聊天模型
-                    lower = model_id.lower()
-                    non_chat = ["image", "dall-e", "whisper", "tts", "audio", "text-embedding"]
-                    if any(kw in lower for kw in non_chat):
-                        continue
-                    # 免费过滤
-                    if free_only:
-                        pricing = m.get("pricing", {})
-                        try:
-                            if float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0:
-                                continue
-                        except (ValueError, TypeError):
-                            pass
-                    result.append(model_id)
-                return result
-            last_error = f"HTTP {resp.status_code}"
-            logger.warning("fetch_models attempt %d/%d failed for %s: %s", attempt, max_retries, base_url, last_error)
-        except Exception as e:
-            last_error = str(e)
-            logger.warning("fetch_models attempt %d/%d error for %s: %s", attempt, max_retries, base_url, e)
-        if attempt < max_retries:
-            await asyncio.sleep(retry_delay)
-            retry_delay *= 2
-    logger.error("fetch_models failed after %d attempts for %s: %s", max_retries, base_url, last_error)
+    
+    # 尝试两种认证方式：先无认证，再带认证
+    auth_attempts = []
+    if api_key:
+        auth_attempts = [
+            ({}, "no_auth"),
+            ({"Authorization": f"Bearer {api_key}"}, "with_auth"),
+        ]
+    else:
+        auth_attempts = [({}, "no_auth")]
+    
+    for headers, auth_type in auth_attempts:
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await client.get(url, headers=headers or None, timeout=10)
+                logger.info("fetch_models: %s attempt %d, status=%d, auth=%s", base_url, attempt, resp.status_code, auth_type)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    # 兼容不同提供商的响应格式：OpenAI 用 "data"，部分用 "models"
+                    model_list = data.get("data") or data.get("models")
+                    if isinstance(model_list, list):
+                        pass  # 已是列表
+                    elif isinstance(data, list):
+                        model_list = data
+                    else:
+                        model_list = []
+                    if not isinstance(model_list, list):
+                        return []
+                    seen: set[str] = set()
+                    result: list[str] = []
+                    for m in model_list:
+                        if not isinstance(m, dict) or "id" not in m:
+                            continue
+                        raw_id = m["id"]
+                        model_id = raw_id.removeprefix("models/")
+                        if model_id in seen:
+                            continue
+                        seen.add(model_id)
+                        # 过滤非聊天模型
+                        lower = model_id.lower()
+                        non_chat = ["image", "dall-e", "whisper", "tts", "audio", "text-embedding"]
+                        if any(kw in lower for kw in non_chat):
+                            continue
+                        # 免费过滤
+                        if free_only:
+                            pricing = m.get("pricing", {})
+                            try:
+                                if float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0:
+                                    continue
+                            except (ValueError, TypeError):
+                                pass
+                        result.append(model_id)
+                    return result
+                last_error = f"HTTP {resp.status_code} ({auth_type})"
+                logger.warning("fetch_models attempt %d/%d failed for %s: %s", attempt, max_retries, base_url, last_error)
+            except Exception as e:
+                last_error = str(e)
+                logger.warning("fetch_models attempt %d/%d error for %s: %s", attempt, max_retries, base_url, e)
+            if attempt < max_retries:
+                await asyncio.sleep(retry_delay)
+                retry_delay *= 2
+        # 如果无认证失败且有待用的带认证重试，继续尝试
+        if auth_type == "no_auth" and api_key:
+            logger.info("No-auth fetch failed for %s, retrying with auth", base_url)
+            continue
+        break
+    
+    logger.error("fetch_models failed after all attempts for %s: %s", base_url, last_error)
     return []
 
 
