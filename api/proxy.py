@@ -16,7 +16,7 @@ from services.router_manager import ROUTERS
 from services.usage_service import append_usage
 
 logger = logging.getLogger("flowgate.proxy")
-UPSTREAM_TIMEOUT = httpx.Timeout(60.0, connect=10.0)
+UPSTREAM_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
 
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/v1")
