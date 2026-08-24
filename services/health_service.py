@@ -414,7 +414,7 @@ async def run_full_check(on_progress=None) -> dict:
     async with db.SessionLocal() as session:
         providers = (await session.execute(select(Provider))).scalars().all()
     
-    total = sum(len([m for m in (p.models or []) if m not in (p.disabled_models or [])]) for p in providers)
+    total = sum(len(p.models or []) + len(p.disabled_models or []) for p in providers)
     current = 0
     
     logger.info("\033[93m▶ 开始全量健康检测，共 %d 个服务商，%d 个模型\033[0m", len(providers), total)
@@ -423,7 +423,12 @@ async def run_full_check(on_progress=None) -> dict:
         # 记录本次检测中已确认删除的模型，避免重复探测
         already_deleted: set[str] = set()
         for provider in providers:
-            models_to_check = [m for m in (provider.models or []) if m not in (provider.disabled_models or [])]
+            # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测）
+            models_to_check = [
+                m for m in (provider.models or []) + (provider.disabled_models or [])
+                if m not in (provider.disabled_models or []) or True  # 都检查
+            ]
+            models_to_check = list(dict.fromkeys(models_to_check))  # 去重
             logger.info("\033[94m  检测服务商: %s (%d 个模型)\033[0m", provider.name, len(models_to_check))
             
             for model in models_to_check:

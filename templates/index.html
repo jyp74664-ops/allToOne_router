@@ -1581,6 +1581,18 @@
               context_length: ctxLen
             });
           });
+          // 限额型模型也加入监控列表，展示健康状态
+          (p.disabled_models || []).forEach(m => {
+            window.modelEnabledMap[`${p.name}||${m}`] = false;
+            const h = p.health?.[m] || { status: 'unknown' };
+            const d = modelDetails[m] || {};
+            const ctxLen = d.context_length || d.max_model_len || '--';
+            data.push({
+              provider: p.name, model: m, status: h.status || 'unknown',
+              latency_ms: h.latency_ms ?? null, code: h.code ?? null,
+              context_length: ctxLen, _disabled: true
+            });
+          });
         });
 
         // 同步到上游提供商页签
@@ -1883,6 +1895,7 @@
         // 判断是否为无数据/空状态
         const isEmpty = checks === 0;
         const badgeClass = isEmpty ? 'model-provider-badge badge-error' : 'model-provider-badge';
+        const isDisabled = d._disabled;
 
         const detail = modelDetails[d.model] || {};
         const ctxLen = detail.context_length || detail.max_model_len || '--';
@@ -1900,12 +1913,15 @@
           lastStatusHtml = `<span title="上次巡检：等待中..." style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-secondary);margin-left:6px;"></span>`;
         }
 
-        return `<tr>
+        const disabledBadge = isDisabled ? ' <span style="font-size:10px;background:var(--warning);color:#000;padding:1px 5px;border-radius:3px;margin-left:4px;">限额型</span>' : '';
+        const rowStyle = isDisabled ? 'opacity:0.7;' : '';
+
+        return `<tr style="${rowStyle}">
       <td>
         <div class="model-name" style="display: flex; align-items: center;">
           <span class="copy-model-icon" data-model="${d.provider}-${d.model}" title="复制模型名" style="cursor:pointer;margin-right:6px;opacity:0.35;font-size:14px;transition:opacity 0.2s;flex-shrink:0;" onmouseenter="this.style.opacity='1'" onmouseleave="this.style.opacity='0.35'">📋</span>
           <span class="${badgeClass}">${d.provider}</span>
-          <span>${d.model}</span>
+          <span style="${isDisabled ? 'text-decoration:line-through;color:var(--text-secondary);' : ''}">${d.model}</span>${disabledBadge}
           ${lastStatusHtml}
         </div>
         ${descHtml}
@@ -2100,6 +2116,7 @@
         const pList = await rProviders.json();
         const pData = pList.find(p => p.name === provider);
         const currentModels = new Set(pData ? (pData.models || []) : []);
+        const disabledModels = new Set(pData ? (pData.disabled_models || []) : []);
 
         // 使用 AbortController 控制超时（10秒）
         const controller = new AbortController();
@@ -2167,10 +2184,11 @@
           }
           allModelsForModal = allModels;
           currentModelsForModal = currentModels;
+          disabledModelsForModal = disabledModels;
           modalStabilityMapForModal = stabilityMap;
           // 确保 modalSortCol 不为 null（默认按名称排序）
           if (!modalSortCol) modalSortCol = 'model';
-          renderModalModelTable(allModels, currentModels, stabilityMap, provider);
+          renderModalModelTable(allModels, currentModels, disabledModels, stabilityMap, provider);
         }
       } catch (e) {
         if (e.message === 'Unauthorized') return;
@@ -2185,14 +2203,15 @@
           allModels.sort();
           allModelsForModal = allModels;
           currentModelsForModal = currentModels;
+          disabledModelsForModal = disabledModels;
           modalStabilityMapForModal = stabilityMap || {};
-          renderModalModelTable(allModels, currentModels, stabilityMap || {}, provider);
+          renderModalModelTable(allModels, currentModels, disabledModels, stabilityMap || {}, provider);
           document.getElementById('modalStatusText').innerText = `已保存 ${allModels.length} 个模型（远端获取失败）`;
         }
       }
     }
 
-    function renderModalModelTable(allModels, currentModels, stabilityMap, provider) {
+    function renderModalModelTable(allModels, currentModels, disabledModels, stabilityMap, provider) {
       const container = document.getElementById('modalModelList');
       let html = `<table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
@@ -2206,7 +2225,8 @@
         <tbody id="modalModelTableBody">`;
       
       allModels.forEach(m => {
-        const isChecked = currentModels.has(m) ? 'checked' : '';
+        const isDisabled = disabledModels.has(m);
+        const isChecked = !isDisabled && currentModels.has(m) ? 'checked' : '';
         const size = parseModelSize(m);
         const sizeStr = size ? `${size}B` : '--';
         const key = `${provider}||${m}`;
@@ -2224,9 +2244,14 @@
         
         const availStr = checks > 0 ? `${availability.toFixed(1)}% (${ok}/${fail})` : '--';
         
-        html += `<tr style="border-bottom:1px solid var(--mac-border);">
-          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${m}" ${isChecked}></td>
-          <td style="padding:6px 8px;font-weight:500;">${m}</td>
+        const rowStyle = isDisabled ? 'opacity:0.55;' : '';
+        const nameStyle = isDisabled ? 'text-decoration:line-through;color:var(--text-secondary);' : 'font-weight:500;';
+        const badgeHtml = isDisabled ? ' <span style="font-size:10px;background:var(--warning);color:#000;padding:1px 4px;border-radius:3px;margin-left:4px;">限额型</span>' : '';
+        const cbTitle = isDisabled ? 'title="限额型模型，取消勾选后仍会保留在监控列表中"' : '';
+        
+        html += `<tr style="border-bottom:1px solid var(--mac-border);${rowStyle}">
+          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${m}" ${isChecked} ${cbTitle}></td>
+          <td style="padding:6px 8px;${nameStyle}">${m}${badgeHtml}</td>
           <td style="padding:6px 8px;text-align:center;color:var(--text-secondary);">${sizeStr}</td>
           <td style="padding:6px 8px;text-align:center;color:${availColor};font-size:12px;">${availStr}</td>
         </tr>`;
@@ -2277,12 +2302,13 @@
       }
       // 重新渲染
       const selectedModels = new Set([...currentModelsForModal]);
-      renderModalModelTable(sortedModels, selectedModels, modalStabilityMapForModal, currentManagingProvider);
+      renderModalModelTable(sortedModels, selectedModels, disabledModelsForModal || new Set(), modalStabilityMapForModal, currentManagingProvider);
     }
 
     // 全局变量保存当前模态框的模型数据
     let allModelsForModal = [];
     let currentModelsForModal = new Set();
+    let disabledModelsForModal = new Set();
 
     function closeModelManager() {
       document.getElementById('modelModal').classList.remove('show');
@@ -2308,18 +2334,28 @@
 
     function selectAllModels(check) {
       document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        cb.checked = check;
-      });
-    }
+        cb.ccheckedModels = [];
+      document.querySelectorAll('.modal-model-checkbox').forEach(cb => { if (cb.checked) checkedModels.push(cb.value); });
 
-    async function saveModelSelection() {
-      if (!currentManagingProvider) return;
-      const selectedModels = [];
-      document.querySelectorAll('.modal-model-checkbox').forEach(cb => { if (cb.checked) selectedModels.push(cb.value); });
+      // 计算限额型模型：之前启用但现在取消勾选的
+      const disabledList = [];
+      allModelsForModal.forEach(m => {
+        if (!checkedModels.includes(m) && currentModelsForModal.has(m)) {
+          disabledList.push(m);
+        }
+      });
 
       const btn = document.querySelector('#modelModal .btn-primary');
       const originalText = btn.innerText;
       btn.innerText = '保存中...';
+      btn.disabled = true;
+      try {
+        const body = { models: checkedModels };
+        if (disabledList.length > 0) body.disabled_models = disabledList;
+        const res = await apiFetch(`/api/providers/${currentManagingProvider}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body
       btn.disabled = true;
       try {
         const res = await apiFetch(`/api/providers/${currentManagingProvider}`, {
