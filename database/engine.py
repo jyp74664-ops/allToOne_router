@@ -57,7 +57,7 @@ class Database:
         # 迁移 providers
         providers_file = Path(__file__).parent.parent / "providers.json"
         if providers_file.exists():
-            providers = json.loads(providers_file.read_text(encoding="utf-8-sig"))
+            providers = json.loads(providers_file.read_text(encoding="utf-8"))
             svc = ProviderService()
             await svc._get_db()
             for p in providers:

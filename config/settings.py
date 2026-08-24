@@ -28,7 +28,7 @@ class Settings:
             return self._config
         
         if self.config_file.exists():
-            data = json.loads(self.config_file.read_text(encoding="utf-8-sig"))
+            data = json.loads(self.config_file.read_text(encoding="utf-8"))
         else:
             data = {
                 "local_api_key": "sk-local-" + secrets.token_hex(16),
