@@ -130,6 +130,15 @@
       box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.05) inset, 0 25px 50px -12px rgba(0, 0, 0, 0.7);
     }
 
+    .selection-box {
+      position: absolute;
+      border: 1px solid #007aff;
+      background: rgba(0, 122, 255, 0.2);
+      pointer-events: none;
+      z-index: 1000;
+      display: none;
+    }
+
     .mac-titlebar {
       height: 52px;
       display: flex;
@@ -1128,6 +1137,7 @@
 
 
   <div class="toast" id="toast"></div>
+  <div id="selection-box" class="selection-box"></div>
 
   <div class="mac-window">
     <div class="mac-content">
@@ -2987,6 +2997,59 @@
         if (e.message !== 'Unauthorized') { console.error(e); showToast('保存请求错误', 'error'); }
       }
     }
+
+    /* ============ 路由表圈选选择 ============ */
+    let isSelecting = false;
+    let selectionStartX = 0;
+    let selectionStartY = 0;
+    const selectionBox = document.getElementById('selection-box');
+
+    document.addEventListener('mousedown', event => {
+      const modal = document.getElementById('routerModal');
+      const tableBody = document.getElementById('routerModelTableBody');
+      if (!modal?.classList.contains('show') || !tableBody?.contains(event.target)) return;
+      if (event.target.closest('input, button, a, select')) return;
+
+      isSelecting = true;
+      selectionStartX = event.clientX;
+      selectionStartY = event.clientY;
+      selectionBox.style.left = `${selectionStartX}px`;
+      selectionBox.style.top = `${selectionStartY}px`;
+      selectionBox.style.width = '0px';
+      selectionBox.style.height = '0px';
+      selectionBox.style.display = 'block';
+      event.preventDefault();
+    });
+
+    document.addEventListener('mousemove', event => {
+      if (!isSelecting) return;
+      const left = Math.min(selectionStartX, event.clientX);
+      const top = Math.min(selectionStartY, event.clientY);
+      const width = Math.abs(event.clientX - selectionStartX);
+      const height = Math.abs(event.clientY - selectionStartY);
+      selectionBox.style.left = `${left}px`;
+      selectionBox.style.top = `${top}px`;
+      selectionBox.style.width = `${width}px`;
+      selectionBox.style.height = `${height}px`;
+
+      document.querySelectorAll('#routerModelTableBody tr').forEach(row => {
+        const checkbox = row.querySelector('.router-model-cb');
+        if (!checkbox) return;
+        const rect = row.getBoundingClientRect();
+        const overlaps = rect.left < left + width && rect.right > left &&
+          rect.top < top + height && rect.bottom > top;
+        if (overlaps) {
+          checkbox.checked = true;
+          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+    });
+
+    document.addEventListener('mouseup', () => {
+      if (!isSelecting) return;
+      isSelecting = false;
+      selectionBox.style.display = 'none';
+    });
 
     /* ============ 上下文长度 inline 编辑 ============ */
     document.addEventListener('click', e => {
