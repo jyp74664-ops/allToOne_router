@@ -2334,8 +2334,15 @@
 
     function selectAllModels(check) {
       document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        cb.ccheckedModels = [];
-      document.querySelectorAll('.modal-model-checkbox').forEach(cb => { if (cb.checked) checkedModels.push(cb.value); });
+        if (cb.closest('tr').style.display !== 'none') cb.checked = check;
+      });
+    }
+
+    async function saveModelSelection() {
+      const checkedModels = [];
+      document.querySelectorAll('.modal-model-checkbox').forEach(cb => {
+        if (cb.checked) checkedModels.push(cb.value);
+      });
 
       // 计算限额型模型：之前启用但现在取消勾选的
       const disabledList = [];
@@ -2355,13 +2362,7 @@
         const res = await apiFetch(`/api/providers/${currentManagingProvider}`, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(body
-      btn.disabled = true;
-      try {
-        const res = await apiFetch(`/api/providers/${currentManagingProvider}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ models: selectedModels })
+          body: JSON.stringify(body)
         });
         if (res.ok) {
           closeModelManager();
