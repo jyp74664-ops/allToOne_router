@@ -1,0 +1,14 @@
+# FlowGate
+
+## 基于 [Router AI Model Gateway](https://github.com/thy-chan/model-gateway) 衍生
+
+原始项目许可：MIT  
+原始项目作者：thy-chan
+
+本项目在原始项目基础上进行了大幅重构：
+- 架构重构：单文件 → 模块化多文件
+- 存储层：JSON 文件 → SQLite 数据库
+- 新增功能：Webhook 通知、Prometheus 指标、多用户支持
+- 前端：Jinja2 → Vue 3 SPA（开发中）
+
+本项目的开源许可证：MIT
