@@ -3005,9 +3005,19 @@
     const selectionBox = document.getElementById('selection-box');
 
     document.addEventListener('mousedown', event => {
-      const modal = document.getElementById('routerModal');
-      const tableBody = document.getElementById('routerModelTableBody');
-      if (!modal?.classList.contains('show') || !tableBody?.contains(event.target)) return;
+      const routerModal = document.getElementById('routerModal');
+      const modelModal = document.getElementById('modelModal');
+      const routerTableBody = document.getElementById('routerModelTableBody');
+      const modelTableBody = document.getElementById('modalModelTableBody');
+
+      let targetBody = null;
+      if (routerModal?.classList.contains('show') && routerTableBody?.contains(event.target)) {
+        targetBody = routerTableBody;
+      } else if (modelModal?.classList.contains('show') && modelTableBody?.contains(event.target)) {
+        targetBody = modelTableBody;
+      }
+
+      if (!targetBody) return;
       if (event.target.closest('input, button, a, select')) return;
 
       isSelecting = true;
@@ -3032,17 +3042,37 @@
       selectionBox.style.width = `${width}px`;
       selectionBox.style.height = `${height}px`;
 
-      document.querySelectorAll('#routerModelTableBody tr').forEach(row => {
-        const checkbox = row.querySelector('.router-model-cb');
-        if (!checkbox) return;
-        const rect = row.getBoundingClientRect();
-        const overlaps = rect.left < left + width && rect.right > left &&
-          rect.top < top + height && rect.bottom > top;
-        if (overlaps) {
-          checkbox.checked = true;
-          checkbox.dispatchEvent(new Event('change', { bubbles: true }));
-        }
-      });
+      // 1. 处理路由表
+      const routerTableBody = document.getElementById('routerModelTableBody');
+      if (routerTableBody) {
+        document.querySelectorAll('#routerModelTableBody tr').forEach(row => {
+          const checkbox = row.querySelector('.router-model-cb');
+          if (!checkbox) return;
+          const rect = row.getBoundingClientRect();
+          const overlaps = rect.left < left + width && rect.right > left &&
+            rect.top < top + height && rect.bottom > top;
+          if (overlaps) {
+            checkbox.checked = true;
+            checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+      }
+
+      // 2. 处理模型管理表
+      const modelTableBody = document.getElementById('modalModelTableBody');
+      if (modelTableBody) {
+        document.querySelectorAll('#modalModelTableBody tr').forEach(row => {
+          const checkbox = row.querySelector('.modal-model-checkbox');
+          if (!checkbox) return;
+          const rect = row.getBoundingClientRect();
+          const overlaps = rect.left < left + width && rect.right > left &&
+            rect.top < top + height && rect.bottom > top;
+          if (overlaps) {
+            checkbox.checked = true;
+            checkbox.dispatchEvent(new Event('change', { bubbles: true }));
+          }
+        });
+      }
     });
 
     document.addEventListener('mouseup', () => {
