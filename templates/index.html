@@ -2977,16 +2977,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(routersData)
         });
-        // 再清理当前路由组的错误标记
-        try {
-          await apiFetch('/api/health-status/clear-fail-counts', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' }
-          });
-        } catch (_) { /* 清理失败不影响保存 */ }
-        
         if (r.ok) {
-          showToast(`已保存「${selectedRouter}」：${finalModels.length} 个模型，已清除错误标记`, 'ok');
+          showToast(`已保存「${selectedRouter}」：${finalModels.length} 个模型`, 'ok');
           renderRouterModelTable();
         } else {
           showToast('保存失败', 'error');
