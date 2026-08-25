@@ -435,6 +435,10 @@ async def run_full_check(on_progress=None) -> dict:
     from config.settings import settings
     
     meta = ModelMetaService()
+    
+    # 确保数据库已初始化
+    db.get_engine()
+    
     results = {}
     async with db.SessionLocal() as session:
         providers = (await session.execute(select(Provider))).scalars().all()
@@ -465,6 +469,7 @@ async def run_full_check(on_progress=None) -> dict:
                     logger.info("  [跳过] %s | %s (冷却中 %ds)", provider.name, model, remaining)
                     if on_progress:
                         on_progress(provider.name, model, "cooldown", current + 1, total)
+                    current += 1
                     continue
                 
                 # 跳过本次检测中已确认删除的模型（避免重复探测 404）

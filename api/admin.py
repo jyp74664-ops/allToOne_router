@@ -319,7 +319,121 @@ async def check_all(_=Depends(verify_admin)):
                 results = results_task.result()
                 yield f"data: {json.dumps({'done': True, 'results': results}, ensure_ascii=False)}\n\n"
                 break
+            await asyncio.sleep(0.1)
+    
+    return StreamingResponse(generate_progress(), media_type="text/event-stream")
+
+
+@router.post("/check/provider/{name}")
+async def check_provider(name: str, _=Depends(verify_admin)):
+    """仅检查指定提供商的所有模型（流式返回进度）"""
+    from services.health_service import health_state
+    from database.models import Provider
+    from database.engine import db
+    from fastapi.responses import StreamingResponse
+    import json
+    import asyncio
+    
+    # 确保数据库已初始化
+    db.get_engine()
+    
+    # 验证提供商存在
+    async with db.SessionLocal() as session:
+        result = await session.execute(select(Provider).where(Provider.name == name))
+        provider = result.scalar_one_or_none()
+    if not provider:
+        raise HTTPException(404, "未找到该提供商")
+    
+    # 只检查当前提供商的模型
+    async def check_single_provider():
+        """仅检查指定提供商"""
+        from sqlalchemy import select
+        from services.meta_service import ModelMetaService
+        from config.settings import settings
+        import httpx
+        
+        meta = ModelMetaService()
+        results = {}
+        total = len(provider.models or []) + len(provider.disabled_models or [])
+        current = 0
+        
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False) as client:
+            for model in (provider.models or []) + (provider.disabled_models or []):
+                key = f"{provider.name}||{model}"
+                
+                # 检查是否在冷却期内
+                if health_state.is_model_rate_limited(key):
+                    remaining = health_state.get_model_cooldown_remaining(key)
+                    if on_progress:
+                        on_progress(provider.name, model, "cooldown", current + 1, total)
+                    current += 1
+                    continue
+                
+                # 检查是否已标记为 deleted
+                prev_status = health_state.health_status.get(key, {}).get("status")
+                if prev_status == "deleted":
+                    if on_progress:
+                        on_progress(provider.name, model, "deleted", current + 1, total)
+                    current += 1
+                    continue
+                
+                result = await check_model(
+                    client, provider.base_url, provider.api_key, model, meta.aliases
+                )
+                results[key] = result
+                health_state.health_status[key] = result
+                health_state.update_quality(key, result)
+                
+                status = result.get("status", "unknown")
+                
+                if status == "rate_limited":
+                    retry_after = result.get("retry_after")
+                    health_state.record_model_rate_limit(key, retry_after)
+                
+                if status == "deleted":
+                    health_state.failed_models[key] = time.time()
+                
+                if status == "ok":
+                    if prev_status == "deleted":
+                        health_state.failed_models.pop(key, None)
+                    health_state.record_success(key)
+                else:
+                    health_state.record_fail(key)
+                
+                current += 1
+                if on_progress:
+                    on_progress(provider.name, model, status, current, total)
+        
+        return results
+    
+    # 进度回调
+    progress_log = []
+    def on_progress(provider_name, model, status, current, total):
+        if provider_name == name:
+            progress_log.append({
+                "provider": provider_name,
+                "model": model,
+                "status": status,
+                "current": current,
+                "total": total
+            })
+    
+    # 运行检查
+    results_task = asyncio.create_task(check_single_provider())
+    
+    async def generate_progress():
+        """流式输出进度"""
+        last_count = 0
+        while True:
+            if len(progress_log) > last_count:
+                for i in range(last_count, len(progress_log)):
+                    yield f"data: {json.dumps(progress_log[i], ensure_ascii=False)}\n\n"
+                last_count = len(progress_log)
             
+            if results_task.done():
+                results = results_task.result()
+                yield f"data: {json.dumps({'done': True, 'results': results}, ensure_ascii=False)}\n\n"
+                break
             await asyncio.sleep(0.1)
     
     return StreamingResponse(generate_progress(), media_type="text/event-stream")

@@ -62,12 +62,11 @@ def merge_reasoning(obj: dict) -> dict:
         rc = target.pop("reasoning_content", None)
         if rc is None:
             continue
-        wrapped = f""
         c = target.get("content")
         if isinstance(c, str) and c:
-            target["content"] = c + wrapped
+            target["content"] = rc + c
         else:
-            target["content"] = wrapped
+            target["content"] = rc
     return obj
 
 
@@ -236,7 +235,8 @@ async def proxy_chat(request: Request, force: bool = False):
             try:
                 if upstream_body.get("stream"):
                     # 流式响应不能依赖外层 AsyncClient 上下文，响应返回后外层会立即关闭。
-                    stream_client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False)
+                    # 推理模型思考阶段可能长时间无字节输出，read 超时放宽到 600s 避免断流
+                    stream_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0), verify=False)
                     upstream_request = client.build_request(
                         "POST", url, json=upstream_body, headers=headers
                     )
@@ -255,19 +255,30 @@ async def proxy_chat(request: Request, force: bool = False):
 
                     async def stream_response():
                         prefix = f"🍀 {provider.name} - {actual_model}🌿🎋"
-                        prefix_done = False
                         reasoning_open = False
+                        _stream_ok = False  # 标记流是否完整结束
                         try:
+                            # 先发送前缀作为独立的首个 SSE 事件，避免 reasoning 延迟导致前缀不出现在内容开头
+                            first_evt = {
+                                "choices": [{
+                                    "delta": {"role": "assistant", "content": prefix + "\n\n", "reasoning_content": None},
+                                    "index": 0,
+                                    "finish_reason": None,
+                                }],
+                                "model": f"{provider.name} · {actual_model}",
+                            }
+                            yield ("data: " + json.dumps(first_evt, ensure_ascii=False) + "\n\n").encode("utf-8")
                             async for line in upstream.aiter_lines():
                                 if not line:
                                     continue
                                 if not line.startswith("data: "):
-                                    yield (line + "\n").encode("utf-8")
+                                    yield restore_hermes_text(line + "\n").encode("utf-8")
                                     continue
                                 data_str = line[6:]
                                 if data_str.strip() == "[DONE]":
+                                    _stream_ok = True  # 流完整结束，标记成功（在 finally 中记 success）
                                     if reasoning_open:
-                                        yield "data: " + json.dumps({"choices": [{"delta": {"content": "</think>"}, "index": 0}]}, ensure_ascii=False) + "\n\n"
+                                        yield "data: " + json.dumps({"choices": [{"delta": {"content": "</think> "}, "index": 0}]}, ensure_ascii=False) + "\n\n"
                                         reasoning_open = False
                                     yield "data: [DONE]\n\n"
                                     break
@@ -279,34 +290,52 @@ async def proxy_chat(request: Request, force: bool = False):
                                     if choices:
                                         delta = choices[0].get("delta") or {}
                                         rc = delta.pop("reasoning_content", None)
-                                        if rc is not None:
+                                        existing_content = delta.get("content")
+                                        if rc:
                                             if not reasoning_open:
                                                 reasoning_open = True
                                                 rc = "<think> " + rc
-                                            delta["content"] = rc
-                                        elif reasoning_open and delta.get("content") is not None:
+                                            if existing_content is not None:
+                                                # 同一事件里既有 reasoning 又有 content（常见于首包/转正包）：
+                                                # content 是正文开头，直接闭合思考块，避免内容丢失
+                                                reasoning_open = False
+                                                delta["content"] = rc + "</think> " + (existing_content or "")
+                                            else:
+                                                delta["content"] = rc
+                                        elif reasoning_open and existing_content is not None:
+                                            # reasoning 结束后的第一个正文包：补上闭合标记
                                             reasoning_open = False
-                                            delta["content"] = "</think> " + (delta["content"] or "")
-                                    if not prefix_done:
-                                        choices2 = obj.get("choices") or []
-                                        if choices2:
-                                            delta2 = choices2[0].get("delta") or {}
-                                            c = delta2.get("content")
-                                            if isinstance(c, str) and c:
-                                                delta2["content"] = f"{prefix}\n\n{c}"
-                                                prefix_done = True
+                                            delta["content"] = "</think> " + (existing_content or "")
+                                        finish = choices[0].get("finish_reason")
+                                        if finish is not None and reasoning_open:
+                                            # 流已结束但思考块未闭合：补上闭合标记，
+                                            # 防止客户端在收到 finish_reason 后忽略 [DONE] 前的补发事件
+                                            reasoning_open = False
+                                            delta["content"] = "</think> " + (delta.get("content") or "")
                                     out = json.dumps(obj, ensure_ascii=False)
                                     out = restore_hermes_text(out)
                                     yield ("data: " + out + "\n\n").encode("utf-8")
                                 except json.JSONDecodeError:
-                                    yield (line + "\n").encode("utf-8")
+                                    yield restore_hermes_text(line + "\n").encode("utf-8")
+                                except Exception as e:
+                                    # 单个事件处理失败不应中断整个流：透传原始行
+                                    logger.warning("\033[93m⚠ 流式事件处理异常: %s\033[0m", e)
+                                    yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
                             await upstream.aclose()
                             await stream_client.aclose()
+                            if _stream_ok:
+                                health_state.record_success(f"{provider.name}||{requested}")
+                                logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
+                            else:
+                                health_state.record_fail(f"{provider.name}||{requested}")
+                                logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
 
-                    health_state.record_success(f"{provider.name}||{requested}")
-                    logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
-                    return StreamingResponse(stream_response(), media_type="text/event-stream")
+                    return StreamingResponse(
+                        stream_response(),
+                        media_type="text/event-stream",
+                        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+                    )
 
                 response = await client.post(url, json=upstream_body, headers=headers)
                 if response.status_code < 400:
