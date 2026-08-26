@@ -349,17 +349,20 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         """仅检查指定提供商"""
         from sqlalchemy import select
         from services.meta_service import ModelMetaService
+        from services.health_service import UPSTREAM_TIMEOUT
         from config.settings import settings
         import httpx
         
         meta = ModelMetaService()
         results = {}
+        enabled_set = set(provider.models or [])
         total = len(provider.models or []) + len(provider.disabled_models or [])
         current = 0
         
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False) as client:
             for model in (provider.models or []) + (provider.disabled_models or []):
                 key = f"{provider.name}||{model}"
+                is_disabled = model not in enabled_set
                 
                 # 检查是否在冷却期内
                 if health_state.is_model_rate_limited(key):
@@ -393,10 +396,19 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 if status == "deleted":
                     health_state.failed_models[key] = time.time()
                 
+                # 与全量检测(run_full_check)保持一致的计数策略：
+                # - 被禁用的模型：仅记录探测结果，不计入失败/熔断
+                # - deleted(404)/rate_limited(429)：不是稳定性失败，不触发熔断
+                # - 只有真正的 fail/error(5xx/超时/连接错误) 才计失败
                 if status == "ok":
                     if prev_status == "deleted":
                         health_state.failed_models.pop(key, None)
-                    health_state.record_success(key)
+                    if not is_disabled:
+                        health_state.record_success(key)
+                elif is_disabled:
+                    logger.info("  [禁用] %s | %s -> %s (不计入失败)", provider.name, model, status)
+                elif status in ("deleted", "rate_limited"):
+                    logger.info("  [跳过计数] %s | %s -> %s", provider.name, model, status)
                 else:
                     health_state.record_fail(key)
                 

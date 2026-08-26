@@ -452,16 +452,16 @@ async def run_full_check(on_progress=None) -> dict:
         # 记录本次检测中已确认删除的模型，避免重复探测
         already_deleted: set[str] = set()
         for provider in providers:
-            # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测）
-            models_to_check = [
-                m for m in (provider.models or []) + (provider.disabled_models or [])
-                if m not in (provider.disabled_models or []) or True  # 都检查
-            ]
-            models_to_check = list(dict.fromkeys(models_to_check))  # 去重
+            # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测，
+            # 以便后台能看到被禁用模型的上游状态；但它们不参与路由，
+            # 探测结果不应计入熔断/失败计数，避免污染 provider 状态）
+            enabled_set = set(provider.models or [])
+            models_to_check = list(dict.fromkeys((provider.models or []) + (provider.disabled_models or [])))
             logger.info("\033[94m  检测服务商: %s (%d 个模型)\033[0m", provider.name, len(models_to_check))
             
             for model in models_to_check:
                 key = f"{provider.name}||{model}"
+                is_disabled = model not in enabled_set
                 
                 # 检查是否在冷却期内（429 限速后跳过）
                 if health_state.is_model_rate_limited(key):
@@ -512,7 +512,15 @@ async def run_full_check(on_progress=None) -> dict:
                     if prev_status == "deleted":
                         already_deleted.discard(key)
                         logger.info("  [恢复] %s | %s -> ok (取消 deleted 标记)", provider.name, model)
-                    health_state.record_success(key)
+                    if not is_disabled:
+                        health_state.record_success(key)
+                elif is_disabled:
+                    # 被禁用的模型：仅记录探测结果，不计入失败/熔断
+                    logger.info("  [禁用] %s | %s -> %s (不计入失败)", provider.name, model, status)
+                elif status in ("deleted", "rate_limited"):
+                    # 404 下架 / 429 限速不是稳定性失败：不计入熔断，
+                    # 避免每轮全量检测把熔断器打爆（下架模型本来就不会被路由选中）
+                    logger.info("  [跳过计数] %s | %s -> %s", provider.name, model, status)
                 else:
                     health_state.record_fail(key)
                 

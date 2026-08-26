@@ -227,6 +227,10 @@ async def proxy_chat(request: Request, force: bool = False):
         for provider, actual_model, requested in candidates:
             upstream_body = dict(body)
             upstream_body["model"] = normalize_model_name(actual_model)
+            # 若是流式：默认请求上游返回 usage（部分上游需显式要求 stream_options.include_usage）
+            # 客户端已带 stream_options 则透传，不再覆盖
+            if upstream_body.get("stream") and not isinstance(upstream_body.get("stream_options"), dict):
+                upstream_body["stream_options"] = {"include_usage": True}
             url = provider.base_url.rstrip("/") + "/chat/completions"
             headers = {
                 "Authorization": f"Bearer {provider.api_key}",
@@ -257,8 +261,10 @@ async def proxy_chat(request: Request, force: bool = False):
                         prefix = f"🍀 {provider.name} - {actual_model}🌿🎋"
                         reasoning_open = False
                         _stream_ok = False  # 标记流是否完整结束
+                        usage_obj = None     # 上游返回的 usage 对象（部分上游只在 [DONE] 前带）
+
                         try:
-                            # 先发送前缀作为独立的首个 SSE 事件，避免 reasoning 延迟导致前缀不出现在内容开头
+                            # 前缀作为流的第一个事件发出（独立首包），始终顶格在开头
                             first_evt = {
                                 "choices": [{
                                     "delta": {"role": "assistant", "content": prefix + "\n\n", "reasoning_content": None},
@@ -286,32 +292,40 @@ async def proxy_chat(request: Request, force: bool = False):
                                     obj = json.loads(data_str)
                                     if "model" in obj and isinstance(obj["model"], str):
                                         obj["model"] = f"{provider.name} · {actual_model}"
+                                    # 捕获上游 usage（部分上游只在最后一个事件带，这里一直更新为最新值）
+                                    if isinstance(obj.get("usage"), dict):
+                                        usage_obj = obj["usage"]
                                     choices = obj.get("choices") or []
                                     if choices:
                                         delta = choices[0].get("delta") or {}
                                         rc = delta.pop("reasoning_content", None)
-                                        existing_content = delta.get("content")
-                                        if rc:
+                                        # 兼容字段名 reasoning（Aion 等上游用 reasoning 而非 reasoning_content）
+                                        if rc is None and "reasoning" in delta:
+                                            rc = delta.pop("reasoning", None)
+                                        # 兼容 reasoning_details 数组（Kilo Code/nemotron 等上游）。
+                                        # 无论 rc 是否已取，都 pop 掉防止透传给客户端；仅在 rc 为空时累积。
+                                        rd = delta.pop("reasoning_details", None)
+                                        if rc is None and rd is not None:
+                                            if isinstance(rd, list):
+                                                rc = "".join(
+                                                    str(item.get("text", "")) if isinstance(item, dict) else str(item)
+                                                    for item in rd
+                                                )
+                                            elif isinstance(rd, str):
+                                                rc = rd
+                                        if rc is not None:
+                                            # 思考增量：首包加 <think> 标记，后续直接裸拼（不重复加标签）
                                             if not reasoning_open:
                                                 reasoning_open = True
                                                 rc = "<think> " + rc
-                                            if existing_content is not None:
-                                                # 同一事件里既有 reasoning 又有 content（常见于首包/转正包）：
-                                                # content 是正文开头，直接闭合思考块，避免内容丢失
-                                                reasoning_open = False
-                                                delta["content"] = rc + "</think> " + (existing_content or "")
-                                            else:
-                                                delta["content"] = rc
-                                        elif reasoning_open and existing_content is not None:
-                                            # reasoning 结束后的第一个正文包：补上闭合标记
-                                            reasoning_open = False
-                                            delta["content"] = "</think> " + (existing_content or "")
-                                        finish = choices[0].get("finish_reason")
-                                        if finish is not None and reasoning_open:
-                                            # 流已结束但思考块未闭合：补上闭合标记，
-                                            # 防止客户端在收到 finish_reason 后忽略 [DONE] 前的补发事件
+                                            delta["content"] = rc
+                                        elif reasoning_open and delta.get("content") is not None:
+                                            # 正文开始：闭合思考块
                                             reasoning_open = False
                                             delta["content"] = "</think> " + (delta.get("content") or "")
+                                        elif reasoning_open:
+                                            # 思考中但本包无内容：忽略
+                                            pass
                                     out = json.dumps(obj, ensure_ascii=False)
                                     out = restore_hermes_text(out)
                                     yield ("data: " + out + "\n\n").encode("utf-8")
@@ -327,6 +341,18 @@ async def proxy_chat(request: Request, force: bool = False):
                             if _stream_ok:
                                 health_state.record_success(f"{provider.name}||{requested}")
                                 logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
+                                # 记录流式用量：上游 usage 可能在最后一个 chunk 里，不限 stream_options.include_usage
+                                if usage_obj:
+                                    try:
+                                        await append_usage(
+                                            provider=provider.name,
+                                            model=requested,
+                                            prompt_tokens=usage_obj.get("prompt_tokens", 0) or 0,
+                                            completion_tokens=usage_obj.get("completion_tokens", 0) or 0,
+                                            total_tokens=usage_obj.get("total_tokens", 0) or 0,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(f"Failed to record stream usage: {e}")
                             else:
                                 health_state.record_fail(f"{provider.name}||{requested}")
                                 logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
@@ -365,15 +391,24 @@ async def proxy_chat(request: Request, force: bool = False):
                     return JSONResponse(result, status_code=response.status_code)
                 last_error = f"{provider.name}: HTTP {response.status_code}"
                 logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
-                # 仅对限流状态码才记录失败并尝试下一候选；其他错误直接报错
+                # 限流(429/503/403)才记录失败并尝试下一候选；
+                # 其他错误（400/401/404/500 等）说明请求本身或上游配置有问题，
+                # 换候选也没用，直接把上游错误透传给客户端，避免误判“候选不可用”
                 if response.status_code in RATE_LIMIT_STATUS_CODES:
                     health_state.record_fail(f"{provider.name}||{requested}")
                     if health_state.check_rate_limit(provider.name):
                         logger.info("\033[93m⏸ %s 处于限速冷却，跳过\033[0m", provider.name)
-                        continue
-                else:
-                    health_state.record_fail(f"{provider.name}||{requested}")
-                continue
+                    continue
+                # 非限流错误：记录失败（不参与下一候选），直接透传上游错误
+                health_state.record_fail(f"{provider.name}||{requested}")
+                try:
+                    detail = response.json().get("error", {}).get("message") or response.text[:300]
+                except Exception:
+                    detail = response.text[:300]
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"上游错误 ({provider.name}): {detail}",
+                )
             except httpx.HTTPError as exc:
                 last_error = f"{provider.name}: {exc}"
                 logger.warning("\033[91m✗ 失败: %s · %s (%s)\033[0m", provider.name, actual_model, exc)

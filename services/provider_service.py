@@ -24,13 +24,27 @@ class ProviderService:
         self.db = _db
     
     async def list_all(self) -> list[dict]:
-        """列出所有提供商"""
+        """列出所有提供商（含实时健康状态）"""
+        from services.health_service import health_state
         async with self.db.SessionLocal() as session:
             providers = await session.execute(
                 select(Provider).order_by(Provider.created_at.desc())
             )
             result = []
             for p in providers.scalars().all():
+                # 附加每个模型的实时健康状态，供前端监控页展示
+                health = {}
+                for m in (p.models or []) + (p.disabled_models or []):
+                    key = f"{p.name}||{m}"
+                    st = health_state.health_status.get(key, {})
+                    if st:
+                        health[m] = {
+                            "status": st.get("status", "unknown"),
+                            "code": st.get("code"),
+                            "latency_ms": st.get("latency_ms"),
+                            "prompt_tokens": st.get("prompt_tokens", 0),
+                            "completion_tokens": st.get("completion_tokens", 0),
+                        }
                 result.append({
                     "id": p.id,
                     "name": p.name,
@@ -40,6 +54,7 @@ class ProviderService:
                     "disabled_models": p.disabled_models or [],
                     "free_only": p.free_only,
                     "provider_status": p.provider_status,
+                    "health": health,
                     "created_at": p.created_at.isoformat(),
                 })
             return result

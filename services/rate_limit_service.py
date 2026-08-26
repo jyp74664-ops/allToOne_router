@@ -145,7 +145,10 @@ async def sync_rate_limits(client: httpx.AsyncClient, meta_service) -> dict:
                     new_limits[model] = found
                     matched += 1
     
-    # 写入 meta
+    # 写入 meta（仅当本次确实匹配到了模型，避免空结果覆盖已有配置）
+    if not new_limits:
+        logger.warning("rate-limit sync: 0 个模型匹配到上游速率限制，保留现有配置不覆盖")
+        return {"ok": True, "matched": 0, "total_providers": len(data.get("providers", [])), "skipped": True}
     meta = meta_service._meta
     meta["rate_limits"] = new_limits
     meta_service._save_meta()
