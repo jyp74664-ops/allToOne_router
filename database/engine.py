@@ -24,7 +24,25 @@ class Database:
         self.db_path = data_dir / "flowgate.db"
         self.engine = None
         self.SessionLocal = None
-    
+
+    @staticmethod
+    def _suppress_aisqlite_noise(record: logging.LogRecord) -> bool:
+        """过滤 aiosqlite/NullPool 在请求取消时产生的无害日志噪音。
+        
+        场景：请求被客户端取消 → asyncio.CancelledError 传播到连接关闭/回滚阶段
+              → SQLAlchemy pool 记录 ERROR，实际不影响任何数据。
+        """
+        msg = str(record.getMessage())
+        # 消息文本直接匹配
+        if "CancelledError" in msg or "Connection closed" in msg:
+            return False
+        # exc_info=True 时异常对象在 record.exc_info 里，文本里未必有 "Cancel"
+        if record.exc_info and record.exc_info[1] is not None:
+            exc_type = type(record.exc_info[1]).__name__
+            if "cancel" in exc_type.lower():
+                return False
+        return True
+
     def get_engine(self):
         """获取异步引擎（延迟初始化）"""
         if self.engine is None:
@@ -36,6 +54,11 @@ class Database:
                 # 因连接被 asyncio.CancelledError 终止而打印 ERROR 日志
                 poolclass=NullPool,
             )
+            # 静默 aiosqlite 在请求取消时的无害 ERROR 日志
+            _pool_logger = logging.getLogger("sqlalchemy.pool")
+            _pool_logger.addFilter(self._suppress_aisqlite_noise)
+            _db_logger = logging.getLogger("aiosqlite")
+            _db_logger.addFilter(self._suppress_aisqlite_noise)
             self.SessionLocal = async_sessionmaker(
                 self.engine, class_=AsyncSession, expire_on_commit=False
             )
