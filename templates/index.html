@@ -1502,7 +1502,7 @@
       if (token) {
         options.headers = Object.assign({}, options.headers || {}, { 'Authorization': 'Bearer ' + token });
       }
-      const r = await fetch(url, options);
+      const r = await fetch(url, Object.assign({}, options, { cache: 'no-store' }));
       if (r.status === 401) {
         clearToken();
         showGate();
@@ -2777,9 +2777,9 @@
     }
 
     function selectRouter(name) {
+      if (!name) return;  // 忽略占位符选项
       selectedRouter = name;
       initRouterPending();
-      document.getElementById('routerSelect').value = name;
       renderRouterModelTable();
     }
 
@@ -2878,7 +2878,9 @@
 
     function initRouterPending() {
       // 把已保存的裸模型名还原为 provider||model 唯一键（同名多 provider 全展开，互不干扰）
-      const savedNames = routersData[selectedRouter] || [];
+      // 兼容两种格式：纯数组（文件存储）和 {"models": [...], "alias": ...}（数据库存储）
+      const raw = routersData[selectedRouter] || [];
+      const savedNames = Array.isArray(raw) ? raw : (raw && raw.models ? raw.models : []);
       routerPending = new Set();
       const nameSet = new Set(savedNames);
       stabilityData.forEach(d => {
@@ -2898,7 +2900,9 @@
         if (checked) routerPending.add(cb.value);
         else routerPending.delete(cb.value);
       });
-      renderRouterModelTable();
+      // 直接同步渲染，避免等待 health-status 请求导致的延迟
+      _doRenderRouterTable();
+      updateRouterSelectedCount();
     }
 
     function onRouterModelToggle(cb) {
@@ -2906,7 +2910,9 @@
       if (!selectedRouter) return;
       if (cb.checked) routerPending.add(cb.value);
       else routerPending.delete(cb.value);
-      renderRouterModelTable();
+      // 直接同步渲染，避免等待 health-status 请求导致的延迟
+      _doRenderRouterTable();
+      updateRouterSelectedCount();
     }
 
     function updateRouterSelectedCount() {

@@ -80,7 +80,7 @@ class RouterService:
         async with db.SessionLocal() as session:
             result = await session.execute(select(RouterGroup))
             routers = result.scalars().all()
-            return {r.name: r.models for r in routers}
+        return {r.name: {"models": r.models, "alias": r.alias} for r in routers}
     
     async def get(self, name: str) -> Optional[dict]:
         """按名称获取路由组"""
@@ -96,8 +96,9 @@ class RouterService:
                 return None
             return {"name": r.name, "models": r.models}
     
-    async def create(self, name: str, models: list) -> dict:
+    async def create(self, name: str, models: list, alias: str = None) -> dict:
         """创建路由组"""
+        global ROUTERS
         from database.engine import db
         from database.models import RouterGroup
         
@@ -109,13 +110,15 @@ class RouterService:
             if existing.scalar_one_or_none():
                 raise ValueError(f"路由组 '{name}' 已存在")
             
-            r = RouterGroup(name=name, models=models)
+            r = RouterGroup(name=name, models=models, alias=alias)
             session.add(r)
             await session.commit()
-            return {"name": name, "models": models}
+            ROUTERS[name] = {"models": models, "alias": alias}
+            return {"name": name, "models": models, "alias": alias}
     
     async def delete(self, name: str) -> bool:
         """删除路由组"""
+        global ROUTERS
         from database.engine import db
         from database.models import RouterGroup
         
@@ -128,19 +131,45 @@ class RouterService:
                 return False
             await session.delete(r)
             await session.commit()
+            ROUTERS.pop(name, None)
             return True
     
     async def save_all(self, routers: dict) -> None:
-        """批量保存路由组（全量替换）"""
+        """批量保存路由组（全量替换）
+        
+        routers 格式支持两种：
+          1. {"name": ["model1", "model2"]}   （旧格式，别名留空）
+          2. {"name": {"models": [...], "alias": "xxx"}} （新格式）
+        """
         global ROUTERS
         from database.engine import db
         from database.models import RouterGroup
         
+        parsed = {}
+        for name, value in routers.items():
+            if isinstance(value, list):
+                parsed[name] = {"models": value, "alias": None}
+            elif isinstance(value, dict):
+                parsed[name] = {
+                    "models": value.get("models", []),
+                    "alias": value.get("alias"),
+                }
+        
         async with db.SessionLocal() as session:
-            # 清空现有路由组
             await session.execute(RouterGroup.__table__.delete())
-            # 插入新路由组
-            for name, models in routers.items():
-                session.add(RouterGroup(name=name, models=models))
+            for name, info in parsed.items():
+                session.add(RouterGroup(
+                    name=name, models=info["models"], alias=info["alias"]
+                ))
             await session.commit()
-        ROUTERS = routers
+        ROUTERS = parsed
+    
+    async def get_aliases(self) -> dict:
+        """返回 {alias: name} 映射（仅含非空别名）"""
+        from database.engine import db
+        from database.models import RouterGroup
+        
+        async with db.SessionLocal() as session:
+            result = await session.execute(select(RouterGroup))
+            rows = result.scalars().all()
+        return {r.alias: r.name for r in rows if r.alias}

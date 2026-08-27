@@ -12,7 +12,6 @@ import httpx
 
 from config.settings import settings
 from services.health_service import health_state, RATE_LIMIT_STATUS_CODES
-from services.router_manager import ROUTERS
 from services.usage_service import append_usage
 
 logger = logging.getLogger("flowgate.proxy")
@@ -118,7 +117,7 @@ def ensure_lang_reply(body: dict) -> dict:
     if not isinstance(msgs, list) or not msgs:
         return body
     lang = detect_user_lang(msgs)
-    hint = LANG_HINTS['zh']
+    hint = LANG_HINTS[lang]
     first = msgs[0]
     if isinstance(first, dict) and first.get("role") == "system":
         c = first.get("content")
@@ -130,24 +129,33 @@ def ensure_lang_reply(body: dict) -> dict:
     return body
 
 
-# 路由组英文名称映射（客户端常用英文名 -> 数据库中的中文名）
-ROUTER_NAME_ALIAS = {
-    "daily-general-fast": "日常通用 / 快速响应 / 低成本",
-    "daily-general": "日常通用 / 快速响应 / 低成本",
-    "image-analysis": "图文分析 / 视觉任务",
-    "visual-task": "图文分析 / 视觉任务",
-    "chinese-long-context": "中文长文本 / 角色扮演 / 复杂对话",
-    "roleplay": "中文长文本 / 角色扮演 / 复杂对话",
-    "lin-ruoxi": "林若曦",
-    "speed": "速度型选手",
-    "large-model": "超大模型",
-    "my-auto-model": "MyAutoModel",
-}
+async def normalize_router_name(name: str) -> str:
+    """规范化路由组名称，支持英文别名（直接从数据库查询）"""
+    if not isinstance(name, str) or not name.strip():
+        return name
+    from database.engine import db
+    from database.models import RouterGroup
+    async with db.SessionLocal() as session:
+        result = await session.execute(
+            select(RouterGroup).where(
+                (RouterGroup.name == name) |
+                (RouterGroup.alias == name)
+            )
+        )
+        row = result.scalar_one_or_none()
+    return row.name if row else name
 
 
-def normalize_router_name(name: str) -> str:
-    """规范化路由组名称，支持英文别名"""
-    return ROUTER_NAME_ALIAS.get(name.lower().strip(), name)
+@router.get("/routers/aliases")
+async def get_router_aliases():
+    """返回路由组别名映射 {alias: chinese_name}，供客户端使用"""
+    from database.engine import db
+    from database.models import RouterGroup
+    async with db.SessionLocal() as session:
+        result = await session.execute(select(RouterGroup))
+        rows = result.scalars().all()
+    aliases = {r.alias: r.name for r in rows if r.alias}
+    return {"object": "list", "data": aliases}
 
 
 @router.api_route("/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
@@ -157,8 +165,8 @@ async def proxy_chat(request: Request, force: bool = False):
     body = compress_hermes(body)
     body = ensure_lang_reply(body)
     requested_model = body.get("model")
-    # 规范化路由组名称（支持英文别名）
-    requested_model = normalize_router_name(requested_model)
+    # 规范化路由组名称（支持英文别名，直接从数据库查询）
+    requested_model = await normalize_router_name(requested_model)
     
     if not isinstance(requested_model, str) or not requested_model:
         raise HTTPException(400, "请求缺少 model")
@@ -248,13 +256,23 @@ async def proxy_chat(request: Request, force: bool = False):
                     if upstream.status_code >= 400:
                         last_error = f"{provider.name}: HTTP {upstream.status_code}"
                         logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, upstream.status_code)
+                        # 记录失败
+                        health_state.record_fail(f"{provider.name}||{requested}")
+                        # 所有错误都尝试下一候选（包括限流和其他错误）
+                        try:
+                            _body = await upstream.aread()
+                            detail = _body.decode("utf-8", errors="replace")
+                            try:
+                                import json as _json
+                                detail = _json.loads(_body).get("error", {}).get("message") or detail[:300]
+                            except Exception:
+                                detail = detail[:300]
+                        except Exception:
+                            detail = ""
                         await upstream.aclose()
                         await stream_client.aclose()
-                        # 记录失败并尝试下一候选
-                        health_state.record_fail(f"{provider.name}||{requested}")
-                        if upstream.status_code in RATE_LIMIT_STATUS_CODES:
-                            if health_state.check_rate_limit(provider.name):
-                                logger.info("\033[93m⏸ %s 处于限速冷却，跳过\033[0m", provider.name)
+                        # 记录错误详情供日志使用，然后尝试下一候选
+                        logger.warning("\033[91m✗ 上游错误: %s · %s · %s\033[0m", provider.name, actual_model, detail[:200])
                         continue
 
                     async def stream_response():
@@ -331,11 +349,17 @@ async def proxy_chat(request: Request, force: bool = False):
                                     yield ("data: " + out + "\n\n").encode("utf-8")
                                 except json.JSONDecodeError:
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
-                                except Exception as e:
+                                except (ValueError, TypeError, KeyError) as e:
                                     # 单个事件处理失败不应中断整个流：透传原始行
                                     logger.warning("\033[93m⚠ 流式事件处理异常: %s\033[0m", e)
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
+                            # 流中断时，如果思考块未闭合，先闭合再关闭连接
+                            if reasoning_open and not _stream_ok:
+                                try:
+                                    yield "data: " + json.dumps({"choices": [{"delta": {"content": "═══ "}}, {"index": 0}]}, ensure_ascii=False) + "\n\n"
+                                except Exception:
+                                    pass
                             await upstream.aclose()
                             await stream_client.aclose()
                             if _stream_ok:
@@ -364,14 +388,29 @@ async def proxy_chat(request: Request, force: bool = False):
                     )
 
                 response = await client.post(url, json=upstream_body, headers=headers)
+                try:
+                    response_json = response.json()
+                except json.JSONDecodeError:
+                    # 响应不是有效的JSON格式
+                    last_error = f"{provider.name}: 非JSON响应"
+                    logger.warning("\033[91m✗ 失败: %s · %s (非JSON响应)\033[0m", provider.name, actual_model)
+                    health_state.record_fail(f"{provider.name}||{requested}")
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"上游响应格式错误 ({provider.name}): {response.text[:300]}"
+                    )
+                
                 if response.status_code < 400:
-                    result = merge_reasoning(response.json())
+                    result = merge_reasoning(response_json)
                     if isinstance(result, dict) and result.get("error"):
                         error_detail = result["error"]
                         last_error = f"{provider.name}: {error_detail}"
                         logger.warning("\033[91m✗ 失败: %s · %s (响应包含 error)\033[0m", provider.name, actual_model)
                         health_state.record_fail(f"{provider.name}||{requested}")
-                        continue
+                        raise HTTPException(
+                            status_code=response.status_code,
+                            detail=f"上游响应错误 ({provider.name}): {error_detail}"
+                        )
                     health_state.record_success(f"{provider.name}||{requested}")
                     logger.info("\033[32m✓ 成功: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
                     result.setdefault("model", f"{provider.name} · {actual_model}")
@@ -391,24 +430,11 @@ async def proxy_chat(request: Request, force: bool = False):
                     return JSONResponse(result, status_code=response.status_code)
                 last_error = f"{provider.name}: HTTP {response.status_code}"
                 logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
-                # 限流(429/503/403)才记录失败并尝试下一候选；
-                # 其他错误（400/401/404/500 等）说明请求本身或上游配置有问题，
-                # 换候选也没用，直接把上游错误透传给客户端，避免误判“候选不可用”
-                if response.status_code in RATE_LIMIT_STATUS_CODES:
-                    health_state.record_fail(f"{provider.name}||{requested}")
-                    if health_state.check_rate_limit(provider.name):
-                        logger.info("\033[93m⏸ %s 处于限速冷却，跳过\033[0m", provider.name)
-                    continue
-                # 非限流错误：记录失败（不参与下一候选），直接透传上游错误
+                # 记录失败并尝试下一候选（含400等继续尝试下一候选）
                 health_state.record_fail(f"{provider.name}||{requested}")
-                try:
-                    detail = response.json().get("error", {}).get("message") or response.text[:300]
-                except Exception:
-                    detail = response.text[:300]
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"上游错误 ({provider.name}): {detail}",
-                )
+                if health_state.check_rate_limit(provider.name):
+                    logger.info("\033[93m⏸ %s 处于限速冷却，跳过\033[0m", provider.name)
+                continue
             except httpx.HTTPError as exc:
                 last_error = f"{provider.name}: {exc}"
                 logger.warning("\033[91m✗ 失败: %s · %s (%s)\033[0m", provider.name, actual_model, exc)
@@ -420,7 +446,7 @@ async def proxy_chat(request: Request, force: bool = False):
 @router.get("/models", dependencies=[Depends(verify_client)])
 async def proxy_models():
     """返回可用模型列表"""
-    from database.models import Provider
+    from database.models import Provider, RouterGroup
     from database.engine import db
     from services.meta_service import ModelMetaService
     from services.health_service import health_state
@@ -428,17 +454,18 @@ async def proxy_models():
     models_list = []
     meta = ModelMetaService()
     
-    # 路由组
-    for router_name in ROUTERS:
-        models_list.append({
-            "id": router_name,
-            "object": "model",
-            "owned_by": "FlowGate",
-            "available": True,
-        })
-    
     # 数据库中的提供商
     async with db.SessionLocal() as session:
+        # 路由组（从数据库读取，与 /chat/completions 一致，动态增删改实时生效）
+        router_result = await session.execute(select(RouterGroup))
+        for r in router_result.scalars().all():
+            models_list.append({
+                "id": r.name,
+                "object": "model",
+                "owned_by": "FlowGate",
+                "available": True,
+            })
+        
         providers = await session.execute(select(Provider))
         for p in providers.scalars().all():
             disabled = set(p.disabled_models or [])

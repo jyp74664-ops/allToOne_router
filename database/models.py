@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import Optional
 from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, JSON, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,6 +42,7 @@ class RouterGroup(Base):
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     name: Mapped[str] = mapped_column(String(100), unique=True)
+    alias: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     models: Mapped[list] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
 
@@ -100,3 +102,15 @@ class Announcement(Base):
     content: Mapped[str] = mapped_column(Text)
     fetched_at: Mapped[datetime] = mapped_column(DateTime)
     source_url: Mapped[str] = mapped_column(String(500), nullable=True)
+
+
+class Webhook(Base):
+    """Webhook 配置"""
+    __tablename__ = "webhooks"
+    
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    url: Mapped[str] = mapped_column(String(500))
+    events: Mapped[list] = mapped_column(JSON, default=list)
+    secret: Mapped[str] = mapped_column(String(200), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

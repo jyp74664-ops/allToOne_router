@@ -1,5 +1,6 @@
 """FlowGate - 高性能 AI 模型网关"""
 import logging
+import time
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -79,7 +80,25 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# 请求日志中间件：合并 uvicorn access log 与业务成功日志
+access_logger = logging.getLogger("flowgate.access")
+
+async def log_request_middleware(request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    client_info = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
+    query = request.url.query
+    full_path = f"{request.url.path}?{query}" if query else request.url.path
+    access_logger.info(
+        '%s - "%s %s HTTP/1.1" %d %.3fs',
+        client_info, request.method, full_path, response.status_code, process_time
+    )
+    return response
+
+
 # CORS
+app.middleware("http")(log_request_middleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -118,13 +137,13 @@ def render_dashboard() -> str:
 @app.get("/", response_class=HTMLResponse)
 async def root() -> str:
     """返回管理面板"""
-    return render_dashboard()
+    return HTMLResponse(render_dashboard(), headers={"Cache-Control": "no-store"})
 
 
 @app.get("/templates/index.html", response_class=HTMLResponse)
 async def dashboard_template() -> str:
     """兼容旧地址并返回已渲染的管理面板"""
-    return render_dashboard()
+    return HTMLResponse(render_dashboard(), headers={"Cache-Control": "no-store"})
 
 
 if __name__ == "__main__":
@@ -135,4 +154,5 @@ if __name__ == "__main__":
         port=8777,
         reload=False,
         log_level="info",
+        access_log=False,
     )

@@ -134,18 +134,24 @@ class HealthState:
         """记录一次失败"""
         self.failed_models[key] = time.time()
         cb = self.circuit_breaker.setdefault(key, {"fails": 0, "open_until": 0})
+        was_open = cb.get("open_until", 0) > time.time()
         cb["fails"] += 1
         if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
             cb["open_until"] = time.time() + CIRCUIT_RECOVERY_SECONDS
             logger.warning("circuit opened: %s", key)
+            if not was_open:
+                _schedule_notify("model.failed", {"key": key, "reason": "circuit_breaker_opened"})
     
     def record_success(self, key: str) -> None:
         """记录一次成功"""
         self.failed_models.pop(key, None)
         cb = self.circuit_breaker.get(key)
         if cb:
+            was_open = cb.get("open_until", 0) > time.time()
             cb["fails"] = 0
             cb["open_until"] = 0
+            if was_open:
+                _schedule_notify("model.recovered", {"key": key})
     
     def update_quality(self, key: str, info: dict) -> None:
         """更新模型质量滑动窗口"""
@@ -209,6 +215,19 @@ class HealthState:
 
 # 全局状态
 health_state = HealthState()
+
+
+def _schedule_notify(event: str, data: dict) -> None:
+    """在当前事件循环中异步调度 Webhook 通知（无循环或导入失败时静默忽略）。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    try:
+        from api.webhooks import notify_webhooks
+    except Exception:
+        return
+    loop.create_task(notify_webhooks(event, data))
 
 
 def normalize_model_name(model: str) -> str:

@@ -4,13 +4,14 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy import select
 import httpx
 
 from config.settings import settings
-from services.health_service import health_state, check_model, fetch_models
+from services.health_service import check_model, fetch_models, health_state
 from services.provider_service import ProviderService
 from services.router_manager import RouterService
 from services.usage_service import (
@@ -222,7 +223,6 @@ async def sync_all_free_models(_=Depends(verify_admin)):
     async with httpx.AsyncClient(timeout=30, verify=False) as client:
         results = await svc.sync_free_models(
             client, ModelMetaService().aliases, ModelMetaService().context_limits,
-            health_state.health_status,
         )
     return {"ok": True, "results": results}
 
@@ -234,7 +234,10 @@ async def sync_all_free_models(_=Depends(verify_admin)):
 async def get_routers(_=Depends(verify_admin)):
     """获取所有路由组"""
     svc = RouterService()
-    return {"ok": True, "data": await svc.list_all()}
+    return JSONResponse(
+        {"ok": True, "data": await svc.list_all()},
+        headers={"Cache-Control": "no-store"},
+    )
 
 
 @router.post("/routers")
@@ -244,6 +247,13 @@ async def save_routers(request: Request, _=Depends(verify_admin)):
     svc = RouterService()
     await svc.save_all(body)
     return {"ok": True}
+
+
+@router.get("/routers/aliases")
+async def get_router_aliases(_=Depends(verify_admin)):
+    """返回路由组别名映射 {alias: chinese_name}"""
+    svc = RouterService()
+    return JSONResponse({"ok": True, "data": await svc.get_aliases()})
 
 
 @router.delete("/routers/{name}")
@@ -267,7 +277,7 @@ async def manual_check(name: str, model: str, _=Depends(verify_admin)):
     
     async with db.SessionLocal() as session:
         result = await session.execute(
-            Provider.__table__.select().where(Provider.name == name)
+            select(Provider).where(Provider.name == name)
         )
         p = result.scalar_one_or_none()
         if not p:
@@ -467,7 +477,6 @@ async def get_auto_validate(_=Depends(verify_admin)):
 @router.post("/auto-validate")
 async def set_auto_validate(body: AutoValidateIn, _=Depends(verify_admin)):
     """设置自动验证开关"""
-    global app_config
     cfg = settings.load()
     cfg.auto_validate = bool(body.enabled)
     settings.save(cfg)
@@ -525,6 +534,7 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
 async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     """获取稳定性统计"""
     from services.usage_service import read_health_history
+    from services.health_service import health_state
     records = await read_health_history(hours)
     
     model_stats = {}
@@ -588,7 +598,7 @@ async def get_model_details(_=Depends(verify_admin)):
     from database.engine import db
     
     async with db.SessionLocal() as session:
-        result = await session.execute(ModelMeta.__table__.select())
+        result = await session.execute(select(ModelMeta))
         for m in result.scalars().all():
             merged[m.model_id] = {
                 "context_length": m.context_length,
