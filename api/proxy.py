@@ -331,12 +331,19 @@ async def proxy_chat(request: Request, force: bool = False):
                                                 )
                                             elif isinstance(rd, str):
                                                 rc = rd
-                                        if rc is not None:
+                                        if rc:
                                             # 思考增量：首包加 <think> 标记，后续直接裸拼（不重复加标签）
                                             if not reasoning_open:
                                                 reasoning_open = True
                                                 rc = "<think> " + rc
-                                            delta["content"] = rc
+                                            # 保留同包中的正文 content（部分上游过渡包同时带 reasoning_content 和 content）
+                                            orig_content = delta.get("content")
+                                            if orig_content:
+                                                # 过渡包：思考结束 + 正文开始，拼接后闭合思考块
+                                                delta["content"] = rc + "\n\n🍀 " + orig_content
+                                                reasoning_open = False
+                                            else:
+                                                delta["content"] = rc
                                         elif reasoning_open and delta.get("content") is not None:
                                             # 正文开始：闭合思考块
                                             reasoning_open = False
