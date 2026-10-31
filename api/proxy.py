@@ -302,7 +302,7 @@ async def proxy_chat(request: Request, force: bool = False):
                                 if data_str.strip() == "[DONE]":
                                     _stream_ok = True  # 流完整结束，标记成功（在 finally 中记 success）
                                     if reasoning_open:
-                                        yield "data: " + json.dumps({"choices": [{"delta": {"content": "</think> "}, "index": 0}]}, ensure_ascii=False) + "\n\n"
+                                        yield "data: " + json.dumps({"choices": [{"delta": {"content": "</think>"}, "index": 0}]}, ensure_ascii=False) + "\n\n"
                                         reasoning_open = False
                                     yield "data: [DONE]\n\n"
                                     break
@@ -345,9 +345,13 @@ async def proxy_chat(request: Request, force: bool = False):
                                             else:
                                                 delta["content"] = rc
                                         elif reasoning_open and delta.get("content") is not None:
-                                            # 正文开始：闭合思考块
+                                            # 正文开始：闭合思考块；如果后面有正文内容才换行，否则不变
                                             reasoning_open = False
-                                            delta["content"] = "</think> " + (delta.get("content") or "")
+                                            content = delta.get("content") or ""
+                                            if content:
+                                                delta["content"] = "</think>\r\n" + content
+                                            else:
+                                                delta["content"] = "</think>"
                                         elif reasoning_open:
                                             # 思考中但本包无内容：忽略
                                             pass
