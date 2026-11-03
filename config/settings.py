@@ -10,6 +10,7 @@ class AppConfig(BaseModel):
     local_api_key: str = ""
     auto_validate: bool = False
     auto_validate_interval: int = 1800
+    merge_reasoning: bool = True
     announcement_url: Optional[str] = None
 
 
@@ -34,6 +35,7 @@ class Settings:
                 "local_api_key": "sk-local-" + secrets.token_hex(16),
                 "auto_validate": False,
                 "auto_validate_interval": 1800,
+                "merge_reasoning": True,
             }
             self._atomic_write(self.config_file, json.dumps(data, indent=2))
         

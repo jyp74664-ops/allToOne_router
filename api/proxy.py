@@ -161,6 +161,8 @@ async def get_router_aliases():
 @router.api_route("/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
 async def proxy_chat(request: Request, force: bool = False):
     """代理聊天补全请求"""
+    # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
+    merge_reasoning_enabled = bool(settings.load().merge_reasoning)
     body = await request.json()
     body = compress_hermes(body)
     body = ensure_lang_reply(body)
@@ -314,7 +316,7 @@ async def proxy_chat(request: Request, force: bool = False):
                                     if isinstance(obj.get("usage"), dict):
                                         usage_obj = obj["usage"]
                                     choices = obj.get("choices") or []
-                                    if choices:
+                                    if choices and merge_reasoning_enabled:
                                         delta = choices[0].get("delta") or {}
                                         rc = delta.pop("reasoning_content", None)
                                         # 兼容字段名 reasoning（Aion 等上游用 reasoning 而非 reasoning_content）
@@ -412,7 +414,7 @@ async def proxy_chat(request: Request, force: bool = False):
                     )
                 
                 if response.status_code < 400:
-                    result = merge_reasoning(response_json)
+                    result = merge_reasoning(response_json) if merge_reasoning_enabled else response_json
                     if isinstance(result, dict) and result.get("error"):
                         error_detail = result["error"]
                         last_error = f"{provider.name}: {error_detail}"

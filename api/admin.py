@@ -223,6 +223,7 @@ async def sync_all_free_models(_=Depends(verify_admin)):
     async with httpx.AsyncClient(timeout=30, verify=False) as client:
         results = await svc.sync_free_models(
             client, ModelMetaService().aliases, ModelMetaService().context_limits,
+            health_state.health_status,
         )
     return {"ok": True, "results": results}
 
@@ -485,6 +486,22 @@ async def set_auto_validate(body: AutoValidateIn, _=Depends(verify_admin)):
         "enabled": cfg.auto_validate,
         "interval": cfg.auto_validate_interval,
     }
+
+
+@router.get("/merge-reasoning")
+async def get_merge_reasoning(_=Depends(verify_admin)):
+    """获取推理内容合并开关状态"""
+    return {"enabled": bool(settings.load().merge_reasoning)}
+
+
+@router.post("/merge-reasoning")
+async def set_merge_reasoning(body: AutoValidateIn, _=Depends(verify_admin)):
+    """设置推理内容合并开关"""
+    cfg = settings.load()
+    cfg.merge_reasoning = bool(body.enabled)
+    settings.save(cfg)
+    logger.info("merge_reasoning set to %s", cfg.merge_reasoning)
+    return {"enabled": cfg.merge_reasoning}
 
 
 # ============================================================
