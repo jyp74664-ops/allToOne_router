@@ -51,21 +51,23 @@ def restore_hermes_text(text: str) -> str:
 
 def merge_reasoning(obj: dict) -> dict:
     """合并 reasoning_content"""
+    if not isinstance(obj, dict):
+        return obj
     choices = obj.get("choices")
     if not choices or not isinstance(choices, list):
         return obj
     for choice in choices:
+        if not isinstance(choice, dict):
+            continue
         target = choice.get("delta") or choice.get("message")
         if not target or not isinstance(target, dict):
             continue
         rc = target.pop("reasoning_content", None)
-        if rc is None:
+        if not isinstance(rc, str) or not rc:
             continue
         c = target.get("content")
         if isinstance(c, str) and c:
             target["content"] = rc + c
-        else:
-            target["content"] = rc
     return obj
 
 
@@ -163,7 +165,12 @@ async def proxy_chat(request: Request, force: bool = False):
     """代理聊天补全请求"""
     # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
     merge_reasoning_enabled = bool(settings.load().merge_reasoning)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "请求体必须是有效的 JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
     body = compress_hermes(body)
     body = ensure_lang_reply(body)
     requested_model = body.get("model")
@@ -183,7 +190,7 @@ async def proxy_chat(request: Request, force: bool = False):
             select(RouterGroup).where(RouterGroup.name == requested_model)
         )
         router = router_result.scalar_one_or_none()
-        wanted_models = router.models if router else [requested_model]
+        wanted_models = router.models if router and isinstance(router.models, list) else [requested_model]
         provider_result = await session.execute(select(Provider))
         providers = provider_result.scalars().all()
 
@@ -251,10 +258,14 @@ async def proxy_chat(request: Request, force: bool = False):
                     # 流式响应不能依赖外层 AsyncClient 上下文，响应返回后外层会立即关闭。
                     # 推理模型思考阶段可能长时间无字节输出，read 超时放宽到 600s 避免断流
                     stream_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0), verify=False)
-                    upstream_request = client.build_request(
-                        "POST", url, json=upstream_body, headers=headers
-                    )
-                    upstream = await stream_client.send(upstream_request, stream=True)
+                    try:
+                        upstream_request = client.build_request(
+                            "POST", url, json=upstream_body, headers=headers
+                        )
+                        upstream = await stream_client.send(upstream_request, stream=True)
+                    except BaseException:
+                        await stream_client.aclose()
+                        raise
                     if upstream.status_code >= 400:
                         last_error = f"{provider.name}: HTTP {upstream.status_code}"
                         logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, upstream.status_code)
@@ -315,9 +326,16 @@ async def proxy_chat(request: Request, force: bool = False):
                                     # 捕获上游 usage（部分上游只在最后一个事件带，这里一直更新为最新值）
                                     if isinstance(obj.get("usage"), dict):
                                         usage_obj = obj["usage"]
-                                    choices = obj.get("choices") or []
-                                    if choices and merge_reasoning_enabled:
-                                        delta = choices[0].get("delta") or {}
+                                    if not isinstance(obj, dict):
+                                        yield restore_hermes_text(line + "\n").encode("utf-8")
+                                        continue
+                                    choices = obj.get("choices")
+                                    if (isinstance(choices, list) and choices
+                                            and isinstance(choices[0], dict) and merge_reasoning_enabled):
+                                        delta = choices[0].get("delta")
+                                        if not isinstance(delta, dict):
+                                            delta = {}
+                                            choices[0]["delta"] = delta
                                         rc = delta.pop("reasoning_content", None)
                                         # 兼容字段名 reasoning（Aion 等上游用 reasoning 而非 reasoning_content）
                                         if rc is None and "reasoning" in delta:
@@ -333,19 +351,16 @@ async def proxy_chat(request: Request, force: bool = False):
                                                 )
                                             elif isinstance(rd, str):
                                                 rc = rd
-                                        if rc:
+                                        orig_content = delta.get("content")
+                                        if isinstance(rc, str) and rc and isinstance(orig_content, str) and orig_content:
                                             # 思考增量：首包加 <think> 标记，后续直接裸拼（不重复加标签）
                                             if not reasoning_open:
                                                 reasoning_open = True
                                                 rc = "<think> " + rc
                                             # 保留同包中的正文 content（部分上游过渡包同时带 reasoning_content 和 content）
-                                            orig_content = delta.get("content")
-                                            if orig_content:
-                                                # 过渡包：思考结束 + 正文开始，拼接后闭合思考块
-                                                delta["content"] = rc + "\n\n🍀 " + orig_content
-                                                reasoning_open = False
-                                            else:
-                                                delta["content"] = rc
+                                            # 过渡包：只在确有正文时合并 reasoning，避免空正文暴露 reasoning
+                                            delta["content"] = rc + "\n\n🍀 " + orig_content
+                                            reasoning_open = False
                                         elif reasoning_open and delta.get("content") is not None:
                                             # 正文开始：闭合思考块；如果后面有正文内容才换行，否则不变
                                             reasoning_open = False
@@ -362,17 +377,11 @@ async def proxy_chat(request: Request, force: bool = False):
                                     yield ("data: " + out + "\n\n").encode("utf-8")
                                 except json.JSONDecodeError:
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
-                                except (ValueError, TypeError, KeyError) as e:
+                                except (ValueError, TypeError, KeyError, AttributeError) as e:
                                     # 单个事件处理失败不应中断整个流：透传原始行
                                     logger.warning("\033[93m⚠ 流式事件处理异常: %s\033[0m", e)
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
-                            # 流中断时，如果思考块未闭合，先闭合再关闭连接
-                            if reasoning_open and not _stream_ok:
-                                try:
-                                    yield "data: " + json.dumps({"choices": [{"delta": {"content": "═══ "}}, {"index": 0}]}, ensure_ascii=False) + "\n\n"
-                                except Exception:
-                                    pass
                             await upstream.aclose()
                             await stream_client.aclose()
                             if _stream_ok:
@@ -403,15 +412,18 @@ async def proxy_chat(request: Request, force: bool = False):
                 response = await client.post(url, json=upstream_body, headers=headers)
                 try:
                     response_json = response.json()
-                except json.JSONDecodeError:
-                    # 响应不是有效的JSON格式
+                except (json.JSONDecodeError, ValueError):
+                    # 响应不是有效的 JSON，记录后尝试下一个候选
                     last_error = f"{provider.name}: 非JSON响应"
                     logger.warning("\033[91m✗ 失败: %s · %s (非JSON响应)\033[0m", provider.name, actual_model)
                     health_state.record_fail(f"{provider.name}||{requested}")
-                    raise HTTPException(
-                        status_code=response.status_code,
-                        detail=f"上游响应格式错误 ({provider.name}): {response.text[:300]}"
-                    )
+                    continue
+
+                if not isinstance(response_json, dict):
+                    last_error = f"{provider.name}: JSON响应顶层不是对象"
+                    logger.warning("\033[91m✗ 失败: %s · %s (JSON顶层不是对象)\033[0m", provider.name, actual_model)
+                    health_state.record_fail(f"{provider.name}||{requested}")
+                    continue
                 
                 if response.status_code < 400:
                     result = merge_reasoning(response_json) if merge_reasoning_enabled else response_json
