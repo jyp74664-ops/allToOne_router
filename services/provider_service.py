@@ -149,7 +149,7 @@ class ProviderService:
         """启用/禁用模型"""
         async with self.db.SessionLocal() as session:
             result = await session.execute(
-                Provider.__table__.select().where(Provider.name == name)
+                select(Provider).where(Provider.name == name)
             )
             p = result.scalar_one_or_none()
             if not p:
@@ -176,7 +176,7 @@ class ProviderService:
         """从上游拉取可用模型列表"""
         async with self.db.SessionLocal() as session:
             result = await session.execute(
-                Provider.__table__.select().where(Provider.name == name)
+                select(Provider).where(Provider.name == name)
             )
             p = result.scalar_one_or_none()
             if not p:
@@ -193,7 +193,7 @@ class ProviderService:
         """批量同步所有提供商的免费模型"""
         results = []
         async with self.db.SessionLocal() as session:
-            providers = await session.execute(Provider.__table__.select())
+            providers = await session.execute(select(Provider))
             for p in providers.scalars().all():
                 models = await _fetch_models(
                     client, p.base_url, p.api_key, True, aliases, context_limits

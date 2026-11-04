@@ -82,8 +82,11 @@ def _request_to_chat(body: dict) -> dict:
         if source in body:
             result[target] = body[source]
     reasoning = body.get("reasoning")
-    if isinstance(reasoning, dict) and isinstance(reasoning.get("effort"), str):
-        result["reasoning_effort"] = reasoning["effort"]
+    if isinstance(reasoning, dict):
+        if isinstance(reasoning.get("effort"), str):
+            result["reasoning_effort"] = reasoning["effort"]
+        if isinstance(reasoning.get("summary"), str):
+            result["reasoning_summary"] = reasoning["summary"]
     if isinstance(result.get("tools"), list):
         converted = []
         for tool in result["tools"]:
@@ -337,9 +340,18 @@ async def _stream_to_responses(upstream: StreamingResponse, model: str):
     saw_done = False
     reasoning_chars = 0
     stream_error = None
+    MAX_BUFFER_SIZE = 1024 * 1024  # 1MB 上限，防止无换行符导致 buffer 无限增长
+    # 前缀过滤状态：proxy 会在流式第一个事件预置 "🍀 {provider} - {model}🌿🎋\n\n"，
+    # 可能被分割到多个 chunk，需跨 chunk 累积后再过滤。
+    prefix_buffer = ""
+    prefix_done = False
     try:
         async for chunk in upstream.body_iterator:
             buffer += chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+            # 防御：若 buffer 超过上限且仍无换行符，强制截断避免内存泄漏
+            if len(buffer) > MAX_BUFFER_SIZE and "\n" not in buffer:
+                logger.warning("Responses stream buffer exceeded %d bytes without newline, truncating: model=%s", MAX_BUFFER_SIZE, model)
+                buffer = buffer[-MAX_BUFFER_SIZE:]
             while "\n" in buffer:
                 line, buffer = buffer.split("\n", 1)
                 if not line.startswith("data: "):
@@ -377,8 +389,21 @@ async def _stream_to_responses(upstream: StreamingResponse, model: str):
                 if not isinstance(fragment, str) or not fragment:
                     continue
                 # The existing proxy prepends a provider banner to each chat stream; omit it from API text.
-                if not text and fragment.startswith("🍀 ") and "🌿🎋\n\n" in fragment:
-                    fragment = fragment.split("🌿🎋\n\n", 1)[1]
+                # 可能被分割到多个 chunk，需跨 chunk 累积后再过滤。
+                if not text and not prefix_done:
+                    prefix_buffer += fragment
+                    if prefix_buffer.startswith("🍀 ") and "🌿🎋\n\n" in prefix_buffer:
+                        idx = prefix_buffer.find("🌿🎋\n\n")
+                        fragment = prefix_buffer[idx + len("🌿🎋\n\n"):]
+                        prefix_done = True
+                    else:
+                        # 尚未看到完整前缀，继续等待；防止无限累积
+                        if len(prefix_buffer) > 200:
+                            prefix_done = True
+                            fragment = prefix_buffer
+                            prefix_buffer = ""
+                        else:
+                            continue
                 if not fragment:
                     continue
                 text += fragment

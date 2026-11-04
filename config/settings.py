@@ -41,6 +41,11 @@ class Settings:
         
         self._config = AppConfig(**data)
         return self._config
+
+    def reload(self) -> AppConfig:
+        """重新从磁盘加载配置，用于运行时热更新"""
+        self._config = None
+        return self.load()
     
     def save(self, config: AppConfig) -> None:
         """持久化配置"""
