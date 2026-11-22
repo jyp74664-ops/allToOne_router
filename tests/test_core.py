@@ -591,3 +591,66 @@ def test_pricing_is_free_prefers_is_free_flag():
     assert model_pricing_is_paid({"id": "paid", "pricing": {"prompt": "0.000002",
                                                            "completion": "0.000004"}}) is True
     assert model_pricing_is_paid({"id": "no-pricing"}) is False
+
+
+def test_speed_test_rejects_unchecked_models(initialized_db, local_client):
+    """测速只测已勾选的模型：请求里带未勾选模型时，若一个都不剩就返回 400 说清原因。"""
+    from database import engine as engine_mod
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="sp-guard", base_url="https://x/v1", api_key="k",
+                           models=["checked-a"], disabled_models=["unchecked-b"],
+                           retired_models=[], free_models=[], free_only=False,
+                           check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.post(
+        "/api/speed-test/start",
+        json={"items": [{"provider": "sp-guard", "model": "unchecked-b"}]},
+    )
+    assert r.status_code == 400, r.text
+    assert "勾选" in r.text
+
+
+def test_stability_exposes_real_speed(initialized_db, local_client):
+    """真实测速结果要出现在 /api/stability 的 ttft_ms / real_tps 上。
+
+    HealthRecord（探针）与 SpeedRecord（测速）是两套数据，不能互相污染。
+    """
+    from datetime import datetime
+    from database import engine as engine_mod
+    from database.models import HealthRecord, SpeedRecord
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(HealthRecord(provider_name="p2", model="m2", status="ok", code=200,
+                               latency_ms=500, prompt_tokens=5, completion_tokens=5,
+                               detail=""))
+            s.add(SpeedRecord(run_id="r1", provider_name="p2", model="m2", status="ok",
+                              ttft_ms=350, decode_tps=42.5, overall_tps=30.1,
+                              output_tokens=128, decode_ms=3000, wall_ms=3350,
+                              estimated=False, tested_at=datetime.now()))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.get("/api/stability?hours=24")
+    assert r.status_code == 200, r.text
+    row = next(x for x in r.json() if x["provider"] == "p2" and x["model"] == "m2")
+    assert row["ttft_ms"] == 350
+    assert row["real_tps"] == 42.5
+    assert row["speed_estimated"] is False
+    assert row["speed_tested_at"] is not None
+    # 探针口径的旧字段仍然存在，只是前端不再展示
+    assert row["tokens_per_sec"] == 10.0
+
+
+def test_speed_test_status_unknown_run(local_client):
+    """查询不存在的测速任务应返回 404，而不是空对象。"""
+    r = local_client.get("/api/speed-test/status?run_id=nope")
+    assert r.status_code == 404

@@ -657,15 +657,32 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
 @router.get("/stability")
 async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     """获取稳定性统计"""
+    from datetime import datetime, timedelta
     from services.usage_service import read_health_history
     from services.health_service import health_state, explain_status
-    from database.models import Provider
+    from database.models import Provider, SpeedRecord
     from database.engine import db
     records = await read_health_history(hours)
     # 已永久移除的模型不再出现在统计列表
     async with db.SessionLocal() as s:
         retired_provs = (await s.execute(select(Provider))).scalars().all()
+    # 最近 7 天的真实测速结果（每个 provider+model 取最新一条）。
+    # 单独一个 session + try：测速表缺失或查询失败不应该把整个监控页拖垮。
+    try:
+        async with db.SessionLocal() as s2:
+            speed_rows = (await s2.execute(
+                select(SpeedRecord)
+                .where(SpeedRecord.tested_at >= datetime.now() - timedelta(days=7))
+                .order_by(SpeedRecord.tested_at.desc())
+                .limit(3000)
+            )).scalars().all()
+    except Exception as e:
+        logger.warning("读取测速记录失败（speed_records 可能尚未创建）：%s", e)
+        speed_rows = []
     retired_keys = {f"{p.name}||{m}" for p in retired_provs for m in (p.retired_models or [])}
+    speed_map = {}
+    for r in speed_rows:
+        speed_map.setdefault(f"{r.provider_name}||{r.model}", r)
     
     model_stats = {}
     for rec in records:
@@ -699,6 +716,8 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
         tps = None
         if s["completion_tokens"] > 0 and s["ok_total_ms"] > 0:
             tps = round(s["completion_tokens"] / (s["ok_total_ms"] / 1000), 2)
+        sp = speed_map.get(key)
+        speed_ok = sp is not None and sp.status == "ok"
         result.append({
             "provider": name,
             "model": model,
@@ -711,6 +730,13 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "min_latency_ms": min(s["latencies"]) if s["latencies"] else None,
             "max_latency_ms": max(s["latencies"]) if s["latencies"] else None,
             "tokens_per_sec": tps,
+            # 真实测速结果（流式 128 token，手动触发才更新；未测过为 None）
+            "ttft_ms": sp.ttft_ms if speed_ok else None,
+            "real_tps": sp.decode_tps if speed_ok else None,
+            "speed_overall_tps": sp.overall_tps if speed_ok else None,
+            "speed_estimated": bool(sp.estimated) if speed_ok else False,
+            "speed_tested_at": sp.tested_at.timestamp() if sp is not None and hasattr(sp.tested_at, "timestamp") else None,
+            "speed_error": ((sp.error or "")[:120] if sp is not None and not speed_ok else ""),
             "last_status": health_state.health_status.get(key, {}).get("status", "unknown"),
         })
         latest = health_state.health_status.get(key, {})
@@ -771,6 +797,95 @@ async def get_check_log(_=Depends(verify_admin)):
         if r.slot in out:
             out[r.slot] = pack(r)
     return out
+
+
+# ============================================================
+# 真实生成速度测速（流式，手动触发）
+# ============================================================
+class SpeedTestIn(BaseModel):
+    items: Optional[list] = None      # [{provider, model}, ...]
+    max_tokens: int = 128
+
+
+@router.post("/speed-test/start")
+async def start_speed_test(body: SpeedTestIn, _=Depends(verify_admin)):
+    """启动一次真实生成速度测速。
+
+    口径与检测一致：只测「已勾选（provider.models）且未关闭检测」的模型，其余跳过并计数。
+    任务在后台跑，前端用 /speed-test/status 轮询进度。
+    """
+    from database.models import Provider
+    from database.engine import db
+    from services import speed_service
+
+    raw = body.items or []
+    if not raw:
+        raise HTTPException(400, "没有要测速的模型：请先筛选表格，再点测速")
+
+    try:
+        max_tokens = max(16, min(512, int(body.max_tokens or 128)))
+    except (TypeError, ValueError):
+        max_tokens = 128
+
+    async with db.SessionLocal() as session:
+        providers = {p.name: p for p in (await session.execute(select(Provider))).scalars().all()}
+
+    picked: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    skipped = 0
+    for it in raw:
+        if not isinstance(it, dict):
+            skipped += 1
+            continue
+        name = str(it.get("provider") or "").strip()
+        model = str(it.get("model") or "").strip()
+        p = providers.get(name)
+        if not p or not model:
+            skipped += 1
+            continue
+        if getattr(p, "check_enabled", True) is False:
+            skipped += 1  # 已关闭检测的提供商不测，避免烧额度
+            continue
+        if model not in (p.models or []):
+            skipped += 1  # 未勾选参与路由的模型不测
+            continue
+        key = (name, model)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(key)
+
+    if not picked:
+        raise HTTPException(
+            400,
+            "所选模型都不在「已勾选」范围内：测速只测模型管理里勾选过的模型，"
+            "请先在「⚙️ 模型」里勾选，或调整表格筛选条件",
+        )
+    if len(picked) > speed_service.MAX_ITEMS:
+        skipped += len(picked) - speed_service.MAX_ITEMS
+        picked = picked[: speed_service.MAX_ITEMS]
+
+    run_id = speed_service.create_run(picked, max_tokens, skipped)
+    logger.info("speed test %s started: %d models, max_tokens=%d, skipped=%d",
+                run_id, len(picked), max_tokens, skipped)
+    return {
+        "ok": True,
+        "run_id": run_id,
+        "total": len(picked),
+        "skipped": skipped,
+        "max_tokens": max_tokens,
+    }
+
+
+@router.get("/speed-test/status")
+async def speed_test_status(run_id: str, _=Depends(verify_admin)):
+    """查询测速进度。服务重启后内存任务会丢，返回 404。"""
+    from services import speed_service
+
+    run = speed_service.get_run(run_id)
+    if not run:
+        raise HTTPException(404, "测速任务不存在或已过期（服务重启会清空任务）")
+    return run
 
 
 # ============================================================

@@ -143,3 +143,31 @@ class CheckLog(Base):
     ok_count: Mapped[int] = mapped_column(Integer, default=0)
     fail_count: Mapped[int] = mapped_column(Integer, default=0)
     checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class SpeedRecord(Base):
+    """真实生成速度测速结果（流式，手动触发）。
+
+    与 HealthRecord 严格区分：HealthRecord 是「通不通」的探针（max_tokens=5、非流式），
+    SpeedRecord 是「多快」的测量（max_tokens=128、流式，记录 TTFT 与 decode 速率）。
+    """
+    __tablename__ = "speed_records"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(20), index=True)
+    provider_name: Mapped[str] = mapped_column(String(100), index=True)
+    model: Mapped[str] = mapped_column(String(200), index=True)
+    status: Mapped[str] = mapped_column(String(20), default="ok")  # ok / error
+    ttft_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)        # 首 token 延迟
+    decode_tps: Mapped[Optional[float]] = mapped_column(Float, nullable=True)     # 首 token 之后的每秒 token 数
+    overall_tps: Mapped[Optional[float]] = mapped_column(Float, nullable=True)    # 含首 token 的整体速率
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    decode_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    wall_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    estimated: Mapped[bool] = mapped_column(Boolean, default=False)  # token 数是否为 chunk 估算
+    error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    tested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
+
+    __table_args__ = (
+        Index("ix_speed_provider_model_time", "provider_name", "model", "tested_at"),
+    )

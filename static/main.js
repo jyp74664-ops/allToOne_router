@@ -379,6 +379,68 @@
       }
     }
 
+    /* ---- 真实生成速度测速（手动触发，流式 128 token） ---- */
+    let _speedPollTimer = null;
+
+    async function runSpeedTest(btn) {
+      if (_speedPollTimer) { showToast('上一轮测速还在进行中，请稍等', 'warn'); return; }
+      const items = (lastFilteredRows || []).map(d => ({ provider: d.provider, model: d.model }));
+      if (!items.length) { showToast('当前筛选结果为空，没有可测速的模型', 'warn'); return; }
+
+      const original = btn ? btn.innerHTML : '';
+      if (btn) { btn.disabled = true; btn.innerHTML = '⏳ 启动中...'; }
+      try {
+        const r = await apiFetch('/api/speed-test/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: items, max_tokens: 128 }),
+        }, 30000);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+        if (d.skipped) showToast(`已跳过 ${d.skipped} 个未勾选（或已关闭检测）的模型`, 'warn', 5000);
+        await pollSpeedTest(d.run_id, btn, original);
+      } catch (e) {
+        if (btn) { btn.disabled = false; btn.innerHTML = original; }
+        if (e.message !== 'Unauthorized') showToast('测速启动失败：' + (e.message || '未知错误'), 'error', 6000);
+      }
+    }
+
+    function pollSpeedTest(runId, btn, original) {
+      return new Promise((resolve) => {
+        const tick = async () => {
+          try {
+            const r = await apiFetch('/api/speed-test/status?run_id=' + encodeURIComponent(runId), {}, 15000);
+            const d = await r.json();
+            if (btn) btn.innerHTML = `⏳ 测速 ${d.done}/${d.total}`;
+            if (d.finished) {
+              clearTimeout(_speedPollTimer); _speedPollTimer = null;
+              if (btn) { btn.disabled = false; btn.innerHTML = original; }
+              const results = d.results || [];
+              const okRows = results.filter(x => x.status === 'ok');
+              const speeds = okRows.map(x => Number(x.decode_tps)).filter(v => Number.isFinite(v) && v > 0);
+              const best = speeds.length ? Math.max.apply(null, speeds).toFixed(1) : null;
+              const fail = results.length - okRows.length;
+              showToast(
+                `✅ 测速完成：${okRows.length} 成功` + (fail ? ` / ${fail} 失败` : '') +
+                (best ? `，最快 ${best} tok/s` : ''),
+                fail ? 'warn' : 'ok', 6000
+              );
+              await loadStability();
+              resolve(true);
+              return;
+            }
+            _speedPollTimer = setTimeout(tick, 1200);
+          } catch (e) {
+            clearTimeout(_speedPollTimer); _speedPollTimer = null;
+            if (btn) { btn.disabled = false; btn.innerHTML = original; }
+            if (e.message !== 'Unauthorized') showToast('测速进度查询失败：' + (e.message || '未知错误'), 'error', 6000);
+            resolve(false);
+          }
+        };
+        tick();
+      });
+    }
+
     async function loadStability(hours, renderFn) {
       const h = hours || document.getElementById('stabilityHours').value;
       try {
@@ -533,6 +595,9 @@
       });
     }
 
+    /* 当前筛选后的行（供「⚡ 测速」取模型清单） */
+    let lastFilteredRows = [];
+
     function renderStability() {
       const filter = document.getElementById('stableFilter').value;
       const search = document.getElementById('stableSearch').value.toLowerCase();
@@ -606,10 +671,21 @@
               va = a.min_latency_ms ?? Infinity; vb = b.min_latency_ms ?? Infinity;
               return asc ? va - vb : vb - va;
             case 'tokens_per_sec':
-              // 没有速度数据的排到最后（用 -1 表示未知）
+              // 旧口径（探针估算），列已下线，保留 case 以防旧数据触发
               va = Number.isFinite(Number(a.tokens_per_sec)) ? Number(a.tokens_per_sec) : -1;
               vb = Number.isFinite(Number(b.tokens_per_sec)) ? Number(b.tokens_per_sec) : -1;
               return asc ? va - vb : vb - va;
+            case 'ttft_ms': {
+              // 没测过的排到最后
+              va = Number.isFinite(Number(a.ttft_ms)) ? Number(a.ttft_ms) : Infinity;
+              vb = Number.isFinite(Number(b.ttft_ms)) ? Number(b.ttft_ms) : Infinity;
+              return asc ? va - vb : vb - va;
+            }
+            case 'real_tps': {
+              va = Number.isFinite(Number(a.real_tps)) ? Number(a.real_tps) : -1;
+              vb = Number.isFinite(Number(b.real_tps)) ? Number(b.real_tps) : -1;
+              return asc ? va - vb : vb - va;
+            }
             default:
               return 0;
           }
@@ -640,10 +716,12 @@
         } else {
           why = '没有匹配的模型，试试调整筛选条件或搜索词。';
         }
-        tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);line-height:1.7;">${esc(why)}</td></tr>`;
+        lastFilteredRows = [];
+        tbody.innerHTML = `<tr><td colspan="11" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);line-height:1.7;">${esc(why)}</td></tr>`;
         return;
       }
 
+      lastFilteredRows = filtered.slice();
       tbody.innerHTML = filtered.map(d => {
         const pct = typeof d.availability === 'number' ? d.availability.toFixed(1) : parseFloat(d.availability || 0).toFixed(1);
         const barColor = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--danger)';
@@ -651,12 +729,21 @@
         const avgL = formatLatency(d.avg_latency_ms);
         const minL = formatLatency(d.min_latency_ms);
         const maxL = formatLatency(d.max_latency_ms);
-        // 生成速度：后端按「completion token ÷ 请求总耗时」估算（样本 5 token，偏保守）
-        const tps = Number(d.tokens_per_sec);
-        const hasTps = Number.isFinite(tps) && tps > 0;
-        const tpsStr = hasTps ? tps.toFixed(1) + ' tok/s' : '--';
-        const tpsColor = !hasTps ? 'var(--text-secondary)'
-          : (tps >= 15 ? 'var(--success)' : tps >= 5 ? 'var(--warning)' : 'var(--danger)');
+        // 真实测速（手动「⚡ 测速」写入）：首 token 延迟 + 首 token 之后的解码速率
+        const ttft = Number(d.ttft_ms);
+        const hasTtft = Number.isFinite(ttft) && ttft > 0;
+        const ttftStr = hasTtft ? Math.round(ttft) + ' ms' : '--';
+        const ttftColor = !hasTtft ? 'var(--text-secondary)'
+          : (ttft <= 800 ? 'var(--success)' : ttft <= 2500 ? 'var(--warning)' : 'var(--danger)');
+        const rtps = Number(d.real_tps);
+        const hasRtps = Number.isFinite(rtps) && rtps > 0;
+        const rtpsStr = hasRtps ? rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '') : '--';
+        const rtpsColor = !hasRtps ? 'var(--text-secondary)'
+          : (rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)');
+        let rtpsTip = d.speed_error
+          ? '测速失败：' + String(d.speed_error)
+          : (d.speed_tested_at ? '测于 ' + new Date(d.speed_tested_at * 1000).toLocaleString('zh-CN') : '尚未测速，点上方「⚡ 测速」');
+        if (hasRtps && d.speed_estimated) rtpsTip += '；token 数由 chunk 估算（上游未返回 usage），约有 ±10% 偏差';
         const checks = Number(d.checks) || 0;
         const ok = Number(d.ok) || 0;
         const fail = (Number(d.fail) || 0) + (Number(d.error) || 0);
@@ -721,7 +808,8 @@
         <span style="color:var(--text-secondary);margin:0 4px">~</span>
         <span style="color:var(--text-secondary)">${maxL}</span>
       </td>
-      <td class="latency" style="font-size:12px;color:${tpsColor}">${tpsStr}</td>
+      <td class="latency" style="font-size:12px;color:${ttftColor}">${ttftStr}</td>
+      <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}">${rtpsStr}</td>
     </tr>`;
       }).join('');
     }
