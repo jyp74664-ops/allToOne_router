@@ -197,7 +197,13 @@
       justify-content: space-between;
       align-items: center;
       margin-bottom: 24px;
+      flex-wrap: wrap;
+      row-gap: 12px;
     }
+
+    /* 右侧按钮多时换行，避免撑宽后压住左侧页签导致点不到 */
+    .ha-right { min-width: 0; }
+    .ha-tools { flex-wrap: wrap; justify-content: flex-end; }
 
     .header-actions h1 {
       font-size: 24px;
