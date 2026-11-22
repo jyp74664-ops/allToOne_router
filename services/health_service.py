@@ -32,7 +32,8 @@ class HealthState:
         self.failed_models: dict = {}          # key -> timestamp
         self.provider_api_status: dict = {}    # provider_name -> ok/error
         self.model_details: dict = {}          # model_id -> {context_length, ...}
-        self._lock = asyncio.Lock()
+        # 关键状态由并发请求与后台任务同时读写，用线程锁保护复合操作
+        self._lock = __import__("threading").Lock()
         # 速率限制跟踪
         self.rate_limit_tracker: dict = {}     # provider_name -> {count, window_start}
         self.provider_rate_limited: dict = {}  # provider_name -> until_timestamp
@@ -132,26 +133,39 @@ class HealthState:
     
     def record_fail(self, key: str) -> None:
         """记录一次失败"""
-        self.failed_models[key] = time.time()
-        cb = self.circuit_breaker.setdefault(key, {"fails": 0, "open_until": 0})
-        was_open = cb.get("open_until", 0) > time.time()
-        cb["fails"] += 1
-        if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
-            cb["open_until"] = time.time() + CIRCUIT_RECOVERY_SECONDS
+        notify = False
+        now = time.time()
+        with self._lock:
+            # 顺带清理过期的失败标记（FAILED_MODEL_TTL 原来定义但从未使用）
+            expired = [k for k, ts in self.failed_models.items() if now - ts > FAILED_MODEL_TTL]
+            for k in expired:
+                self.failed_models.pop(k, None)
+            self.failed_models[key] = now
+            cb = self.circuit_breaker.setdefault(key, {"fails": 0, "open_until": 0})
+            was_open = cb.get("open_until", 0) > now
+            cb["fails"] += 1
+            if cb["fails"] >= CIRCUIT_FAIL_THRESHOLD:
+                cb["open_until"] = now + CIRCUIT_RECOVERY_SECONDS
+                if not was_open:
+                    notify = True
+        if notify:
             logger.warning("circuit opened: %s", key)
-            if not was_open:
-                _schedule_notify("model.failed", {"key": key, "reason": "circuit_breaker_opened"})
-    
+            _schedule_notify("model.failed", {"key": key, "reason": "circuit_breaker_opened"})
+
     def record_success(self, key: str) -> None:
         """记录一次成功"""
-        self.failed_models.pop(key, None)
-        cb = self.circuit_breaker.get(key)
-        if cb:
-            was_open = cb.get("open_until", 0) > time.time()
-            cb["fails"] = 0
-            cb["open_until"] = 0
-            if was_open:
-                _schedule_notify("model.recovered", {"key": key})
+        notify = False
+        with self._lock:
+            self.failed_models.pop(key, None)
+            cb = self.circuit_breaker.get(key)
+            if cb:
+                was_open = cb.get("open_until", 0) > time.time()
+                cb["fails"] = 0
+                cb["open_until"] = 0
+                if was_open:
+                    notify = True
+        if notify:
+            _schedule_notify("model.recovered", {"key": key})
     
     def update_quality(self, key: str, info: dict) -> None:
         """更新模型质量滑动窗口"""
@@ -467,7 +481,7 @@ async def run_full_check(on_progress=None) -> dict:
     
     logger.info("\033[93m▶ 开始全量健康检测，共 %d 个服务商，%d 个模型\033[0m", len(providers), total)
     
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
         # 记录本次检测中已确认删除的模型，避免重复探测
         already_deleted: set[str] = set()
         for provider in providers:

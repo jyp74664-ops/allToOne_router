@@ -20,5 +20,11 @@ dist/
 build/
 *.egg-info/
 .pytest_cache/
-.vscode/
 .idea/
+node_modules/
+proxy_b64.txt
+fix_proxy.ps1
+backups/
+# 测评中间产物（报告保留，原始数据按需要提交）
+speed_*.json
+summary_rows.json

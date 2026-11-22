@@ -1,13 +1,15 @@
 """Prometheus 指标路由"""
 import time
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Response, Depends
 from sqlalchemy import select, func
+
+from api.auth import verify_admin
 
 router = APIRouter()
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(verify_admin)])
 async def prometheus_metrics():
     """暴露 Prometheus 监控指标"""
     from services.health_service import health_state
@@ -55,7 +57,12 @@ async def prometheus_metrics():
     metrics_lines.append("# TYPE flowgate_circuit_breaker_open gauge")
     for key, cb in health_state.circuit_breaker.items():
         is_open = 1 if cb.get("open_until", 0) > time.time() else 0
-        provider, model = key.split("||")
+        if "||" not in key:
+            continue
+        provider, model = key.split("||", 1)
+        # Prometheus 标签值需转义反斜杠、双引号与换行
+        provider = provider.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+        model = model.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
         metrics_lines.append(f'flowgate_circuit_breaker_open{{provider="{provider}",model="{model}"}} {is_open}')
 
     metrics_lines.append("")  # 末尾换行

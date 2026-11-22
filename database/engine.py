@@ -1,6 +1,6 @@
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase
-from sqlalchemy import text, select
+from sqlalchemy import text, select, event
 from sqlalchemy.pool import NullPool
 from pathlib import Path
 from typing import AsyncGenerator
@@ -54,6 +54,14 @@ class Database:
                 # 因连接被 asyncio.CancelledError 终止而打印 ERROR 日志
                 poolclass=NullPool,
             )
+
+            # SQLite 默认关闭外键，需在每个连接上显式启用，否则 ON DELETE CASCADE 不生效
+            @event.listens_for(self.engine.sync_engine, "connect")
+            def _enable_fk(dbapi_conn, _record):
+                cur = dbapi_conn.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
+
             # 静默 aiosqlite 在请求取消时的无害 ERROR 日志
             _pool_logger = logging.getLogger("sqlalchemy.pool")
             _pool_logger.addFilter(self._suppress_aisqlite_noise)

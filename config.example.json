@@ -1,4 +1,9 @@
 {
   "local_api_key": "sk-local-REPLACE_WITH_YOUR_KEY",
-  "admin_token": "adm-REPLACE_WITH_YOUR_TOKEN"
+  "admin_token": "adm-REPLACE_WITH_YOUR_TOKEN",
+  "auto_validate": false,
+  "auto_validate_interval": 1800,
+  "merge_reasoning": false,
+  "verify_ssl": true,
+  "announcement_url": null
 }

@@ -3,10 +3,10 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlalchemy import select
 
+from api.auth import verify_admin
 from config.settings import settings
 from database.engine import db
 from database.models import Webhook
@@ -14,15 +14,6 @@ from database.models import Webhook
 logger = logging.getLogger("flowgate.webhooks")
 
 router = APIRouter(prefix="/api/webhooks")
-security = HTTPBearer(auto_error=False)
-
-
-def verify_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> str:
-    if not credentials or credentials.credentials != settings.load().local_api_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials.credentials
 
 
 class WebhookConfig(BaseModel):
@@ -93,7 +84,7 @@ async def notify_webhooks(event: str, data: dict) -> None:
         return
 
     payload = {"event": event, "data": data}
-    async with httpx.AsyncClient(timeout=10, verify=False) as client:
+    async with httpx.AsyncClient(timeout=10, verify=settings.load().verify_ssl) as client:
         for w in webhooks:
             if w.events and event not in w.events:
                 continue

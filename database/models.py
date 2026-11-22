@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, JSON, ForeignKey
+from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, JSON, ForeignKey, Index
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.engine import Base
@@ -31,8 +31,12 @@ class ModelConfig(Base):
     
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     provider_id: Mapped[int] = mapped_column(ForeignKey("providers.id", ondelete="CASCADE"))
-    model_id: Mapped[str] = mapped_column(String(200))
-    
+    model_id: Mapped[str] = mapped_column(String(200), index=True)
+
+    __table_args__ = (
+        Index("ix_model_config_provider", "provider_id"),
+    )
+
     provider: Mapped["Provider"] = relationship(back_populates="models_config")
 
 
@@ -61,6 +65,11 @@ class HealthRecord(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     detail: Mapped[str] = mapped_column(Text, nullable=True)
     checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+    __table_args__ = (
+        Index("ix_health_checked_at", "checked_at"),
+        Index("ix_health_provider_model_time", "provider_name", "model", "checked_at"),
+    )
     
     @property
     def key(self) -> str:
@@ -79,6 +88,11 @@ class UsageRecord(Base):
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
     request_id: Mapped[str] = mapped_column(String(50), nullable=True)
+
+    __table_args__ = (
+        Index("ix_usage_provider_time", "provider", "timestamp"),
+        Index("ix_usage_model_time", "model", "timestamp"),
+    )
 
 
 class ModelMeta(Base):

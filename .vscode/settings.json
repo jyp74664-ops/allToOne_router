@@ -1,0 +1,5 @@
+{
+    "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+    "Codegeex.CompletionDelay": 0.4,
+    "Codegeex.GenerationPreference": "automatic"
+}

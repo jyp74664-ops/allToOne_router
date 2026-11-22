@@ -1,16 +1,21 @@
 import json
+import logging
 import secrets
 from pathlib import Path
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+logger = logging.getLogger("flowgate.config")
 
 
 class AppConfig(BaseModel):
     """应用基础配置"""
     local_api_key: str = ""
+    admin_token: str = ""
     auto_validate: bool = False
-    auto_validate_interval: int = 1800
+    auto_validate_interval: int = Field(default=1800, ge=30)
     merge_reasoning: bool = True
+    verify_ssl: bool = True
     announcement_url: Optional[str] = None
 
 
@@ -28,18 +33,57 @@ class Settings:
         if self._config is not None:
             return self._config
         
+        data = {}
         if self.config_file.exists():
-            data = json.loads(self.config_file.read_text(encoding="utf-8"))
+            try:
+                data = json.loads(self.config_file.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    raise ValueError("config root must be an object")
+            except Exception as e:
+                logger.error("配置文件解析失败，回退到安全默认配置: %s", e)
+                data = {}
         else:
-            data = {
-                "local_api_key": "sk-local-" + secrets.token_hex(16),
-                "auto_validate": False,
-                "auto_validate_interval": 1800,
-                "merge_reasoning": True,
-            }
-            self._atomic_write(self.config_file, json.dumps(data, indent=2))
-        
-        self._config = AppConfig(**data)
+            data = {}
+
+        changed = False
+        if not data.get("local_api_key"):
+            data["local_api_key"] = "sk-local-" + secrets.token_hex(16)
+            changed = True
+        if not data.get("admin_token"):
+            data["admin_token"] = "adm-" + secrets.token_hex(16)
+            changed = True
+        for key, default in (
+            ("auto_validate", False),
+            ("auto_validate_interval", 1800),
+            ("merge_reasoning", True),
+        ):
+            if key not in data:
+                data[key] = default
+                changed = True
+        # 纠正非法区间（负数会形成忙循环）
+        try:
+            if int(data.get("auto_validate_interval", 1800)) < 30:
+                data["auto_validate_interval"] = 1800
+                changed = True
+        except (TypeError, ValueError):
+            data["auto_validate_interval"] = 1800
+            changed = True
+
+        try:
+            self._config = AppConfig(**data)
+        except Exception as e:
+            logger.error("配置字段校验失败，回退到安全默认配置: %s", e)
+            self._config = AppConfig(
+                local_api_key="sk-local-" + secrets.token_hex(16),
+                admin_token="adm-" + secrets.token_hex(16),
+            )
+            changed = True
+
+        if changed or not self.config_file.exists():
+            self._atomic_write(
+                self.config_file,
+                json.dumps(self._config.model_dump(), indent=2, ensure_ascii=False),
+            )
         return self._config
 
     def reload(self) -> AppConfig:

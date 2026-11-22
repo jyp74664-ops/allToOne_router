@@ -129,15 +129,14 @@ async def cleanup_old_records() -> tuple[int, int]:
     async with db.SessionLocal() as session:
         from datetime import timedelta
         
-        # 清理健康历史
-        cutoff_history = datetime.now() - timedelta(days=MAX_HISTORY_DAYS)
+        # 统一用字符串 cutoff（与 read_health_history 口径一致，SQLite DateTime 存为 TEXT）
+        cutoff_history = (datetime.now() - timedelta(days=MAX_HISTORY_DAYS)).strftime('%Y-%m-%d %H:%M:%S.%f')
         result = await session.execute(
             HealthRecord.__table__.delete().where(HealthRecord.checked_at < cutoff_history)
         )
         removed_history = result.rowcount
-        
-        # 清理用量记录
-        cutoff_usage = datetime.now() - timedelta(days=MAX_USAGE_DAYS)
+
+        cutoff_usage = (datetime.now() - timedelta(days=MAX_USAGE_DAYS)).strftime('%Y-%m-%d %H:%M:%S.%f')
         result = await session.execute(
             UsageRecord.__table__.delete().where(UsageRecord.timestamp < cutoff_usage)
         )

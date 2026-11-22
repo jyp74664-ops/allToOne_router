@@ -17,6 +17,21 @@ from services.usage_service import append_usage
 logger = logging.getLogger("flowgate.proxy")
 UPSTREAM_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
 
+
+def note_rate_limit(provider_name: str, status_code: int, headers=None) -> None:
+    """遇到限流状态码时记录 provider 级冷却（原来 record_rate_limit 从未被调用）。"""
+    if status_code not in (429, 503) and status_code < 500:
+        return
+    retry_after = None
+    if headers:
+        raw = headers.get("retry-after")
+        if raw:
+            try:
+                retry_after = float(raw)
+            except (TypeError, ValueError):
+                pass
+    health_state.record_rate_limit(provider_name, retry_after)
+
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/v1")
 
@@ -37,15 +52,11 @@ HERMES_MAP = [
 
 
 def compress_hermes(obj: dict) -> dict:
-    s = json.dumps(obj, ensure_ascii=False)
-    for long, short in HERMES_MAP:
-        s = s.replace(long, short)
-    return json.loads(s)
+    # HERMES_MAP 当前 long==short，实际无压缩效果；短路以免每次请求做两轮 JSON 序列化。
+    return obj
 
 
 def restore_hermes_text(text: str) -> str:
-    for long, short in HERMES_MAP:
-        text = text.replace(short, long)
     return text
 
 
@@ -226,6 +237,7 @@ async def proxy_chat(request: Request, force: bool = False):
             if not force and (
                 health_state.is_circuit_open(key)
                 or health_state.health_status.get(key, {}).get("status") in {"deleted", "fail", "error"}
+                or health_state.check_rate_limit(provider.name)
             ):
                 continue
             candidates.append((provider, actual_model, wanted))
@@ -240,7 +252,7 @@ async def proxy_chat(request: Request, force: bool = False):
     logger.info("\033[93m▶ 路由请求: %s (%d 个候选)\033[0m", requested_model, len(candidates))
 
     last_error = "上游无响应"
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False) as client:
+    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
         for provider, actual_model, requested in candidates:
             upstream_body = dict(body)
             upstream_body["model"] = normalize_model_name(actual_model)
@@ -257,7 +269,7 @@ async def proxy_chat(request: Request, force: bool = False):
                 if upstream_body.get("stream"):
                     # 流式响应不能依赖外层 AsyncClient 上下文，响应返回后外层会立即关闭。
                     # 推理模型思考阶段可能长时间无字节输出，read 超时放宽到 600s 避免断流
-                    stream_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0), verify=False)
+                    stream_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0), verify=settings.load().verify_ssl)
                     try:
                         upstream_request = client.build_request(
                             "POST", url, json=upstream_body, headers=headers
@@ -295,16 +307,17 @@ async def proxy_chat(request: Request, force: bool = False):
                         usage_obj = None     # 上游返回的 usage 对象（部分上游只在 [DONE] 前带）
 
                         try:
-                            # 前缀作为流的第一个事件发出（独立首包），始终顶格在开头
-                            first_evt = {
-                                "choices": [{
-                                    "delta": {"role": "assistant", "content": prefix + "\n\n", "reasoning_content": None},
-                                    "index": 0,
-                                    "finish_reason": None,
-                                }],
-                                "model": f"{provider.name} · {actual_model}",
-                            }
-                            yield ("data: " + json.dumps(first_evt, ensure_ascii=False) + "\n\n").encode("utf-8")
+                            # 合并推理内容开启时，才在流开头显示上游模型前缀。
+                            if merge_reasoning_enabled:
+                                first_evt = {
+                                    "choices": [{
+                                        "delta": {"role": "assistant", "content": prefix + "\n\n", "reasoning_content": None},
+                                        "index": 0,
+                                        "finish_reason": None,
+                                    }],
+                                    "model": f"{provider.name} · {actual_model}",
+                                }
+                                yield ("data: " + json.dumps(first_evt, ensure_ascii=False) + "\n\n").encode("utf-8")
                             async for line in upstream.aiter_lines():
                                 if not line:
                                     continue
@@ -457,8 +470,9 @@ async def proxy_chat(request: Request, force: bool = False):
                 logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
                 # 记录失败并尝试下一候选（含400等继续尝试下一候选）
                 health_state.record_fail(f"{provider.name}||{requested}")
+                note_rate_limit(provider.name, response.status_code, response.headers)
                 if health_state.check_rate_limit(provider.name):
-                    logger.info("\033[93m⏸ %s 处于限速冷却，跳过\033[0m", provider.name)
+                    logger.info("\033[93m⏸ %s 处于限速冷却\033[0m", provider.name)
                 continue
             except httpx.HTTPError as exc:
                 last_error = f"{provider.name}: {exc}"

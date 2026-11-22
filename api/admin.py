@@ -11,6 +11,10 @@ from sqlalchemy import select
 import httpx
 
 from config.settings import settings
+from api.auth import (
+    verify_admin, verify_admin_password, issue_session_token, security,
+    is_local_request, credential_is_valid,
+)
 from services.health_service import check_model, fetch_models, health_state
 from services.provider_service import ProviderService
 from services.router_manager import RouterService
@@ -25,20 +29,41 @@ from services.rate_limit_service import sync_rate_limits
 
 logger = logging.getLogger("flowgate.api")
 
-security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/api")
 
 
-def verify_admin(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
-) -> str:
-    """管理面板鉴权"""
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Missing credentials")
-    cfg = settings.load()
-    if credentials.credentials != cfg.local_api_key:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return credentials.credentials
+class AdminLoginIn(BaseModel):
+    password: str
+
+
+@router.get("/admin/auth-status")
+async def admin_auth_status(request: Request):
+    """公开的探测端点：告诉前端本机免登录、局域网是否已登录。"""
+    if is_local_request(request):
+        return {"need_login": False, "local": True}
+    auth = request.headers.get("authorization", "")
+    token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+    if credential_is_valid(token):
+        return {"need_login": False, "local": False}
+    return {"need_login": True, "local": False}
+
+
+@router.post("/admin/login")
+async def admin_login(body: AdminLoginIn):
+    """管理端登录：校验独立管理密码，签发短期会话 token。
+
+    本机访问无需登录；此端点主要供局域网使用。
+    """
+    if not verify_admin_password(body.password):
+        raise HTTPException(status_code=401, detail="管理密码错误")
+    token = issue_session_token()
+    return {"token": token, "token_type": "bearer"}
+
+
+@router.get("/client-key")
+async def get_client_key(_=Depends(verify_admin)):
+    """登录后返回客户端 API key（供管理页展示，不写入 HTML）。"""
+    return {"api_key": settings.load().local_api_key}
 
 
 # ============================================================
@@ -89,19 +114,45 @@ async def get_health_status(_=Depends(verify_admin)):
     }
 
 
+class ClearFailIn(BaseModel):
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    all: bool = False
+
+
 @router.post("/health-status/clear-fail-counts")
-async def clear_fail_counts(provider: Optional[str] = None, _=Depends(verify_admin)):
-    """清除失败标记，可选只清除指定提供商的"""
-    if provider:
+async def clear_fail_counts(
+    body: Optional[ClearFailIn] = None,
+    provider: Optional[str] = None,
+    _=Depends(verify_admin),
+):
+    """清除失败标记。
+
+    精确模式：body 传 provider + model，只清一个模型。
+    兼容模式：仅传 provider，清该 provider 下全部；显式 all=true 才清全部。
+    """
+    body = body or ClearFailIn()
+    target_provider = body.provider or provider
+    target_model = body.model
+    if body.all:
+        return {"cleared": health_state.clear_all_fail_counts()}
+
+    if target_provider and target_model:
+        key = f"{target_provider}||{target_model}"
+        if key in health_state.circuit_breaker:
+            health_state.clear_fail_count(key)
+            return {"cleared": 1}
+        return {"cleared": 0}
+
+    if target_provider:
         cleared = 0
-        keys_to_remove = [k for k in health_state.circuit_breaker if k.startswith(provider + "||")]
-        for k in keys_to_remove:
+        for k in [k for k in health_state.circuit_breaker if k.startswith(target_provider + "||")]:
             health_state.clear_fail_count(k)
             cleared += 1
         return {"cleared": cleared}
-    else:
-        count = health_state.clear_all_fail_counts()
-        return {"cleared": count}
+
+    # 没有任何限定条件：拒绝，避免误清空全部
+    raise HTTPException(status_code=400, detail="请指定 provider/model，或显式传 all=true")
 
 
 @router.get("/poll-status")
@@ -188,7 +239,7 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
 
     meta = ModelMetaService()
     try:
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+        async with httpx.AsyncClient(timeout=15, verify=settings.load().verify_ssl) as client:
             models = await fetch_models(
                 client, p.base_url, p.api_key, free_only=False,
                 aliases=meta.aliases, context_limits=meta.context_limits,
@@ -206,7 +257,7 @@ async def refresh_models(name: str, _=Depends(verify_admin)):
     """刷新模型列表"""
     svc = ProviderService()
     try:
-        async with httpx.AsyncClient(timeout=30, verify=False) as client:
+        async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
             models = await svc.fetch_available_models(
                 name, client, ModelMetaService().aliases, ModelMetaService().context_limits
             )
@@ -220,7 +271,7 @@ async def refresh_models(name: str, _=Depends(verify_admin)):
 async def sync_all_free_models(_=Depends(verify_admin)):
     """批量同步免费模型"""
     svc = ProviderService()
-    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+    async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
         results = await svc.sync_free_models(
             client, ModelMetaService().aliases, ModelMetaService().context_limits,
             health_state.health_status,
@@ -285,7 +336,7 @@ async def manual_check(name: str, model: str, _=Depends(verify_admin)):
             raise HTTPException(404, "未找到")
     
     meta = ModelMetaService()
-    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+    async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
         check_result = await check_model(
             client, p.base_url, p.api_key, model, meta.aliases
         )
@@ -370,7 +421,7 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         total = len(provider.models or []) + len(provider.disabled_models or [])
         current = 0
         
-        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=False) as client:
+        async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
             for model in (provider.models or []) + (provider.disabled_models or []):
                 key = f"{provider.name}||{model}"
                 is_disabled = model not in enabled_set
@@ -665,10 +716,28 @@ async def delete_context_limit(model: str, _=Depends(verify_admin)):
 # ============================================================
 # 速率限制接口
 # ============================================================
+class RateLimitsIn(BaseModel):
+    limits: dict[str, str]
+
+
+@router.post("/rate-limits")
+async def save_rate_limits(body: RateLimitsIn, _=Depends(verify_admin)):
+    """手动保存速率限制配置（真实生效）"""
+    meta = ModelMetaService()
+    meta.set_rate_limits(body.limits)
+    return {"ok": True, "count": len(body.limits)}
+
+
+@router.get("/rate-limits")
+async def get_rate_limits(_=Depends(verify_admin)):
+    """读取当前速率限制配置"""
+    return {"ok": True, "limits": ModelMetaService().rate_limits}
+
+
 @router.post("/sync-rate-limits")
 async def sync_rate_limits_api(_=Depends(verify_admin)):
-    """同步速率限制"""
-    async with httpx.AsyncClient(timeout=30, verify=False) as client:
+    """从公开数据源同步速率限制（不改变手动设置）"""
+    async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
         result = await sync_rate_limits(client, ModelMetaService())
     return result
 
@@ -695,7 +764,7 @@ async def get_announcement(_=Depends(verify_admin)):
     # 尝试从远程获取
     url = cfg.announcement_url or "https://gitee.com/ywtc000/dongye/raw/master/announcement.md"
     try:
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+        async with httpx.AsyncClient(timeout=15, verify=settings.load().verify_ssl) as client:
             resp = await client.get(url, follow_redirects=True)
             if resp.status_code == 200:
                 content = resp.text.strip()

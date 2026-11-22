@@ -5,7 +5,6 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse
 
@@ -34,15 +33,25 @@ async def lifespan(app: FastAPI):
 
     async def _init_tasks():
         try:
-            async with httpx.AsyncClient(timeout=30, verify=False) as client:
+            async with httpx.AsyncClient(timeout=30) as client:
                 await _sync_rl(client, ModelMetaService())
         except Exception as e:
             logger.warning("initial rate-limit sync failed: %s", e)
-        asyncio.create_task(_auto_validate_loop())
 
-    asyncio.create_task(_init_tasks())
+    # 保存任务强引用，避免被 GC 导致后台任务静默停止
+    app.state.bg_tasks = []
+    app.state.bg_tasks.append(asyncio.create_task(_init_tasks()))
+    app.state.bg_tasks.append(asyncio.create_task(_auto_validate_loop()))
+    # 启动时清理过期记录
+    try:
+        from services.usage_service import cleanup_old_records
+        await cleanup_old_records()
+    except Exception as e:
+        logger.warning("startup cleanup failed: %s", e)
     logger.info("FlowGate started")
     yield
+    for task in getattr(app.state, "bg_tasks", []):
+        task.cancel()
     logger.info("FlowGate shutdown")
 
 
@@ -97,15 +106,8 @@ async def log_request_middleware(request, call_next):
     return response
 
 
-# CORS
+# 请求日志中间件（不启用 CORS：管理页与 API 同源，杜绝跨站凭据窃取）
 app.middleware("http")(log_request_middleware)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # 注册路由
 app.include_router(admin_router, prefix="")
@@ -114,10 +116,10 @@ app.include_router(responses_router, prefix="")
 app.include_router(webhook_router, prefix="")
 app.include_router(metrics_router, prefix="")
 
-# 静态文件（前端构建产物）
-frontend_dist = Path(__file__).parent / "frontend" / "dist"
-if frontend_dist.exists():
-    app.mount("/", StaticFiles(directory=str(frontend_dist), html=True), name="frontend")
+# 静态资源（拆分后的 CSS/JS）
+static_dir = Path(__file__).parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 
 
 @app.get("/health")
@@ -127,10 +129,10 @@ async def health_check():
 
 
 def render_dashboard() -> str:
-    """渲染带本地 API 密钥的管理面板"""
+    """渲染管理面板（不注入任何密钥，登录后经 /api/client-key 获取）。"""
     template = Path(__file__).parent / "templates" / "index.html"
     html = template.read_text(encoding="utf-8")
-    html = html.replace("{{ local_api_key }}", settings.load().local_api_key)
+    html = html.replace("{{ local_api_key }}", "")
     html = html.replace("{{app_version}}", app.version)
     return html
 

@@ -7,9 +7,19 @@ logger = logging.getLogger("flowgate.meta")
 
 
 class ModelMetaService:
-    """模型元数据服务"""
-    
+    """模型元数据服务（进程级单例，避免每次请求重复读取 143KB 文件）。"""
+
+    _instance: Optional["ModelMetaService"] = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
     def __init__(self):
+        if getattr(self, "_initialized", False):
+            return
         self._meta = {
             "aliases": {},
             "context_limits": {},
@@ -17,6 +27,11 @@ class ModelMetaService:
             "model_descriptions": {},
             "rate_limits": {},
         }
+        self._load_meta()
+        self._initialized = True
+
+    def reload(self) -> None:
+        """从磁盘重新加载元数据"""
         self._load_meta()
     
     def _load_meta(self) -> None:
@@ -72,6 +87,13 @@ class ModelMetaService:
     def delete_context_limit(self, model: str) -> None:
         """删除模型上下文长度配置"""
         self.context_limits.pop(model, None)
+        self._save_meta()
+
+    def set_rate_limits(self, limits: dict) -> None:
+        """整体覆盖速率限制配置"""
+        if not isinstance(limits, dict):
+            raise ValueError("rate limits must be an object")
+        self._meta["rate_limits"] = limits
         self._save_meta()
     
     def get_description(self, model: str) -> Optional[str]:
