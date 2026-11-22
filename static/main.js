@@ -1019,7 +1019,7 @@
       let html = `<table style="width:100%;border-collapse:collapse;font-size:13px;">
         <thead>
           <tr style="background:var(--mac-window-bg);position:sticky;top:0;z-index:1;border-bottom:1px solid var(--mac-border);">
-            <th style="width:32px;padding:6px 8px;text-align:center;border-bottom:1px solid var(--mac-border);"><input type="checkbox" id="modalSelectAll" onchange="toggleModalSelectAll(this.checked)" title="全选/取消全选"></th>
+            <th style="width:32px;padding:6px 8px;text-align:center;border-bottom:1px solid var(--mac-border);"><input type="checkbox" id="modalSelectAll" onchange="toggleModalSelectAll(this.checked)" title="全选时只勾选有成功率的模型（近 24 小时有检测记录），没有成功率的保持不勾选"></th>
             <th style="padding:6px 8px;text-align:left;font-size:12px;border-bottom:1px solid var(--mac-border);cursor:pointer;user-select:none;" onclick="toggleModalSort('model')">模型名称 <span class="sort-icon" id="modalSortIcon_model">⇅</span></th>
             <th style="padding:6px 8px;text-align:center;font-size:12px;border-bottom:1px solid var(--mac-border);width:80px;cursor:pointer;user-select:none;" onclick="toggleModalSort('size')">模型大小 <span class="sort-icon" id="modalSortIcon_size">⇅</span></th>
             <th style="padding:6px 8px;text-align:center;font-size:12px;border-bottom:1px solid var(--mac-border);width:100px;cursor:pointer;user-select:none;" onclick="toggleModalSort('success')">成功率 <span class="sort-icon" id="modalSortIcon_success">⇅</span></th>
@@ -1053,7 +1053,7 @@
         const cbTitle = isDisabled ? 'title="限额型模型，取消勾选后仍会保留在监控列表中"' : '';
         
         html += `<tr style="border-bottom:1px solid var(--mac-border);${rowStyle}">
-          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${m}" ${isChecked} ${cbTitle}></td>
+          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${m}" data-has-success="${checks > 0 ? 1 : 0}" ${isChecked} ${cbTitle} onchange="syncModalSelectAllState()"></td>
           <td style="padding:6px 8px;${nameStyle}">${m}${badgeHtml}</td>
           <td style="padding:6px 8px;text-align:center;color:var(--text-secondary);">${sizeStr}</td>
           <td style="padding:6px 8px;text-align:center;color:${availColor};font-size:12px;">${availStr}</td>
@@ -1074,6 +1074,8 @@
         activeIcon.style.opacity = '1';
         activeIcon.style.color = 'var(--accent-primary)';
       }
+      // 渲染完成后按实际勾选情况回填表头全选框状态
+      syncModalSelectAllState();
     }
 
     function toggleModalSort(col) {
@@ -1132,16 +1134,33 @@
       });
     }
 
+    // 表头全选框状态跟随实际勾选情况（部分勾选显示为 indeterminate）
+    function syncModalSelectAllState() {
+      const head = document.getElementById('modalSelectAll');
+      if (!head) return;
+      const boxes = [...document.querySelectorAll('#modalModelTableBody .modal-model-checkbox')]
+        .filter(cb => cb.closest('tr').style.display !== 'none');
+      const on = boxes.filter(cb => cb.checked).length;
+      head.checked = boxes.length > 0 && on === boxes.length;
+      head.indeterminate = on > 0 && on < boxes.length;
+    }
+
     function toggleModalSelectAll(checked) {
       document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        if (cb.closest('tr').style.display !== 'none') cb.checked = checked;
+        if (cb.closest('tr').style.display === 'none') return;
+        // 全选只勾"有成功率"的模型；没有成功率记录的保持不勾选
+        cb.checked = checked ? cb.dataset.hasSuccess === '1' : false;
       });
+      syncModalSelectAllState();
     }
 
     function selectAllModels(check) {
       document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        if (cb.closest('tr').style.display !== 'none') cb.checked = check;
+        if (cb.closest('tr').style.display === 'none') return;
+        // 全选只勾"有成功率"的模型；没有成功率记录的保持不勾选
+        cb.checked = check ? cb.dataset.hasSuccess === '1' : false;
       });
+      syncModalSelectAllState();
     }
 
     async function saveModelSelection() {

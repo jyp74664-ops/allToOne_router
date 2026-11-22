@@ -410,3 +410,30 @@ def test_manual_check_rejects_paid_model_when_free_only(local_client, initialize
     r = local_client.post("/api/check/fo/paid-b")
     assert r.status_code == 400, r.text
     assert "收费模型" in r.text
+
+
+def test_manual_check_allows_paid_model_when_free_off(local_client, initialized_db, monkeypatch):
+    """显示「含收费」的提供商（free_only=False）单模型检查不能被 400 拦掉。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import api.admin as admin_mod
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="paidok", base_url="https://a/v1", api_key="k",
+                           models=["free-a", "paid-b"], disabled_models=[],
+                           retired_models=[], free_models=["free-a"],
+                           free_only=False, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    async def fake_check(client=None, base_url=None, api_key=None, model=None, aliases=None, **kw):
+        return {"status": "ok", "code": 200, "latency_ms": 1}
+    monkeypatch.setattr(admin_mod, "check_model", fake_check)
+
+    r = local_client.post("/api/check/paidok/paid-b")
+    assert r.status_code == 200, r.text
+    assert r.json().get("status") == "ok"

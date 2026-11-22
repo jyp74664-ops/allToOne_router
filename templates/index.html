@@ -328,8 +328,9 @@
       <div class="modal-body">
         <div style="margin-bottom: 12px; display: flex; gap: 8px; justify-content: space-between; align-items: center;">
           <div style="display: flex; gap: 8px;">
-            <button class="btn" onclick="selectAllModels(true)">全选</button>
-            <button class="btn" onclick="selectAllModels(false)">取消全选</button>
+            <button class="btn" onclick="selectAllModels(true)"
+              title="只勾选“有成功率”的模型（近 24 小时有检测记录）；没有成功率记录的模型保持不勾选">全选</button>
+            <button class="btn" onclick="selectAllModels(false)" title="取消勾选当前列表中可见的全部模型">取消全选</button>
           </div>
           <input type="text" id="modalSearchInput" placeholder="搜索模型..." oninput="filterModalModels()"
             style="padding: 6px 10px; border-radius: 6px; border: 1px solid var(--mac-border); background: transparent; color: var(--text-primary); font-size: 13px; width: 200px; outline: none; box-shadow: inset 0 1px 2px rgba(0,0,0,0.05);">

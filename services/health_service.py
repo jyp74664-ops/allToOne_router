@@ -590,7 +590,13 @@ def checkable_models(provider) -> list[str]:
 
 
 def is_paid_model(provider, model: str) -> bool:
-    """该模型是否被上游判定为收费模型（需要 provider.free_models 已知）。"""
+    """该模型是否应被跳过的收费模型。
+
+    只有勾了「仅拉取免费模型」(free_only=True) 的提供商会跳过收费模型；
+    显示「含收费」的提供商（free_only=False）一律返回 False，照常检测。
+    """
+    if getattr(provider, "free_only", True) is False:
+        return False
     free = set(getattr(provider, "free_models", None) or [])
     return bool(free) and model not in free
 
