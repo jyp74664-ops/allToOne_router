@@ -418,6 +418,38 @@ async def check_model(
     return {"status": "error", "latency_ms": latency, "detail": last_error}
 
 
+def _pricing_is_paid(pricing: dict) -> bool:
+    """单个价格对象是否收费（prompt / completion 任一非 0）。"""
+    try:
+        return float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0
+    except (ValueError, TypeError):
+        return False
+
+
+def model_pricing_is_paid(item: dict) -> bool:
+    """上游 /models 返回的单个模型是否收费。
+
+    兼容两种常见结构：
+    - 扁平：{"id": ..., "pricing": {"prompt": 0, "completion": 0}}
+    - 聚合（AMD / OpenRouter 这类）：{"id": ..., "providers": [{"pricing": {...}}, ...]}
+
+    判定口径：只要存在一个报价全 0 的渠道，就认为能免费用到，算免费；
+    所有渠道都收费才算收费。完全没有价格信息时按免费处理（宁松不严）。
+    """
+    pricings: list[dict] = []
+    flat = item.get("pricing")
+    if isinstance(flat, dict):
+        pricings.append(flat)
+    for pv in item.get("providers") or []:
+        if isinstance(pv, dict):
+            pr = pv.get("pricing")
+            if isinstance(pr, dict):
+                pricings.append(pr)
+    if not pricings:
+        return False
+    return all(_pricing_is_paid(pr) for pr in pricings)
+
+
 async def fetch_models(
     client: httpx.AsyncClient,
     base_url: str,
@@ -482,21 +514,11 @@ async def fetch_models(
                         if any(kw in lower for kw in non_chat):
                             continue
                         # 免费过滤
-                        if free_only:
-                            pricing = m.get("pricing") or {}
-                            try:
-                                if float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0:
-                                    continue
-                            except (ValueError, TypeError):
-                                pass
-                        if free_out is not None:
-                            pricing = m.get("pricing") or {}
-                            try:
-                                is_paid = float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0
-                            except (ValueError, TypeError):
-                                is_paid = False  # 上游没给 pricing → 按免费处理（与 free_only 过滤口径一致）
-                            if not is_paid:
-                                free_out.add(model_id)
+                        is_paid_model_item = model_pricing_is_paid(m)
+                        if free_only and is_paid_model_item:
+                            continue
+                        if free_out is not None and not is_paid_model_item:
+                            free_out.add(model_id)
                         result.append(model_id)
                     return result
                 last_error = f"HTTP {resp.status_code} ({auth_type})"
@@ -646,6 +668,12 @@ async def run_full_check(on_progress=None) -> dict:
             # 探测它们只会白烧上游额度，因此不再纳入全量检测（2026-11-23 用户要求）。
             # 勾了「仅拉取免费模型」的提供商还会再过滤掉收费模型，避免产生费用。
             models_to_check = checkable_models(provider)
+            if not models_to_check:
+                logger.warning(
+                    "  [跳过检测] %s 没有可检测的模型（models=%d，free_only=%s）",
+                    provider.name, len(provider.models or []), provider.free_only,
+                )
+                continue
             skipped_paid = len(provider.models or []) - len(models_to_check)
             logger.info(
                 "\033[94m  检测服务商: %s (%d 个模型%s)\033[0m",

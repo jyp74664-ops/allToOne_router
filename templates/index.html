@@ -329,7 +329,7 @@
         <div style="margin-bottom: 12px; display: flex; gap: 8px; justify-content: space-between; align-items: center;">
           <div style="display: flex; gap: 8px;">
             <button class="btn" onclick="selectAllModels(true)"
-              title="只勾选“有成功率”的模型（近 24 小时有检测记录）；没有成功率记录的模型保持不勾选">全选</button>
+              title="只勾选“有成功率”的模型（近 24 小时有检测记录）；没有成功率记录的保持不勾选。例外：整个列表一条成功率都没有时（全新提供商），会退化为全部勾选">全选</button>
             <button class="btn" onclick="selectAllModels(false)" title="取消勾选当前列表中可见的全部模型">取消全选</button>
           </div>
           <input type="text" id="modalSearchInput" placeholder="搜索模型..." oninput="filterModalModels()"

@@ -400,6 +400,20 @@ async def check_provider(name: str, _=Depends(verify_admin)):
     if getattr(provider, "check_enabled", True) is False:
         raise HTTPException(400, "该提供商已关闭检测，请先打开开关")
     
+    # 没有可检测的模型时别静默返回「0 正常 / 0 异常」，否则用户会以为检测坏了
+    from services.health_service import checkable_models
+    if not checkable_models(provider):
+        if not (provider.models or []):
+            raise HTTPException(
+                400,
+                f"{name} 当前没有任何模型（模型列表为空），请先打开「⚙️ 模型」勾选并保存，再点检测",
+            )
+        raise HTTPException(
+            400,
+            f"{name} 勾选了「仅拉取免费模型」，但已配置的模型在上游都判为收费模型，已全部跳过；"
+            "如需检测收费模型，请取消该勾选后保存",
+        )
+    
     # 只检查当前提供商的模型
     async def check_single_provider():
         """仅检查指定提供商"""
@@ -414,7 +428,6 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         retire_list: list[str] = []  # EOL/404 待永久移除
         # 与全量检测口径一致：只探测已勾选的模型；勾了「仅拉取免费模型」的
         # 提供商还要再滤掉收费模型，避免探测收费接口产生费用。
-        from services.health_service import checkable_models
         models_to_check = checkable_models(provider)
         total = len(models_to_check)
         current = 0

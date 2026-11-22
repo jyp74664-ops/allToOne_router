@@ -437,3 +437,46 @@ def test_manual_check_allows_paid_model_when_free_off(local_client, initialized_
     r = local_client.post("/api/check/paidok/paid-b")
     assert r.status_code == 200, r.text
     assert r.json().get("status") == "ok"
+
+
+def test_model_pricing_is_paid_handles_nested_providers():
+    """AMD/OpenRouter 这类把价格放在 providers[].pricing 里的上游也要能判出收费。"""
+    from services.health_service import model_pricing_is_paid
+
+    # 扁平：全 0 → 免费
+    assert model_pricing_is_paid({"pricing": {"prompt": "0", "completion": "0"}}) is False
+    # 扁平：非 0 → 收费
+    assert model_pricing_is_paid({"pricing": {"prompt": "3.5e-8", "completion": "0"}}) is True
+    # 嵌套：所有渠道都收费 → 收费
+    assert model_pricing_is_paid({"providers": [
+        {"pricing": {"prompt": "1e-6", "completion": "1e-6"}},
+        {"pricing": {"prompt": "2e-6", "completion": "0"}},
+    ]}) is True
+    # 嵌套：有一个渠道免费 → 免费
+    assert model_pricing_is_paid({"providers": [
+        {"pricing": {"prompt": "1e-6", "completion": "1e-6"}},
+        {"pricing": {"prompt": "0", "completion": "0"}},
+    ]}) is False
+    # 完全没有价格信息 → 按免费处理
+    assert model_pricing_is_paid({"id": "x"}) is False
+
+
+def test_check_provider_rejects_empty_models(local_client, initialized_db):
+    """模型列表为空时不能静默返回 0/0，要给出可操作的 400 提示。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="empty", base_url="https://a/v1", api_key="k",
+                           models=[], disabled_models=[], retired_models=[],
+                           free_models=[], free_only=False, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.post("/api/check/provider/empty")
+    assert r.status_code == 400, r.text
+    assert "模型列表为空" in r.text

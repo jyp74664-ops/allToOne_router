@@ -736,7 +736,13 @@
         });
         
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          // 后端会给出可操作的原因（例如「模型列表为空，请先勾选保存」），优先展示它
+          let detail = '';
+          try {
+            const errBody = await response.json();
+            detail = errBody && errBody.detail ? String(errBody.detail) : '';
+          } catch (e) { /* 非 JSON 响应，退回状态码 */ }
+          throw new Error(detail || `HTTP ${response.status}`);
         }
         
         const reader = response.body.getReader();
@@ -776,9 +782,9 @@
           }
         }
       } catch (e) {
-        if (e.name !== 'AbortError') {
+        if (e.name !== 'AbortError' && e.message !== 'Unauthorized') {
           console.error("Check failed", e);
-          showToast("检测请求失败", "error");
+          showToast('检测失败：' + (e.message || '未知错误'), 'error');
         }
       } finally {
         btn.innerHTML = originalHtml;
@@ -1145,22 +1151,33 @@
       head.indeterminate = on > 0 && on < boxes.length;
     }
 
-    function toggleModalSelectAll(checked) {
-      document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        if (cb.closest('tr').style.display === 'none') return;
-        // 全选只勾"有成功率"的模型；没有成功率记录的保持不勾选
-        cb.checked = checked ? cb.dataset.hasSuccess === '1' : false;
-      });
+    // 全选的实际执行：只勾有成功率的行；整列表都没有成功率时退化为全勾
+    function applyModalSelectAll(checked) {
+      const boxes = [...document.querySelectorAll('#modalModelTableBody .modal-model-checkbox')]
+        .filter(cb => cb.closest('tr').style.display !== 'none');
+      if (!checked) {
+        boxes.forEach(cb => { cb.checked = false; });
+        syncModalSelectAllState();
+        return { fallback: false };
+      }
+      const withSuccess = boxes.filter(cb => cb.dataset.hasSuccess === '1');
+      // 全新提供商可能一个成功率记录都没有；此时若还按规则不勾，用户将无从下手，
+      // 因此退化为全勾（仅限"整个列表 0 条成功率"这一种情况）
+      const fallback = withSuccess.length === 0 && boxes.length > 0;
+      boxes.forEach(cb => { cb.checked = fallback ? true : cb.dataset.hasSuccess === '1'; });
       syncModalSelectAllState();
+      return { fallback };
+    }
+
+    function toggleModalSelectAll(checked) {
+      applyModalSelectAll(checked);
     }
 
     function selectAllModels(check) {
-      document.querySelectorAll('#modalModelTableBody .modal-model-checkbox').forEach(cb => {
-        if (cb.closest('tr').style.display === 'none') return;
-        // 全选只勾"有成功率"的模型；没有成功率记录的保持不勾选
-        cb.checked = check ? cb.dataset.hasSuccess === '1' : false;
-      });
-      syncModalSelectAllState();
+      const r = applyModalSelectAll(check);
+      if (check && r.fallback) {
+        showToast('该提供商下没有任何成功率记录，已按全选处理（保存前请自行确认模型是否可用）', 'warn');
+      }
     }
 
     async function saveModelSelection() {
