@@ -90,6 +90,12 @@ class Database:
                 ))
             except Exception:
                 pass  # 列已存在则忽略
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE providers ADD COLUMN check_enabled BOOLEAN DEFAULT 1"
+                ))
+            except Exception:
+                pass  # 列已存在则忽略
         # 迁移历史 JSONL 数据（如果存在）
         await self._migrate_legacy_data()
     

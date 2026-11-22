@@ -211,12 +211,18 @@
           const pTitle = esc((p.provider_status === 'error' ? '上游 API 不可用' : '') + (!p.models || p.models.length === 0 ? (p.provider_status === 'error' ? '；' : '上游模型列表为空') : ''));
           const pBase = esc(p.base_url || '');
           providersHtml += `
-        <div class="provider-card" data-provider="${pName}">
+        <div class="provider-card${p.check_enabled === false ? ' provider-check-off' : ''}" data-provider="${pName}">
           <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; gap: 6px; flex-wrap: wrap;">
-            <div class="p-name ${(p.provider_status === 'error' || !p.models || p.models.length === 0) ? 'provider-error' : ''}" style="margin-bottom: 0;" title="${pTitle}">${pName} Configuration</div>
+            <div class="p-name-wrap" style="display:flex;align-items:center;gap:8px;min-width:0;">
+              <label class="switch switch-sm" title="关闭后该提供商不参与健康检测（全量/自动检测都会跳过）">
+                <input type="checkbox" class="chk-check-enabled" data-provider="${pName}" ${p.check_enabled === false ? '' : 'checked'}>
+                <span class="slider"></span>
+              </label>
+              <div class="p-name ${(p.provider_status === 'error' || !p.models || p.models.length === 0) ? 'provider-error' : ''}" style="margin-bottom: 0;" title="${pTitle}">${pName} Configuration</div>
+            </div>
             <div style="display: flex; gap: 6px; flex-shrink: 0; align-items: center;">
               ${p.free_only === false ? '<span style="font-size:11px;color:var(--warning);background:rgba(255,204,0,0.15);padding:2px 6px;border-radius:4px;" title="包含收费模型">含收费</span>' : ''}
-              <button class="btn act-check" style="padding: 4px 8px; font-size: 11px;">🔍 检查</button>
+              <button class="btn act-check" style="padding: 4px 8px; font-size: 11px;" ${p.check_enabled === false ? 'disabled title="已关闭检测，请先打开左侧开关"' : ''}>🔍 检查</button>
               <button class="btn act-models" style="padding: 4px 8px; font-size: 11px;">⚙️ 模型</button>
               <button class="btn act-edit" style="padding: 4px 8px; font-size: 11px;">✏️ 编辑</button>
               <button class="btn act-delete" style="padding: 4px 8px; font-size: 11px; color: var(--danger);">🗑 删除</button>
@@ -267,6 +273,8 @@
           const q = s => card.querySelector(s);
           const bCheck = q('.act-check'), bModels = q('.act-models'), bEdit = q('.act-edit'), bDel = q('.act-delete');
           if (bCheck) bCheck.onclick = () => checkProvider(name, bCheck);
+          const chk = q('.chk-check-enabled');
+          if (chk) chk.onchange = () => toggleProviderCheck(chk.dataset.provider, chk.checked, card);
           if (bModels) bModels.onclick = () => openModelManager(name);
           if (bEdit) bEdit.onclick = () => openProviderEditor(name);
           if (bDel) bDel.onclick = () => deleteProvider(name);
@@ -671,6 +679,34 @@
       try { document.execCommand('copy'); } catch (_) { }
       document.body.removeChild(ta);
       if (icon) { icon.textContent = '📋'; icon.style.opacity = '0.35'; }
+    }
+
+    async function toggleProviderCheck(providerName, enabled, card) {
+      try {
+        const r = await apiFetch(`/api/providers/${encodeURIComponent(providerName)}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ check_enabled: enabled }),
+        });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        showToast(enabled ? `${providerName} 已开启检测` : `${providerName} 已关闭检测`, 'ok');
+        if (card) {
+          card.classList.toggle('provider-check-off', !enabled);
+          const bCheck = card.querySelector('.act-check');
+          if (bCheck) {
+            bCheck.disabled = !enabled;
+            if (enabled) bCheck.removeAttribute('title');
+            else bCheck.title = '已关闭检测，请先打开左侧开关';
+          }
+        }
+      } catch (e) {
+        if (e.message !== 'Unauthorized') {
+          console.error('toggleProviderCheck failed:', e);
+          showToast('切换检测开关失败', 'error');
+          const chk = card ? card.querySelector('.chk-check-enabled') : null;
+          if (chk) chk.checked = !enabled;  // 失败回滚
+        }
+      }
     }
 
     async function checkProvider(providerName, btn) {

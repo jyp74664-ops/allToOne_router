@@ -679,6 +679,32 @@
       color: var(--accent-primary);
     }
 
+    /* 供应商卡片的检测开关（小号） */
+    .switch.switch-sm {
+      width: 30px;
+      height: 18px;
+      flex-shrink: 0;
+    }
+    .switch.switch-sm .slider:before {
+      height: 14px;
+      width: 14px;
+      left: 2px;
+      bottom: 2px;
+    }
+    .switch.switch-sm input:checked + .slider:before {
+      transform: translateX(12px);
+    }
+    .provider-card.provider-check-off {
+      opacity: 0.55;
+      background-image: repeating-linear-gradient(
+        45deg, transparent, transparent 8px,
+        rgba(128, 128, 128, 0.06) 8px, rgba(128, 128, 128, 0.06) 16px
+      );
+    }
+    .provider-card.provider-check-off .act-check {
+      cursor: not-allowed;
+    }
+
     .switch {
       position: relative;
       display: inline-block;

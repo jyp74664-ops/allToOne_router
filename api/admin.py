@@ -84,6 +84,7 @@ class ProviderUpdate(BaseModel):
     models: Optional[list[str]] = None
     disabled_models: Optional[list[str]] = None
     free_only: Optional[bool] = None
+    check_enabled: Optional[bool] = None
 
 
 class ToggleModelIn(BaseModel):
@@ -381,6 +382,8 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         provider = result.scalar_one_or_none()
     if not provider:
         raise HTTPException(404, "未找到该提供商")
+    if getattr(provider, "check_enabled", True) is False:
+        raise HTTPException(400, "该提供商已关闭检测，请先打开开关")
     
     # 只检查当前提供商的模型
     async def check_single_provider():

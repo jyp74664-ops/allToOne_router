@@ -53,6 +53,7 @@ class ProviderService:
                     "models": p.models or [],
                     "disabled_models": p.disabled_models or [],
                     "free_only": p.free_only,
+                    "check_enabled": p.check_enabled is not False,
                     "provider_status": p.provider_status,
                     "health": health,
                     "created_at": p.created_at.isoformat(),

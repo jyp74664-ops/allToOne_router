@@ -590,6 +590,10 @@ async def run_full_check(on_progress=None) -> dict:
         already_deleted: set[str] = set()
         retire_by_provider: dict[str, list[str]] = {}  # EOL/404 待永久移除
         for provider in providers:
+            # 关闭了检测的提供商整体跳过（不探测、不刷日志）
+            if getattr(provider, "check_enabled", True) is False:
+                logger.info("  [跳过检测] %s (已关闭检测)", provider.name)
+                continue
             # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测，
             # 以便后台能看到被禁用模型的上游状态；但它们不参与路由，
             # 探测结果不应计入熔断/失败计数，避免污染 provider 状态）

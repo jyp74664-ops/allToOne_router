@@ -28,3 +28,6 @@ backups/
 # 测评中间产物（报告保留，原始数据按需要提交）
 speed_*.json
 summary_rows.json
+
+# 本地临时备份（不进仓库）
+*.bak-*

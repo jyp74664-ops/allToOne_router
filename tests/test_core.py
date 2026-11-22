@@ -232,3 +232,79 @@ def test_sync_skips_retired_models(initialized_db, monkeypatch):
             p_ = (await s.execute(select(Provider).where(Provider.name == "sync-test"))).scalar_one()
             assert p_.models == ["live-model"]
     asyncio.run(verify())
+
+
+def test_check_enabled_skips_provider(initialized_db, monkeypatch):
+    """check_enabled=False 的提供商不参与全量检测。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.health_service as hs
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="on-prov", base_url="https://a/v1", api_key="k",
+                           models=["m-on"], disabled_models=[], check_enabled=True))
+            s.add(Provider(name="off-prov", base_url="https://b/v1", api_key="k",
+                           models=["m-off"], disabled_models=[], check_enabled=False))
+            await s.commit()
+    asyncio.run(seed())
+
+    called = []
+
+    async def fake_check(client, base_url, api_key, model, aliases, **kw):
+        called.append(model)
+        return {"status": "ok", "code": 200, "latency_ms": 1}
+    monkeypatch.setattr(hs, "check_model", fake_check)
+
+    results = asyncio.run(hs.run_full_check())
+    assert "m-on" in called
+    assert "m-off" not in called
+    assert any(k.endswith("||m-on") for k in results)
+    assert not any(k.endswith("||m-off") for k in results)
+
+
+def test_check_provider_rejects_disabled(local_client, initialized_db):
+    """关闭检测后手动单点检查返回 400。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="closed", base_url="https://x/v1", api_key="k",
+                           models=["m"], disabled_models=[], check_enabled=False))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.post("/api/check/provider/closed")
+    assert r.status_code == 400, r.text
+    assert "关闭检测" in r.text
+
+
+def test_providers_list_exposes_check_enabled(local_client, initialized_db):
+    """列表接口返回 check_enabled，供前端渲染开关。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="p-on", base_url="https://a/v1", api_key="k",
+                           models=["m"], disabled_models=[], check_enabled=True))
+            s.add(Provider(name="p-off", base_url="https://b/v1", api_key="k",
+                           models=["m"], disabled_models=[], check_enabled=False))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.get("/api/providers")
+    assert r.status_code == 200, r.text
+    by_name = {p["name"]: p for p in r.json()}
+    assert by_name["p-on"]["check_enabled"] is True
+    assert by_name["p-off"]["check_enabled"] is False
