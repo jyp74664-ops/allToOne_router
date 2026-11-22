@@ -246,8 +246,19 @@ async def proxy_chat(request: Request, force: bool = False):
         logger.error("\033[91m✗ 无可用的模型候选: %s\033[0m", requested_model)
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
 
-    # 按优先级排序：先按失败次数升序（失败少的优先），再按模型大小降序（大的优先）
-    candidates.sort(key=lambda c: (health_state.get_fail_count(f"{c[0].name}||{c[2]}"), -health_state.get_model_size(f"{c[0].name}||{c[2]}")))
+    # 按质量分与延迟择优：质量分高、延迟低、失败少、模型大的优先
+    # 无历史数据时质量分默认 1.0、延迟用大数占位，退化为按失败次数与大小排序
+    def _route_key(c):
+        k = f"{c[0].name}||{c[2]}"
+        quality = health_state.get_quality_score(k)
+        latency = health_state.get_avg_latency(k)
+        return (
+            -quality,
+            latency if latency is not None else float("inf"),
+            health_state.get_fail_count(k),
+            -health_state.get_model_size(k),
+        )
+    candidates.sort(key=_route_key)
     
     logger.info("\033[93m▶ 路由请求: %s (%d 个候选)\033[0m", requested_model, len(candidates))
 

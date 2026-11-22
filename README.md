@@ -72,6 +72,25 @@ flowgate/
 - `verify_ssl`: 默认 `true` 校验上游 TLS 证书。若某个上游用自签证书导致失败，可临时设为 `false`（有中间人风险）。
 - `auto_validate_interval`: 自动验证间隔，最小 30 秒。
 
+## 测试
+
+```bash
+pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest
+```
+
+15 个回归测试覆盖鉴权（本机/局域网/伪造代理头/代理透传）、只读端点、Prometheus 指标、限流解析、路由组 CRUD、Webhook。测试使用临时数据库，不触碰真实 `flowgate.db`，也不调用任何上游 API。
+
+## 反向代理
+
+默认不信任任何代理头，本机判定只看 TCP 对端。若经 Nginx 等反代访问，在 `config.json` 配置：
+
+```json
+"trusted_proxies": ["127.0.0.1", "10.0.0.0/8"]
+```
+
+只有直连对端在白名单内才解析 `X-Forwarded-For`，且从右往左跳过可信代理跳，防止伪造。
+
 ## 数据库维护
 
 ```bash

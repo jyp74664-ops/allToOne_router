@@ -28,13 +28,21 @@ async def prometheus_metrics():
     metrics_lines.append("# TYPE flowgate_providers_total gauge")
     metrics_lines.append(f"flowgate_providers_total {providers_total}")
 
-    # 健康模型数量
-    metrics_lines.append("# HELP flowgate_models_total Total number of models")
+    # 模型数量：以配置总数为基准，未检查的归入 unknown（冷启动时不再恒为 0）
+    metrics_lines.append("# HELP flowgate_models_total Configured models by health status")
     metrics_lines.append("# TYPE flowgate_models_total gauge")
+    from sqlalchemy import select as _select
+    from database.models import Provider as _Provider
+    async with db.SessionLocal() as session:
+        _rows = (await session.execute(_select(_Provider.models))).scalars().all()
+    configured = {m for models in _rows for m in (models or [])}
     ok_count = sum(1 for v in health_state.health_status.values() if v.get("status") == "ok")
     fail_count = sum(1 for v in health_state.health_status.values() if v.get("status") in ("fail", "error"))
+    checked = ok_count + fail_count
+    unknown_count = max(0, len(configured) - checked)
     metrics_lines.append(f'flowgate_models_total{{status="ok"}} {ok_count}')
     metrics_lines.append(f'flowgate_models_total{{status="fail"}} {fail_count}')
+    metrics_lines.append(f'flowgate_models_total{{status="unknown"}} {unknown_count}')
 
     # 用量统计（从数据库汇总）
     async with db.SessionLocal() as session:

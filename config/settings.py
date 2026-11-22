@@ -17,6 +17,8 @@ class AppConfig(BaseModel):
     merge_reasoning: bool = True
     verify_ssl: bool = True
     announcement_url: Optional[str] = None
+    # 可信反向代理的 IP 或 CIDR 列表。为空时不信任任何代理头（默认安全）。
+    trusted_proxies: list[str] = []
 
 
 class Settings:

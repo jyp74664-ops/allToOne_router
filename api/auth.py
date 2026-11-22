@@ -5,13 +5,15 @@
 - 客户端调用 /v1/* 仍用 local_api_key，现有客户端零改动。
 - 会话 token 为 HMAC 签名的自包含 token，无服务端状态，改密码后旧会话自动失效。
 
-安全说明：本机判定只看 TCP 连接对端地址（request.client.host），
-绝不看 X-Forwarded-For 等客户端可伪造的请求头。若将来套了反向代理，
-代理机地址会变成 127.0.0.1 而导致本机信任失效，届时需重新评估。
+安全说明：
+- 默认不信任任何代理，本机判定只看 TCP 对端地址，X-Forwarded-For 被完全忽略。
+- 若套了反向代理，需在 config.json 的 trusted_proxies 填入代理 IP/CIDR；
+  只有直连对端在该白名单内时才解析代理头，并从右往左跳过可信跳，防伪造。
 """
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import secrets
 import time
@@ -28,10 +30,48 @@ SESSION_TTL_SECONDS = 12 * 3600
 LOCAL_HOSTS = {"127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost"}
 
 
-def is_local_request(request: Request) -> bool:
-    """判断请求是否来自本机（只看 TCP 对端，不信任任何代理头）。"""
+def _ip_in_networks(ip: str, networks: list[str]) -> bool:
+    """判断 IP 是否落在可信代理列表（支持 CIDR）。无效配置一律不匹配。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for net in networks:
+        try:
+            if addr in ipaddress.ip_network(net, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def get_client_ip(request: Request) -> str:
+    """解析真实客户端 IP。
+
+    - 直连对端不在 trusted_proxies 时：完全忽略 X-Forwarded-For（防伪造）。
+    - 直连对端可信时：从右往左跳过可信代理跳，取最右侧的不可信地址。
+    """
     client = request.client
-    return bool(client and client.host and client.host.lower() in LOCAL_HOSTS)
+    direct = client.host if client else ""
+    if not direct:
+        return ""
+    trusted = settings.load().trusted_proxies or []
+    if not _ip_in_networks(direct, trusted):
+        return direct
+
+    xff = request.headers.get("x-forwarded-for", "")
+    if not xff:
+        return direct
+    chain = [ip.strip() for ip in xff.split(",") if ip.strip()]
+    for ip in reversed(chain):
+        if not _ip_in_networks(ip, trusted):
+            return ip
+    return chain[0] if chain else direct
+
+
+def is_local_request(request: Request) -> bool:
+    """判断请求是否来自本机（支持显式配置的可信代理透传）。"""
+    return get_client_ip(request).lower() in LOCAL_HOSTS
 
 
 def _signing_key() -> bytes:

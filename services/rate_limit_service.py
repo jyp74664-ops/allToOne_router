@@ -14,7 +14,10 @@ RATE_LIMIT_GLOSSARY = {
     "RPS": ("请求/秒", "请求"),
 }
 
-RATE_LIMIT_DATA_URL = "https://raw.githubusercontent.com/mnfst/awesome-free-llm-apis/main/data.json"
+RATE_LIMIT_DATA_URLS = [
+    "https://raw.githubusercontent.com/mnfst/awesome-free-llm-apis/main/data.json",
+    "https://fastly.jsdelivr.net/gh/mnfst/awesome-free-llm-apis@main/data.json",
+]
 
 
 def translate_rate_limit(rate_limit_str: str) -> str:
@@ -50,15 +53,25 @@ def rate_limit_tooltip(rate_limit_str: str) -> str:
 
 async def sync_rate_limits(client: httpx.AsyncClient, meta_service) -> dict:
     """从 GitHub 下载速率限制数据并匹配"""
-    try:
-        resp = await client.get(RATE_LIMIT_DATA_URL, timeout=30)
-        if resp.status_code != 200:
-            logger.warning("rate-limit fetch failed: HTTP %d", resp.status_code)
-            return {"ok": False, "detail": f"HTTP {resp.status_code}"}
-        data = resp.json()
-    except Exception as e:
-        logger.warning("rate-limit fetch error: %s", e)
-        return {"ok": False, "detail": str(e)}
+    last_error = ""
+    data = None
+    source_used = ""
+    for url in RATE_LIMIT_DATA_URLS:
+        try:
+            resp = await client.get(url, timeout=15)
+            if resp.status_code != 200:
+                last_error = f"HTTP {resp.status_code}"
+                logger.warning("rate-limit fetch %s failed: %s", url, last_error)
+                continue
+            data = resp.json()
+            source_used = url
+            break
+        except Exception as e:
+            last_error = str(e)
+            logger.warning("rate-limit fetch %s error: %s", url, e)
+    if data is None:
+        return {"ok": False, "detail": f"所有数据源均失败，最后错误: {last_error}"}
+    logger.info("rate-limit data loaded from %s", source_used)
     
     # 构建 baseUrl → provider 映射
     url_map = {}
@@ -154,4 +167,4 @@ async def sync_rate_limits(client: httpx.AsyncClient, meta_service) -> dict:
     meta_service._save_meta()
     
     logger.info("rate-limit sync: %d matched out of %d total models", matched, sum(len(p.models or []) for p in providers))
-    return {"ok": True, "matched": matched, "total_providers": len(data.get("providers", []))}
+    return {"ok": True, "matched": matched, "total_providers": len(data.get("providers", [])), "source": source_used}

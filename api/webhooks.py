@@ -28,9 +28,15 @@ def _to_dict(w: Webhook) -> dict:
         "id": w.id,
         "url": w.url,
         "events": w.events or [],
-        "secret": w.secret,
+        "secret": "****" if w.secret else "",
+        "has_secret": bool(w.secret),
         "enabled": w.enabled,
     }
+
+
+class WebhookTestIn(BaseModel):
+    url: str
+    secret: str = ""
 
 
 @router.get("/configs")
@@ -56,6 +62,34 @@ async def add_webhook(data: WebhookConfig, _=Depends(verify_admin)):
         await session.commit()
         await session.refresh(w)
         return {"ok": True, "webhook": _to_dict(w)}
+
+
+@router.post("/test")
+async def test_webhook(data: WebhookTestIn, _=Depends(verify_admin)):
+    """发送一条测试事件，验证 Webhook 连通性（不落库）。"""
+    from urllib.parse import urlparse
+    parsed = urlparse(data.url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise HTTPException(400, "Webhook URL 必须是有效的 http(s) 地址")
+
+    import httpx
+    headers = {"Content-Type": "application/json"}
+    if data.secret:
+        headers["X-Webhook-Secret"] = data.secret
+    payload = {
+        "event": "webhook.test",
+        "data": {"message": "FlowGate webhook 连通性测试", "ts": int(__import__("time").time())},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=10, verify=settings.load().verify_ssl) as client:
+            resp = await client.post(data.url, json=payload, headers=headers)
+        return {
+            "ok": 200 <= resp.status_code < 300,
+            "status_code": resp.status_code,
+            "detail": resp.text[:200],
+        }
+    except Exception as e:
+        return {"ok": False, "status_code": 0, "detail": str(e)[:200]}
 
 
 @router.delete("/configs/{id}")
