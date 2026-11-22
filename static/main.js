@@ -397,7 +397,7 @@
         }, 30000);
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
-        if (d.skipped) showToast(`已跳过 ${d.skipped} 个未勾选（或已关闭检测）的模型`, 'warn', 5000);
+        if (d.skipped) showToast(`已跳过 ${d.skipped} 个（提供商已删除或数据不完整）`, 'warn', 5000);
         await pollSpeedTest(d.run_id, btn, original);
       } catch (e) {
         if (btn) { btn.disabled = false; btn.innerHTML = original; }
@@ -667,9 +667,6 @@
             case 'avg_latency_ms':
               va = a.avg_latency_ms ?? Infinity; vb = b.avg_latency_ms ?? Infinity;
               return asc ? va - vb : vb - va;
-            case 'min_latency_ms':
-              va = a.min_latency_ms ?? Infinity; vb = b.min_latency_ms ?? Infinity;
-              return asc ? va - vb : vb - va;
             case 'tokens_per_sec':
               // 旧口径（探针估算），列已下线，保留 case 以防旧数据触发
               va = Number.isFinite(Number(a.tokens_per_sec)) ? Number(a.tokens_per_sec) : -1;
@@ -717,7 +714,7 @@
           why = '没有匹配的模型，试试调整筛选条件或搜索词。';
         }
         lastFilteredRows = [];
-        tbody.innerHTML = `<tr><td colspan="11" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);line-height:1.7;">${esc(why)}</td></tr>`;
+        tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);line-height:1.7;">${esc(why)}</td></tr>`;
         return;
       }
 
@@ -727,8 +724,6 @@
         const barColor = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--danger)';
         const formatLatency = value => Number.isFinite(Number(value)) ? Math.round(Number(value)) + ' ms' : '--';
         const avgL = formatLatency(d.avg_latency_ms);
-        const minL = formatLatency(d.min_latency_ms);
-        const maxL = formatLatency(d.max_latency_ms);
         // 真实测速（手动「⚡ 测速」写入）：首 token 延迟 + 首 token 之后的解码速率
         const ttft = Number(d.ttft_ms);
         const hasTtft = Number.isFinite(ttft) && ttft > 0;
@@ -803,11 +798,6 @@
         <span style="color:var(--danger);font-weight:600">${fail}</span>
       </td>
       <td class="latency ${d.avg_latency_ms && d.avg_latency_ms < 3000 ? 'fast' : d.avg_latency_ms && d.avg_latency_ms < 8000 ? 'medium' : ''}">${avgL}</td>
-      <td class="latency" style="font-size:12px;">
-        <span style="color:var(--success)">${minL}</span>
-        <span style="color:var(--text-secondary);margin:0 4px">~</span>
-        <span style="color:var(--text-secondary)">${maxL}</span>
-      </td>
       <td class="latency" style="font-size:12px;color:${ttftColor}">${ttftStr}</td>
       <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}">${rtpsStr}</td>
     </tr>`;

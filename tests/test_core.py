@@ -593,27 +593,51 @@ def test_pricing_is_free_prefers_is_free_flag():
     assert model_pricing_is_paid({"id": "no-pricing"}) is False
 
 
-def test_speed_test_rejects_unchecked_models(initialized_db, local_client):
-    """测速只测已勾选的模型：请求里带未勾选模型时，若一个都不剩就返回 400 说清原因。"""
+def test_speed_test_uses_current_view(initialized_db, local_client, monkeypatch):
+    """测速按「当前视图」走：未勾选、甚至已关检测的模型，只要在表格里就会被测。
+
+    2026-11-23 用户改口径：原来只测 provider.models 里勾选的，实际用起来大量行被跳过。
+    """
     from database import engine as engine_mod
+    import services.speed_service as speed_service
 
     db = engine_mod.db
 
     async def seed():
         async with db.SessionLocal() as s:
-            s.add(Provider(name="sp-guard", base_url="https://x/v1", api_key="k",
+            s.add(Provider(name="sp-view", base_url="https://x/v1", api_key="k",
                            models=["checked-a"], disabled_models=["unchecked-b"],
                            retired_models=[], free_models=[], free_only=False,
-                           check_enabled=True))
+                           check_enabled=False))
             await s.commit()
     asyncio.run(seed())
 
+    captured = {}
+
+    def fake_create_run(items, max_tokens, skipped=0):
+        captured["items"] = list(items)
+        captured["skipped"] = skipped
+        return "run-test"
+
+    monkeypatch.setattr(speed_service, "create_run", fake_create_run)
+
     r = local_client.post(
         "/api/speed-test/start",
-        json={"items": [{"provider": "sp-guard", "model": "unchecked-b"}]},
+        json={"items": [{"provider": "sp-view", "model": "unchecked-b"}]},
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["total"] == 1
+    assert captured["items"] == [("sp-view", "unchecked-b")]
+    assert captured["skipped"] == 0
+
+
+def test_speed_test_rejects_unknown_provider(initialized_db, local_client):
+    """提供商已被删除时没有可测对象，返回 400 而不是静默返回空任务。"""
+    r = local_client.post(
+        "/api/speed-test/start",
+        json={"items": [{"provider": "nope", "model": "m"}]},
     )
     assert r.status_code == 400, r.text
-    assert "勾选" in r.text
 
 
 def test_stability_exposes_real_speed(initialized_db, local_client):

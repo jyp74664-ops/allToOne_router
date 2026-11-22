@@ -146,7 +146,7 @@
           </select>
           <input type="text" id="stableSearch" placeholder="搜索模型标识..." oninput="renderStability(); saveFilterState()">
           <button class="btn" id="speedTestBtn" onclick="runSpeedTest(this)" style="margin-left:auto;flex-shrink:0;"
-            title="对当前筛选出的模型逐个发一次流式请求（生成 128 token），测量首 Token 延迟与真实解码速度。只测已勾选的模型，会消耗上游额度，需要时再点">⚡ 测速</button>
+            title="对当前表格里筛出来的这一列模型逐个发一次流式请求（生成 128 token），测量首 Token 延迟与真实解码速度。测的是当前视图，与「模型管理」里的勾选无关；会消耗上游额度，需要时再点">⚡ 测速</button>
           <button class="btn" id="refreshListBtn" onclick="refreshMonitorList(this)" style="flex-shrink:0;"
             title="重新拉取模型清单与当前时间窗口的检测统计（只读数据，不发起检测、不消耗上游额度）">↻ 刷新</button>
         </div>
@@ -167,7 +167,6 @@
                 <th class="sortable" data-sort="checks">探针次数 <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="ok">成功 / 失败 <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="avg_latency_ms">平均延迟 <span class="sort-icon">⇅</span></th>
-                <th class="sortable" data-sort="min_latency_ms">极速 / 最慢 <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="ttft_ms"
                   title="首 Token 延迟（TTFT）：从发出请求到收到第一个内容 token 的时间，包含网络往返与上游排队。越小越跟手">首 Token <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="real_tps"

@@ -811,7 +811,8 @@ class SpeedTestIn(BaseModel):
 async def start_speed_test(body: SpeedTestIn, _=Depends(verify_admin)):
     """启动一次真实生成速度测速。
 
-    口径与检测一致：只测「已勾选（provider.models）且未关闭检测」的模型，其余跳过并计数。
+    口径：测的是「前端当前表格里筛出来的这一列」，与「模型管理」里的勾选、
+    提供商检测开关都无关——用户点的是「测我现在看到的这些」。只校验提供商仍然存在。
     任务在后台跑，前端用 /speed-test/status 轮询进度。
     """
     from database.models import Provider
@@ -839,15 +840,8 @@ async def start_speed_test(body: SpeedTestIn, _=Depends(verify_admin)):
             continue
         name = str(it.get("provider") or "").strip()
         model = str(it.get("model") or "").strip()
-        p = providers.get(name)
-        if not p or not model:
-            skipped += 1
-            continue
-        if getattr(p, "check_enabled", True) is False:
-            skipped += 1  # 已关闭检测的提供商不测，避免烧额度
-            continue
-        if model not in (p.models or []):
-            skipped += 1  # 未勾选参与路由的模型不测
+        if not model or name not in providers:
+            skipped += 1  # 提供商已被删除 / 数据不完整
             continue
         key = (name, model)
         if key in seen:
@@ -858,8 +852,8 @@ async def start_speed_test(body: SpeedTestIn, _=Depends(verify_admin)):
     if not picked:
         raise HTTPException(
             400,
-            "所选模型都不在「已勾选」范围内：测速只测模型管理里勾选过的模型，"
-            "请先在「⚙️ 模型」里勾选，或调整表格筛选条件",
+            "表格里没有可测速的模型：这些模型所属的提供商可能已被删除。"
+            "点「↻ 刷新」重新拉取列表后再试",
         )
     if len(picked) > speed_service.MAX_ITEMS:
         skipped += len(picked) - speed_service.MAX_ITEMS
