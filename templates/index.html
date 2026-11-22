@@ -69,6 +69,15 @@
               </label>
               <span style="font-size: 12px; color: var(--text-secondary);" title="开启后每 30 分钟自动巡检全部已勾选的模型（等同手动点“立即检测”）。不会立即执行，且会持续消耗上游额度；关闭后当前这一轮仍会跑完。">自动验证链接</span>
             </div>
+            <!-- 检测日志入口：常驻右上角，点开查看最近一次单服务商日志与全量日志 -->
+            <button class="btn btn-icon" onclick="openCheckLog()" id="checkLogBtn"
+              title="查看最近一次检测日志：上为单服务商日志，下为全量日志，含每个模型的状态含义、HTTP 状态码与上游原文">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                stroke-linecap="round" stroke-linejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" />
+                <path d="M14 2v6h6M8 13h8M8 17h5" />
+              </svg>
+            </button>
           </div>
         </div>
       </div>
@@ -77,7 +86,6 @@
       <div id="checkLogBubble" class="check-log-bubble" style="display:none;">
         <span class="check-log-bubble-icon">✅</span>
         <span id="checkLogBubbleText" class="check-log-bubble-text">检测完成</span>
-        <button class="check-log-bubble-btn" onclick="openCheckLog()" title="查看最近一次检查的逐模型记录：状态含义、HTTP 状态码与上游原文">查看日志</button>
       </div>
 
       <div id="monitor-view">

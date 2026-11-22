@@ -246,6 +246,17 @@
       background: rgba(255, 255, 255, 0.08);
     }
 
+    /* 纯图标按钮（常驻的检测日志入口） */
+    .btn.btn-icon {
+      padding: 6px 8px;
+      gap: 0;
+      line-height: 0;
+    }
+
+    .btn.btn-icon svg {
+      display: block;
+    }
+
     .btn-primary {
       background: var(--accent-primary);
       border-color: rgba(0, 0, 0, 0.05);
@@ -1089,16 +1100,6 @@
     }
     .check-log-bubble-icon { font-size: 15px; }
     .check-log-bubble-text { flex: 1; font-weight: 500; color: var(--text-primary); }
-    .check-log-bubble-btn {
-      border: none;
-      background: var(--accent-primary, #6B5CE6);
-      color: #fff;
-      border-radius: 6px;
-      padding: 5px 12px;
-      font-size: 12px;
-      cursor: pointer;
-    }
-    .check-log-bubble-btn:hover { filter: brightness(1.08); }
     .check-log-section {
       margin-bottom: 18px;
     }

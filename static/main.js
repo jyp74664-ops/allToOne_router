@@ -91,6 +91,7 @@
     }
 
     /* ============ 检测完成日志气泡 ============ */
+    let _bubbleTimer = null;
     function showCheckLogBubble(summary, hasFail) {
       const box = document.getElementById('checkLogBubble');
       const txt = document.getElementById('checkLogBubbleText');
@@ -99,11 +100,15 @@
       const icon = box.querySelector('.check-log-bubble-icon');
       if (icon) icon.textContent = hasFail ? '⚠️' : '✅';
       box.style.display = 'flex';
+      // 气泡只做提示，日志入口已常驻右上角图标，所以几秒后自动收起
+      if (_bubbleTimer) clearTimeout(_bubbleTimer);
+      _bubbleTimer = setTimeout(dismissCheckLogBubble, 6000);
     }
 
     function dismissCheckLogBubble() {
       const box = document.getElementById('checkLogBubble');
       if (box) box.style.display = 'none';
+      if (_bubbleTimer) { clearTimeout(_bubbleTimer); _bubbleTimer = null; }
     }
 
     async function openCheckLog() {
@@ -159,8 +164,6 @@
     function closeCheckLog() {
       const modal = document.getElementById('checkLogModal');
       if (modal) modal.classList.remove('show');
-      // 关闭日志弹窗时顺带收起“检测完成”气泡，避免它一直挂着显示过期内容
-      dismissCheckLogBubble();
     }
 
     /* ============ 数据 ============ */
@@ -782,7 +785,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
-                showCheckLogBubble(`单服务商 ${providerName} 检测完成：${ok} 正常 / ${fail} 异常 — 点击查看日志`, fail > 0);
+                showCheckLogBubble(`单服务商 ${providerName} 检测完成：${ok} 正常 / ${fail} 异常`, fail > 0);
               } else if (event.provider === providerName) {
                 const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
                 const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
@@ -854,7 +857,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
-                showCheckLogBubble(`全量检测完成：${ok} 正常 / ${fail} 异常 — 点击查看日志`, fail > 0);
+                showCheckLogBubble(`全量检测完成：${ok} 正常 / ${fail} 异常`, fail > 0);
               } else if (event.provider && event.model) {
                 total = event.total;
                 current = event.current;
