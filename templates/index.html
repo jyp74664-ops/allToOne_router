@@ -393,15 +393,27 @@
   <div class="modal-overlay" id="checkLogModal" onclick="if(event.target===this) closeCheckLog()">
     <div class="modal-content" style="max-width: 860px;">
       <div class="modal-header">
-        <div class="modal-title">最近一次检查日志</div>
+        <div class="modal-title">最近检查日志</div>
         <div class="mac-btn close" onclick="closeCheckLog()" style="cursor: pointer;"></div>
       </div>
       <div class="modal-body">
-        <div id="checkLogMeta" style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;"></div>
-        <div id="checkLogBody" class="check-log-body">加载中...</div>
+        <div class="check-log-section">
+          <div class="check-log-section-head">
+            <span class="check-log-section-title">🔍 最近一次单服务商检查</span>
+            <span id="checkLogProviderMeta" class="check-log-section-meta">加载中...</span>
+          </div>
+          <div id="checkLogProviderBody" class="check-log-body">暂无记录</div>
+        </div>
+        <div class="check-log-section">
+          <div class="check-log-section-head">
+            <span class="check-log-section-title">🌐 最近一次全量检查</span>
+            <span id="checkLogAllMeta" class="check-log-section-meta">加载中...</span>
+          </div>
+          <div id="checkLogAllBody" class="check-log-body">暂无记录</div>
+        </div>
       </div>
       <div class="modal-footer">
-        <span style="font-size:12px;color:var(--text-secondary);">仅展示最近一次检查，日志不含 API Key</span>
+        <span style="font-size:12px;color:var(--text-secondary);">每个槽位只保留最新一份，日志不含 API Key</span>
         <button class="btn btn-primary" onclick="closeCheckLog()">关闭</button>
       </div>
     </div>

@@ -465,6 +465,9 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         from services.health_service import retire_models
         if retire_list:
             await retire_models(name, retire_list)
+        # 单服务商日志写入固定槽位（覆盖上一家）
+        from services.usage_service import save_check_log
+        await save_check_log("provider", results, scope=name)
         return results
     
     # 进度回调
@@ -688,53 +691,33 @@ async def get_history(hours: int = 24, _=Depends(verify_admin)):
 
 
 @router.get("/check-log")
-async def get_check_log(limit: int = 300, _=Depends(verify_admin)):
-    """最近一次检查的逐模型日志（含真实含义），供前端日志气泡展示。
+async def get_check_log(_=Depends(verify_admin)):
+    """最近检查日志：两个固定槽位——最近一次单服务商检查 + 最近一次全量检查。
 
-    取最近一条记录往前 window 秒内的所有记录作为一次检查批次；
-    没有精确批次边界时退化为「最近 limit 条」。不含 API Key。
+    每个槽位只保留最新一份，不含 API Key。
     """
-    from datetime import datetime, timedelta
-    from sqlalchemy import select, desc
-    from database.models import HealthRecord
+    from sqlalchemy import select
+    from database.models import CheckLog
     from database.engine import db
-    from services.health_service import explain_status
 
-    limit = max(1, min(limit, 1000))
     async with db.SessionLocal() as session:
-        latest = (await session.execute(
-            select(HealthRecord.checked_at).order_by(desc(HealthRecord.checked_at)).limit(1)
-        )).scalar_one_or_none()
-        if latest is None:
-            return {"checked_at": None, "count": 0, "items": []}
-        cutoff = latest - timedelta(minutes=10)
-        rows = (await session.execute(
-            select(HealthRecord)
-            .where(HealthRecord.checked_at >= cutoff)
-            .order_by(desc(HealthRecord.checked_at))
-            .limit(limit)
-        )).scalars().all()
+        rows = (await session.execute(select(CheckLog))).scalars().all()
 
-    items = []
+    def pack(r: CheckLog) -> dict:
+        return {
+            "scope": r.scope or "",
+            "checked_at": r.checked_at.timestamp() if hasattr(r.checked_at, "timestamp") else None,
+            "count": len(r.items or []),
+            "ok": r.ok_count,
+            "fail": r.fail_count,
+            "items": r.items or [],
+        }
+
+    out = {"provider": None, "all": None}
     for r in rows:
-        ex = explain_status(r.status, r.code, r.detail or "")
-        ts = r.checked_at.timestamp() if hasattr(r.checked_at, "timestamp") else None
-        items.append({
-            "provider": r.provider_name,
-            "model": r.model,
-            "status": r.status,
-            "code": r.code,
-            "latency_ms": r.latency_ms,
-            "detail": (r.detail or "")[:300],
-            "reason": ex["label"],
-            "kind": ex["kind"],
-            "time": ts,
-        })
-    return {
-        "checked_at": latest.timestamp() if hasattr(latest, "timestamp") else None,
-        "count": len(items),
-        "items": items,
-    }
+        if r.slot in out:
+            out[r.slot] = pack(r)
+    return out
 
 
 # ============================================================

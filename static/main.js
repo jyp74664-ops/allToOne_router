@@ -108,40 +108,50 @@
 
     async function openCheckLog() {
       const modal = document.getElementById('checkLogModal');
-      const body = document.getElementById('checkLogBody');
-      const meta = document.getElementById('checkLogMeta');
-      if (!modal || !body) return;
+      if (!modal) return;
       modal.classList.add('show');
-      body.textContent = '加载中...';
-      if (meta) meta.textContent = '';
+      const sections = [
+        { slot: 'provider', body: 'checkLogProviderBody', meta: 'checkLogProviderMeta' },
+        { slot: 'all', body: 'checkLogAllBody', meta: 'checkLogAllMeta' },
+      ];
+      for (const s of sections) {
+        const el = document.getElementById(s.body), meta = document.getElementById(s.meta);
+        if (el) el.textContent = '加载中...';
+        if (meta) meta.textContent = '';
+      }
       try {
         const r = await apiFetch('/api/check-log');
         if (!r.ok) throw new Error('HTTP ' + r.status);
         const d = await r.json();
-        const items = d.items || [];
-        if (!items.length) {
-          body.textContent = '暂无检查记录。';
-          return;
+        for (const s of sections) {
+          const el = document.getElementById(s.body), meta = document.getElementById(s.meta);
+          if (!el) continue;
+          const log = d[s.slot];
+          if (!log || !(log.items || []).length) {
+            el.textContent = '暂无检查记录。';
+            continue;
+          }
+          const tstr = log.checked_at ? new Date(log.checked_at * 1000).toLocaleString('zh-CN') : '未知';
+          if (meta) meta.textContent = `${log.scope ? log.scope + ' · ' : ''}${tstr} · ${log.ok} 正常 / ${log.fail} 异常`;
+          el.innerHTML = log.items.map(it => {
+            const kind = esc(it.kind || 'unknown');
+            const short = esc(it.short || it.status || '?');
+            const reason = esc(it.reason || '');
+            const code = it.code != null ? '[' + esc(String(it.code)) + ']' : '';
+            const who = esc(it.provider + ' · ' + it.model);
+            return `<div class="check-log-row">` +
+              `<span class="check-log-kind" data-kind="${kind}">${short}</span>` +
+              `<span class="check-log-msg">${who} — ${reason}</span>` +
+              `<span class="check-log-code">${code}</span>` +
+              `</div>`;
+          }).join('');
         }
-        if (meta) {
-          const t = d.checked_at ? new Date(d.checked_at * 1000).toLocaleString('zh-CN') : '未知';
-          meta.textContent = `检查时间：${t}　·　共 ${d.count} 条记录`;
-        }
-        body.innerHTML = items.map(it => {
-          const kind = esc(it.kind || 'unknown');
-          const short = esc(it.status_short || it.status || '?');
-          const reason = esc(it.reason || '');
-          const code = it.code != null ? '[' + esc(String(it.code)) + ']' : '';
-          const who = esc(it.provider + ' · ' + it.model);
-          return `<div class="check-log-row">` +
-            `<span class="check-log-kind" data-kind="${kind}">${short}</span>` +
-            `<span class="check-log-msg">${who} — ${reason}</span>` +
-            `<span class="check-log-code">${code}</span>` +
-            `</div>`;
-        }).join('');
       } catch (e) {
         if (e.message !== 'Unauthorized') {
-          body.textContent = '加载失败：' + (e.message || '未知错误');
+          for (const s of sections) {
+            const el = document.getElementById(s.body);
+            if (el) el.textContent = '加载失败：' + (e.message || '未知错误');
+          }
         }
       }
     }
@@ -704,7 +714,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
-                showCheckLogBubble(`检测完成：${ok} 正常 / ${fail} 异常 — 点击查看最新日志`, fail > 0);
+                showCheckLogBubble(`单服务商 ${providerName} 检测完成：${ok} 正常 / ${fail} 异常 — 点击查看日志`, fail > 0);
               } else if (event.provider === providerName) {
                 const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
                 const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
@@ -776,7 +786,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
-                showCheckLogBubble(`检测完成：${ok} 正常 / ${fail} 异常 — 点击查看最新日志`, fail > 0);
+                showCheckLogBubble(`全量检测完成：${ok} 正常 / ${fail} 异常 — 点击查看日志`, fail > 0);
               } else if (event.provider && event.model) {
                 total = event.total;
                 current = event.current;

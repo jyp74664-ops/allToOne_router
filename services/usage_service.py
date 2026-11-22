@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
-from database.models import UsageRecord, HealthRecord
+from database.models import UsageRecord, HealthRecord, CheckLog
 from database.engine import db
 
 logger = logging.getLogger("flowgate.usage")
@@ -64,6 +64,44 @@ async def read_usage(days: int = 1) -> list[dict]:
             for r in records
         ]
 
+
+async def save_check_log(slot: str, results: dict, scope: str = "") -> None:
+    """把一次检查结果写入固定槽位（同槽位覆盖，只留最新一份）。
+
+    slot: "provider"（最近一次单服务商检查）/ "all"（最近一次全量检查）
+    scope: 单检查时的服务商名，全量时为空
+    每条记录带人话含义，供前端日志面板直接展示。
+    """
+    from services.health_service import explain_status
+
+    items = []
+    for key, info in results.items():
+        provider, model = key.split("||", 1)
+        status = info.get("status", "unknown")
+        code = info.get("code")
+        ex = explain_status(status, code, info.get("detail", "") or "")
+        items.append({
+            "provider": provider,
+            "model": model,
+            "status": status,
+            "code": code,
+            "short": ex["short"],
+            "reason": ex["label"],
+            "kind": ex["kind"],
+            "latency_ms": info.get("latency_ms"),
+        })
+    ok = sum(1 for i in items if i["status"] == "ok")
+
+    async with db.SessionLocal() as session:
+        await session.merge(CheckLog(
+            slot=slot,
+            scope=scope,
+            items=items,
+            ok_count=ok,
+            fail_count=len(items) - ok,
+            checked_at=datetime.now(),
+        ))
+        await session.commit()
 
 async def append_health_history(snapshot: dict) -> None:
     """追加一条健康探测历史"""

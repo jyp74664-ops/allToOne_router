@@ -130,38 +130,32 @@ def test_explain_status_real_meanings():
     assert auth["kind"] == "no_auth"
 
 
-def test_check_log_endpoint(local_client, initialized_db):
-    """/api/check-log 返回最近检查明细，且带 reason。"""
+def test_check_log_two_slots(local_client, initialized_db):
+    """/api/check-log 返回两个槽位；同槽位再写入会覆盖，只留最新一份。"""
     import asyncio
-    from datetime import datetime
-    from database import engine as engine_mod
-    from database.models import HealthRecord
+    from services.usage_service import save_check_log
 
-    db = engine_mod.db
+    first = {"nvidia||google/gemma-2b": {"status": "eol", "code": 410, "detail": "end of life"}}
+    second = {"agnes||agnes-3.0-flash": {"status": "ok", "code": 200, "latency_ms": 300}}
 
-    async def seed():
-        async with db.SessionLocal() as s:
-            s.add(HealthRecord(
-                provider_name="nvidia", model="google/gemma-2b",
-                status="fail", code=410, latency_ms=100,
-                detail="end of life", checked_at=datetime.now(),
-            ))
-            s.add(HealthRecord(
-                provider_name="agnes", model="agnes-3.0-flash",
-                status="ok", code=200, latency_ms=300,
-                checked_at=datetime.now(),
-            ))
-            await s.commit()
-    asyncio.run(seed())
+    asyncio.run(save_check_log("provider", first, scope="nvidia"))
+    asyncio.run(save_check_log("all", first))
 
     r = local_client.get("/api/check-log")
     assert r.status_code == 200, r.text
     d = r.json()
-    assert d["count"] >= 2
-    by_model = {i["model"]: i for i in d["items"]}
-    assert by_model["google/gemma-2b"]["kind"] == "offline"
-    assert "下线" in by_model["google/gemma-2b"]["reason"]
-    assert by_model["agnes-3.0-flash"]["kind"] == "ok"
+    assert set(d.keys()) == {"provider", "all"}
+    assert d["provider"]["scope"] == "nvidia"
+    assert d["provider"]["count"] == 1
+    assert d["provider"]["items"][0]["kind"] == "offline"
+    assert d["all"]["count"] == 1
+
+    # 再写一次 provider 槽：必须覆盖，且全量槽不受影响
+    asyncio.run(save_check_log("provider", second, scope="agnes"))
+    d2 = local_client.get("/api/check-log").json()
+    assert d2["provider"]["scope"] == "agnes"
+    assert d2["provider"]["items"][0]["model"] == "agnes-3.0-flash"
+    assert d2["all"]["items"][0]["model"] == "google/gemma-2b"
     assert "api_key" not in r.text.lower()
 
 

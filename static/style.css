@@ -1081,6 +1081,28 @@
       padding: 0 2px;
     }
     .check-log-bubble-close:hover { color: var(--danger); }
+    .check-log-section {
+      margin-bottom: 18px;
+    }
+    .check-log-section:last-child { margin-bottom: 0; }
+    .check-log-section-head {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid var(--mac-border);
+    }
+    .check-log-section-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .check-log-section-meta {
+      font-size: 11px;
+      color: var(--text-secondary);
+    }
+
     .check-log-body {
       max-height: 56vh;
       overflow-y: auto;

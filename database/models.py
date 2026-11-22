@@ -129,3 +129,15 @@ class Webhook(Base):
     secret: Mapped[str] = mapped_column(String(200), default="")
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+
+
+class CheckLog(Base):
+    """检查日志：两个固定槽位（provider=最近单次检查, all=最近全量检查），各自只保留一份。"""
+    __tablename__ = "check_logs"
+
+    slot: Mapped[str] = mapped_column(String(20), primary_key=True)  # provider / all
+    scope: Mapped[str] = mapped_column(String(100), default="")  # 单检查的服务商名
+    items: Mapped[list] = mapped_column(JSON, default=list)
+    ok_count: Mapped[int] = mapped_column(Integer, default=0)
+    fail_count: Mapped[int] = mapped_column(Integer, default=0)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

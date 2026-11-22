@@ -677,6 +677,10 @@ async def run_full_check(on_progress=None) -> dict:
     for prov, models in retire_by_provider.items():
         await retire_models(prov, models)
     
+    # 全量日志写入固定槽位（只保留最新一份）
+    from services.usage_service import save_check_log
+    await save_check_log("all", results)
+    
     ok_count = sum(1 for v in results.values() if v.get("status") == "ok")
     fail_count = len(results) - ok_count
     logger.info("\033[92m✓ 健康检测完成: %d 正常 / %d 异常\033[0m", ok_count, fail_count)
