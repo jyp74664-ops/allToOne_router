@@ -17,6 +17,7 @@ class Provider(Base):
     models: Mapped[list] = mapped_column(JSON, default=list)
     disabled_models: Mapped[list] = mapped_column(JSON, default=list)
     retired_models: Mapped[list] = mapped_column(JSON, default=list)  # 检测确认 EOL/404 后永久移除的模型
+    free_models: Mapped[list] = mapped_column(JSON, default=list)  # 同步时上游 pricing 判定为免费的模型，检测时据此跳过收费模型
     check_enabled: Mapped[bool] = mapped_column(Boolean, default=True)  # 关闭后不参与健康检测
     free_only: Mapped[bool] = mapped_column(Boolean, default=True)
     provider_status: Mapped[str] = mapped_column(String(20), default="unknown")

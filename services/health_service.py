@@ -425,8 +425,13 @@ async def fetch_models(
     free_only: bool,
     aliases: dict,
     context_limits: dict,
+    free_out: set | None = None,
 ) -> list[str]:
-    """拉取模型列表"""
+    """拉取模型列表。
+
+    free_out: 传入一个 set 时，会把上游 pricing 判定为免费的模型名收集进去，
+    供调用方持久化（检测时据此跳过收费模型）。
+    """
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
     url = base_url.rstrip("/") + "/models"
@@ -478,12 +483,20 @@ async def fetch_models(
                             continue
                         # 免费过滤
                         if free_only:
-                            pricing = m.get("pricing", {})
+                            pricing = m.get("pricing") or {}
                             try:
                                 if float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0:
                                     continue
                             except (ValueError, TypeError):
                                 pass
+                        if free_out is not None:
+                            pricing = m.get("pricing") or {}
+                            try:
+                                is_paid = float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0
+                            except (ValueError, TypeError):
+                                is_paid = False  # 上游没给 pricing → 按免费处理（与 free_only 过滤口径一致）
+                            if not is_paid:
+                                free_out.add(model_id)
                         result.append(model_id)
                     return result
                 last_error = f"HTTP {resp.status_code} ({auth_type})"
@@ -559,6 +572,29 @@ async def retire_models(provider_name: str, model_names: list[str]) -> list[str]
         logger.info("\033[91m♻ 已永久移除不可用模型 %s: %s\033[0m", provider_name, ", ".join(removed))
     return removed
 
+def checkable_models(provider) -> list[str]:
+    """本次检测应该探测的模型（去重后的 provider.models）。
+
+    勾选了「仅拉取免费模型」(free_only=True) 的提供商，只探测已知免费的模型：
+    免费集合来自同步时上游 pricing 的判定结果（provider.free_models）。
+    如果从未同步过（免费集合为空），无法区分收费模型，退回探测全部，
+    避免把整家服务商的模型都跳过。
+    """
+    models = list(dict.fromkeys(provider.models or []))
+    if getattr(provider, "free_only", True) is False:
+        return models
+    free = set(getattr(provider, "free_models", None) or [])
+    if not free:
+        return models
+    return [m for m in models if m in free]
+
+
+def is_paid_model(provider, model: str) -> bool:
+    """该模型是否被上游判定为收费模型（需要 provider.free_models 已知）。"""
+    free = set(getattr(provider, "free_models", None) or [])
+    return bool(free) and model not in free
+
+
 async def run_full_check(on_progress=None) -> dict:
     """检查所有启用模型并更新健康状态。
     
@@ -580,9 +616,10 @@ async def run_full_check(on_progress=None) -> dict:
     async with db.SessionLocal() as session:
         providers = (await session.execute(select(Provider))).scalars().all()
     
-    # 只统计真正参与检测的模型（关闭检测的提供商、未勾选的模型都不算）
+    # 只统计真正参与检测的模型（关闭检测的提供商、未勾选的模型、
+    # 以及「仅免费」提供商下的收费模型都不算）
     total = sum(
-        len(p.models or [])
+        len(checkable_models(p))
         for p in providers
         if getattr(p, "check_enabled", True) is not False
     )
@@ -601,8 +638,15 @@ async def run_full_check(on_progress=None) -> dict:
                 continue
             # 只探测已勾选（启用）的模型。未勾选的 disabled_models 不参与路由，
             # 探测它们只会白烧上游额度，因此不再纳入全量检测（2026-11-23 用户要求）。
-            models_to_check = list(dict.fromkeys(provider.models or []))
-            logger.info("\033[94m  检测服务商: %s (%d 个模型)\033[0m", provider.name, len(models_to_check))
+            # 勾了「仅拉取免费模型」的提供商还会再过滤掉收费模型，避免产生费用。
+            models_to_check = checkable_models(provider)
+            skipped_paid = len(provider.models or []) - len(models_to_check)
+            logger.info(
+                "\033[94m  检测服务商: %s (%d 个模型%s)\033[0m",
+                provider.name,
+                len(models_to_check),
+                f"，跳过 {skipped_paid} 个收费模型" if skipped_paid > 0 else "",
+            )
             
             for model in models_to_check:
                 key = f"{provider.name}||{model}"

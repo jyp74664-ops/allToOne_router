@@ -184,6 +184,36 @@ class ProviderService:
                 raise ValueError(f"提供商 '{name}' 不存在")
             return await _fetch_models(client, p.base_url, p.api_key, p.free_only, aliases, context_limits)
     
+    async def refresh_models(
+        self,
+        name: str,
+        client: httpx.AsyncClient,
+        aliases: dict,
+        context_limits: dict,
+    ) -> list[str]:
+        """按提供商的 free_only 重新拉取模型列表，同时记录上游判定为免费的模型。
+
+        免费集合（free_models）是检测阶段跳过收费模型的依据：
+        勾了「仅拉取免费模型」的提供商，只会探测这个集合里的模型。
+        """
+        async with self.db.SessionLocal() as session:
+            result = await session.execute(
+                select(Provider).where(Provider.name == name)
+            )
+            p = result.scalar_one_or_none()
+            if not p:
+                raise ValueError(f"提供商 '{name}' 不存在")
+            free_out: set[str] = set()
+            models = await _fetch_models(
+                client, p.base_url, p.api_key, p.free_only, aliases, context_limits,
+                free_out=free_out,
+            )
+            p.models = models
+            p.disabled_models = []
+            p.free_models = sorted(free_out)
+            await session.commit()
+            return models
+
     async def sync_free_models(
         self,
         client: httpx.AsyncClient,
@@ -196,8 +226,10 @@ class ProviderService:
         async with self.db.SessionLocal() as session:
             providers = await session.execute(select(Provider))
             for p in providers.scalars().all():
+                free_out: set[str] = set()
                 models = await _fetch_models(
-                    client, p.base_url, p.api_key, True, aliases, context_limits
+                    client, p.base_url, p.api_key, True, aliases, context_limits,
+                    free_out=free_out,
                 )
                 # 过滤已删除的模型
                 deleted_keys = {k for k, v in health_status.items() if v and v.get("status") == "deleted"}
@@ -209,6 +241,7 @@ class ProviderService:
                 
                 p.models = models
                 p.disabled_models = []
+                p.free_models = sorted(free_out)
                 await session.commit()
                 results.append({
                     "name": p.name,

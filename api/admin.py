@@ -227,7 +227,12 @@ async def toggle_model(name: str, data: ToggleModelIn, _=Depends(verify_admin)):
 
 @router.get("/providers/{name}/available-models")
 async def get_available_models(name: str, _=Depends(verify_admin)):
-    """获取上游可⽤模型列表（不保存）"""
+    """获取上游可用模型列表（不保存模型列表）。
+
+    顺带刷新该提供商的「免费模型集合」：检测阶段要靠它跳过收费模型，
+    而调用方（模型管理弹窗）本来就要拉一次上游 /models，这里直接复用，
+    不额外发请求。
+    """
     from database.models import Provider
     from database.engine import db
     import httpx
@@ -240,13 +245,24 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
 
     meta = ModelMetaService()
     try:
+        free_out: set[str] = set()
         async with httpx.AsyncClient(timeout=15, verify=settings.load().verify_ssl) as client:
             models = await fetch_models(
                 client, p.base_url, p.api_key, free_only=False,
                 aliases=meta.aliases, context_limits=meta.context_limits,
+                free_out=free_out,
             )
         if not models:
             return {"ok": False, "models": [], "detail": "上游模型列表获取失败。"}
+        # 上游判定结果有变化才写库，避免每次开弹窗都写一次
+        if sorted(free_out) != sorted(p.free_models or []):
+            async with db.SessionLocal() as session:
+                row = (await session.execute(
+                    select(Provider).where(Provider.name == name)
+                )).scalar_one_or_none()
+                if row:
+                    row.free_models = sorted(free_out)
+                    await session.commit()
         return {"ok": True, "models": models}
     except Exception as e:
         logger.warning("available-models fetch failed for %s: %s", name, e)
@@ -255,14 +271,13 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
 
 @router.post("/providers/{name}/fetch-models")
 async def refresh_models(name: str, _=Depends(verify_admin)):
-    """刷新模型列表"""
+    """刷新模型列表（同时刷新免费模型集合，供检测阶段过滤收费模型）"""
     svc = ProviderService()
     try:
         async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
-            models = await svc.fetch_available_models(
+            models = await svc.refresh_models(
                 name, client, ModelMetaService().aliases, ModelMetaService().context_limits
             )
-        await svc.update(name, {"models": models, "disabled_models": []})
         return {"ok": True, "models": models}
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -397,14 +412,16 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         meta = ModelMetaService()
         results = {}
         retire_list: list[str] = []  # EOL/404 待永久移除
-        enabled_set = set(provider.models or [])
-        total = len(provider.models or []) + len(provider.disabled_models or [])
+        # 与全量检测口径一致：只探测已勾选的模型；勾了「仅拉取免费模型」的
+        # 提供商还要再滤掉收费模型，避免探测收费接口产生费用。
+        from services.health_service import checkable_models
+        models_to_check = checkable_models(provider)
+        total = len(models_to_check)
         current = 0
         
         async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
-            for model in (provider.models or []) + (provider.disabled_models or []):
+            for model in models_to_check:
                 key = f"{provider.name}||{model}"
-                is_disabled = model not in enabled_set
                 
                 # 检查是否在冷却期内
                 if health_state.is_model_rate_limited(key):
@@ -445,16 +462,12 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                     health_state.failed_models[key] = time.time()
                 
                 # 与全量检测(run_full_check)保持一致的计数策略：
-                # - 被禁用的模型：仅记录探测结果，不计入失败/熔断
                 # - deleted(404)/rate_limited(429)：不是稳定性失败，不触发熔断
                 # - 只有真正的 fail/error(5xx/超时/连接错误) 才计失败
                 if status == "ok":
                     if prev_status == "deleted":
                         health_state.failed_models.pop(key, None)
-                    if not is_disabled:
-                        health_state.record_success(key)
-                elif is_disabled:
-                    logger.info("  [禁用] %s | %s -> %s (不计入失败)", provider.name, model, status)
+                    health_state.record_success(key)
                 elif status in ("deleted", "rate_limited"):
                     logger.info("  [跳过计数] %s | %s -> %s", provider.name, model, status)
                 else:
@@ -519,6 +532,12 @@ async def manual_check(name: str, model: str, _=Depends(verify_admin)):
         if not p:
             raise HTTPException(404, "未找到")
     
+    # 勾了「仅拉取免费模型」的提供商，单模型检查也不探测收费模型（会产生费用）
+    from services.health_service import is_paid_model
+    if is_paid_model(p, model):
+        raise HTTPException(
+            400, "该提供商勾选了「仅拉取免费模型」，此模型为收费模型，已跳过检测"
+        )
     meta = ModelMetaService()
     async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
         check_result = await check_model(

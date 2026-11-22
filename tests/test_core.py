@@ -337,3 +337,76 @@ def test_full_check_skips_unchecked_models(initialized_db, monkeypatch):
     results = asyncio.run(hs.run_full_check())
     assert called == ["m-on"], called
     assert list(results) == ["mix||m-on"], list(results)
+
+
+def test_checkable_models_respects_free_only():
+    """勾了「仅拉取免费模型」只探测已知免费模型；未勾选则全测；免费集合未知时退回全测。"""
+    from services.health_service import checkable_models
+
+    class P:
+        pass
+
+    p = P()
+    p.models = ["free-a", "paid-b"]
+    p.free_models = ["free-a"]
+    p.free_only = True
+    assert checkable_models(p) == ["free-a"]
+
+    p.free_only = False
+    assert checkable_models(p) == ["free-a", "paid-b"]
+
+    # 免费集合为空（从没同步过）时无法区分收费，不能把整家跳过
+    p.free_only = True
+    p.free_models = []
+    assert checkable_models(p) == ["free-a", "paid-b"]
+
+
+def test_full_check_skips_paid_models_when_free_only(initialized_db, monkeypatch):
+    """立即检测：free_only 的提供商只探测免费模型，收费模型不碰。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.health_service as hs
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="freeonly", base_url="https://a/v1", api_key="k",
+                           models=["free-a", "paid-b"], disabled_models=[],
+                           retired_models=[], free_models=["free-a"],
+                           free_only=True, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    called = []
+
+    async def fake_check(client, base_url, api_key, model, aliases, **kw):
+        called.append(model)
+        return {"status": "ok", "code": 200, "latency_ms": 1}
+    monkeypatch.setattr(hs, "check_model", fake_check)
+
+    asyncio.run(hs.run_full_check())
+    assert called == ["free-a"], called
+
+
+def test_manual_check_rejects_paid_model_when_free_only(local_client, initialized_db):
+    """单模型检查：free_only 提供商下的收费模型返回 400，不发探测请求。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="fo", base_url="https://a/v1", api_key="k",
+                           models=["free-a", "paid-b"], disabled_models=[],
+                           retired_models=[], free_models=["free-a"],
+                           free_only=True, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.post("/api/check/fo/paid-b")
+    assert r.status_code == 400, r.text
+    assert "收费模型" in r.text

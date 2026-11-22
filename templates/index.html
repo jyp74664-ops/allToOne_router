@@ -164,7 +164,8 @@
         <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; margin-top: 8px;">
           <h2 style="font-size: 16px; font-weight: 600;">上游提供商</h2>
           <div style="display: flex; gap: 8px;">
-            <button class="btn" onclick="syncAllFreeModels()" id="syncFreeModelsBtn">↻ 同步全部免费模型</button>
+            <button class="btn" onclick="syncAllFreeModels()" id="syncFreeModelsBtn"
+              title="对每个提供商重新拉一次上游 /models，按上游 pricing 只保留免费模型，并覆盖该提供商的模型列表（会清空未勾选列表和手动勾选的结果，已确认下线的模型不会加回）。只改模型清单，不做健康检测、不改 Key">↻ 同步全部免费模型</button>
             <button class="btn btn-primary" onclick="openProviderEditor()" id="addProviderBtn">+ 添加提供商</button>
           </div>
         </div>
