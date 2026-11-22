@@ -252,8 +252,10 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
                 aliases=meta.aliases, context_limits=meta.context_limits,
                 free_out=free_out,
             )
+        if models is None:
+            return {"ok": False, "models": [], "detail": "上游模型列表拉取失败（网络/超时/Key 无效），本地已勾选的模型不受影响。"}
         if not models:
-            return {"ok": False, "models": [], "detail": "上游模型列表获取失败。"}
+            return {"ok": False, "models": [], "detail": "上游没有返回任何可用模型。"}
         # 上游判定结果有变化才写库，避免每次开弹窗都写一次
         if sorted(free_out) != sorted(p.free_models or []):
             async with db.SessionLocal() as session:

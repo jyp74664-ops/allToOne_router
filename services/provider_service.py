@@ -182,7 +182,14 @@ class ProviderService:
             p = result.scalar_one_or_none()
             if not p:
                 raise ValueError(f"提供商 '{name}' 不存在")
-            return await _fetch_models(client, p.base_url, p.api_key, p.free_only, aliases, context_limits)
+            models = await _fetch_models(
+                client, p.base_url, p.api_key, p.free_only, aliases, context_limits
+            )
+            if models is None:
+                raise ValueError(
+                    f"上游模型列表拉取失败（{p.name}），请检查 Base URL 与 API Key；原有模型列表未改动"
+                )
+            return models
     
     async def refresh_models(
         self,
@@ -208,6 +215,15 @@ class ProviderService:
                 client, p.base_url, p.api_key, p.free_only, aliases, context_limits,
                 free_out=free_out,
             )
+            if models is None:
+                raise ValueError(
+                    f"上游模型列表拉取失败（{p.name}），已保留原有 {len(p.models or [])} 个模型；请检查 Base URL 与 API Key"
+                )
+            if not models and (p.models or []):
+                raise ValueError(
+                    f"上游未返回可用模型（{p.name}），已保留原有 {len(p.models)} 个模型。"
+                    "常见原因：该提供商勾选了「仅拉取免费模型」但上游当前没有免费模型"
+                )
             p.models = models
             p.disabled_models = []
             p.free_models = sorted(free_out)
@@ -226,11 +242,23 @@ class ProviderService:
         async with self.db.SessionLocal() as session:
             providers = await session.execute(select(Provider))
             for p in providers.scalars().all():
+                old_models = list(p.models or [])
                 free_out: set[str] = set()
                 models = await _fetch_models(
                     client, p.base_url, p.api_key, True, aliases, context_limits,
                     free_out=free_out,
                 )
+                # 拉取失败：保留原配置，只记失败原因。
+                # （2026-11-23 事故：这里原本直接拿空列表覆盖，上游超时一次就把 7 家
+                #   提供商的模型清单全清了，检测跟着变成 0 正常 / 0 异常。）
+                if models is None:
+                    results.append({
+                        "name": p.name,
+                        "ok": False,
+                        "reason": "上游拉取失败（网络/超时/Key 无效），已保留原模型列表",
+                        "count": len(old_models),
+                    })
+                    continue
                 # 过滤已删除的模型
                 deleted_keys = {k for k, v in health_status.items() if v and v.get("status") == "deleted"}
                 deleted_models = {k.split("||", 1)[1] for k in deleted_keys if k.startswith(p.name + "||")}
@@ -238,7 +266,17 @@ class ProviderService:
                 # 持久过滤：检测确认 EOL/404 后永久移除的模型不再加回
                 retired = set(p.retired_models or [])
                 models = [m for m in models if m not in retired]
-                
+
+                # 上游一个可用模型都没返回、而本地原本有配置：不覆盖，报出来让人查。
+                if not models and old_models:
+                    results.append({
+                        "name": p.name,
+                        "ok": False,
+                        "reason": "上游未返回可用模型（可能全部判为收费，或接口格式变化），已保留原模型列表",
+                        "count": len(old_models),
+                    })
+                    continue
+
                 p.models = models
                 p.disabled_models = []
                 p.free_models = sorted(free_out)

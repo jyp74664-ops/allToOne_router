@@ -419,7 +419,12 @@ async def check_model(
 
 
 def _pricing_is_paid(pricing: dict) -> bool:
-    """单个价格对象是否收费（prompt / completion 任一非 0）。"""
+    """单个价格对象是否收费（prompt / completion 任一非 0）。
+
+    负数（OpenRouter 系网关用 -1 表示"价格未知/动态路由"）按收费处理——
+    这类模型（如 kilo-auto/efficient、openrouter/auto）实际会走付费通道，
+    放进"仅免费"名单会让用户白花钱，宁可漏报也不误收。
+    """
     try:
         return float(pricing.get("prompt", 0)) != 0 or float(pricing.get("completion", 0)) != 0
     except (ValueError, TypeError):
@@ -433,9 +438,14 @@ def model_pricing_is_paid(item: dict) -> bool:
     - 扁平：{"id": ..., "pricing": {"prompt": 0, "completion": 0}}
     - 聚合（AMD / OpenRouter 这类）：{"id": ..., "providers": [{"pricing": {...}}, ...]}
 
-    判定口径：只要存在一个报价全 0 的渠道，就认为能免费用到，算免费；
-    所有渠道都收费才算收费。完全没有价格信息时按免费处理（宁松不严）。
+    判定口径：
+    1. 上游给了明确的 `isFree: true` 就以它为准（Kilo / OpenRouter 这类网关会带），
+       比价格字段更权威；
+    2. 否则看价格：只要存在一个报价全 0 的渠道就算免费，所有渠道都收费才算收费；
+    3. 完全没有价格信息时按免费处理（宁松不严）。
     """
+    if item.get("isFree") is True:
+        return False
     pricings: list[dict] = []
     flat = item.get("pricing")
     if isinstance(flat, dict):
@@ -458,11 +468,16 @@ async def fetch_models(
     aliases: dict,
     context_limits: dict,
     free_out: set | None = None,
-) -> list[str]:
+) -> list[str] | None:
     """拉取模型列表。
 
     free_out: 传入一个 set 时，会把上游 pricing 判定为免费的模型名收集进去，
     供调用方持久化（检测时据此跳过收费模型）。
+
+    返回值：
+    - list[str]：请求成功（可能为空列表，表示上游确实没有可用模型）
+    - None：全部重试都失败（网络错误 / Key 无效 / 上游 5xx）。
+      调用方必须区分这两种情况——失败时绝对不能拿空列表去覆盖已有模型配置。
     """
     if not base_url.startswith(("http://", "https://")):
         base_url = "https://" + base_url
@@ -510,7 +525,11 @@ async def fetch_models(
                         seen.add(model_id)
                         # 过滤非聊天模型
                         lower = model_id.lower()
-                        non_chat = ["image", "dall-e", "whisper", "tts", "audio", "text-embedding"]
+                        non_chat = [
+                            "image", "dall-e", "whisper", "tts", "audio",
+                            "text-embedding", "embed", "rerank", "moderation",
+                            "lyria", "veo", "sora",  # 音乐 / 视频生成，走不了 chat/completions
+                        ]
                         if any(kw in lower for kw in non_chat):
                             continue
                         # 免费过滤
@@ -536,7 +555,9 @@ async def fetch_models(
         break
     
     logger.error("fetch_models failed after all attempts for %s: %s", base_url, last_error)
-    return []
+    # 返回 None 而不是 []：调用方据此区分"拉取失败"与"上游确实没有模型"，
+    # 失败时绝不能拿空列表覆盖用户已配置好的模型清单（2026-11-23 事故）
+    return None
 
 
 def get_context_length(model: str, aliases: dict, context_limits: dict, details: dict) -> int:

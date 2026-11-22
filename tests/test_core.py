@@ -502,3 +502,92 @@ def test_stability_returns_tokens_per_sec(local_client, initialized_db):
     assert r.status_code == 200, r.text
     row = next(x for x in r.json() if x["provider"] == "p" and x["model"] == "m")
     assert row["tokens_per_sec"] == 5.0
+
+
+def test_sync_keeps_models_when_fetch_fails(initialized_db, monkeypatch):
+    """上游拉取失败（返回 None）时同步不能清空已有模型列表。
+
+    2026-11-23 事故：sync_free_models 直接把空列表写库，上游超时一次就把
+    7 家提供商的模型清单全清掉了，检测随之变成 0 正常 / 0 异常。
+    """
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.provider_service as ps
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="fail-fetch", base_url="https://x/v1", api_key="k",
+                           models=["keep-a", "keep-b"], disabled_models=[], free_models=[]))
+            await s.commit()
+    asyncio.run(seed())
+
+    async def fake_fetch(*a, **kw):
+        return None
+    monkeypatch.setattr(ps, "_fetch_models", fake_fetch)
+
+    import httpx
+    results = asyncio.run(ps.ProviderService().sync_free_models(
+        httpx.AsyncClient(), {}, {}, {}
+    ))
+    r = next(x for x in results if x["name"] == "fail-fetch")
+    assert r["ok"] is False
+    assert r["count"] == 2
+
+    async def verify():
+        async with db.SessionLocal() as s:
+            from sqlalchemy import select
+            p_ = (await s.execute(select(Provider).where(Provider.name == "fail-fetch"))).scalar_one()
+            assert p_.models == ["keep-a", "keep-b"]
+    asyncio.run(verify())
+
+
+def test_sync_keeps_models_when_upstream_returns_empty(initialized_db, monkeypatch):
+    """上游返回空列表（全收费/格式变化）时保留原配置，而不是写空列表。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.provider_service as ps
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="empty-fetch", base_url="https://x/v1", api_key="k",
+                           models=["keep-c"], disabled_models=[], free_models=[]))
+            await s.commit()
+    asyncio.run(seed())
+
+    async def fake_fetch(*a, **kw):
+        return []
+    monkeypatch.setattr(ps, "_fetch_models", fake_fetch)
+
+    import httpx
+    results = asyncio.run(ps.ProviderService().sync_free_models(
+        httpx.AsyncClient(), {}, {}, {}
+    ))
+    r = next(x for x in results if x["name"] == "empty-fetch")
+    assert r["ok"] is False
+
+    async def verify():
+        async with db.SessionLocal() as s:
+            from sqlalchemy import select
+            p_ = (await s.execute(select(Provider).where(Provider.name == "empty-fetch"))).scalar_one()
+            assert p_.models == ["keep-c"]
+    asyncio.run(verify())
+
+
+def test_pricing_is_free_prefers_is_free_flag():
+    """上游明确 isFree=true 时优先采信，不被 -1 之类的价格字段干扰。"""
+    from services.health_service import model_pricing_is_paid
+
+    assert model_pricing_is_paid({"id": "a:free", "isFree": True,
+                                  "pricing": {"prompt": "0", "completion": "0"}}) is False
+    # -1 表示价格未知/动态路由，按收费处理，避免把付费自动路由拉进免费名单
+    assert model_pricing_is_paid({"id": "auto", "isFree": False,
+                                  "pricing": {"prompt": "-1", "completion": "-1"}}) is True
+    assert model_pricing_is_paid({"id": "paid", "pricing": {"prompt": "0.000002",
+                                                           "completion": "0.000004"}}) is True
+    assert model_pricing_is_paid({"id": "no-pricing"}) is False

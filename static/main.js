@@ -81,13 +81,13 @@
 
     /* ============ Toast 提示 ============ */
     let _toastTimer = null;
-    function showToast(msg, type = 'ok') {
+    function showToast(msg, type = 'ok', duration = 3000) {
       const el = document.getElementById('toast');
       if (!el) return;
       el.textContent = msg;
       el.className = 'toast show ' + type;
       if (_toastTimer) clearTimeout(_toastTimer);
-      _toastTimer = setTimeout(() => { el.className = 'toast ' + type; }, 3000);
+      _toastTimer = setTimeout(() => { el.className = 'toast ' + type; }, duration);
     }
 
     /* ============ 检测完成日志气泡 ============ */
@@ -324,7 +324,14 @@
         const success = (data.results || []).filter(item => item.ok);
         const failed = (data.results || []).filter(item => !item.ok);
         const total = success.reduce((sum, item) => sum + item.count, 0);
-        showToast(`同步完成：${success.length} 个提供商，${total} 个免费模型${failed.length ? `，${failed.length} 个失败` : ''}`, failed.length ? 'warn' : 'ok');
+        let msg = `同步完成：${success.length} 个提供商，${total} 个免费模型`;
+        if (failed.length) {
+          // 把失败原因一并列出，否则用户只看到"失败"两个字却不知道为什么
+          const detail = failed.slice(0, 3).map(f => `· ${f.name}：${f.reason || '未知原因'}`).join('\n');
+          msg += `\n${failed.length} 个未同步（原有模型列表已保留）：\n${detail}` +
+                 (failed.length > 3 ? `\n…还有 ${failed.length - 3} 个` : '');
+        }
+        showToast(msg, failed.length ? 'warn' : 'ok', failed.length ? 9000 : 3000);
         await load();
       } catch (e) {
         if (e.message !== 'Unauthorized') {

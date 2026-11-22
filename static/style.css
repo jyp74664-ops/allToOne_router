@@ -1069,6 +1069,11 @@
       opacity: 0;
       pointer-events: none;
       transition: opacity 0.3s, transform 0.3s;
+      /* 同步失败时会带多行原因，需要保留换行 */
+      white-space: pre-line;
+      max-width: min(560px, calc(100vw - 64px));
+      text-align: left;
+      line-height: 1.6;
     }
 
     .toast.show {
