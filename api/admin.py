@@ -718,6 +718,20 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             tps = round(s["completion_tokens"] / (s["ok_total_ms"] / 1000), 2)
         sp = speed_map.get(key)
         speed_ok = sp is not None and sp.status == "ok"
+        # 解码速率要过物理校准：上游整包返回时 decode 窗口只有几毫秒，
+        # 会算出几万 tok/s（历史数据里已经出现过 31750），这种数字不能当速度展示。
+        from services.speed_service import decode_plausible
+        decode_trusted = (
+            speed_ok
+            and sp.decode_tps is not None
+            and decode_plausible(sp.output_tokens or 0, sp.decode_ms)
+        )
+        # 整包返回：解码速率测不出来，但端到端吞吐（输出 token ÷ 总耗时）仍有参考价值，
+        # 前端用「≈」前缀标注，和真实 decode 速率区分开。
+        speed_buffered = bool(
+            speed_ok and not decode_trusted
+            and (sp.overall_tps or 0) > 0 and (sp.output_tokens or 0) >= 8
+        )
         result.append({
             "provider": name,
             "model": model,
@@ -732,8 +746,9 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "tokens_per_sec": tps,
             # 真实测速结果（流式 128 token，手动触发才更新；未测过为 None）
             "ttft_ms": sp.ttft_ms if speed_ok else None,
-            "real_tps": sp.decode_tps if speed_ok else None,
+            "real_tps": sp.decode_tps if decode_trusted else None,
             "speed_overall_tps": sp.overall_tps if speed_ok else None,
+            "speed_buffered": speed_buffered,
             "speed_estimated": bool(sp.estimated) if speed_ok else False,
             "speed_tested_at": sp.tested_at.timestamp() if sp is not None and hasattr(sp.tested_at, "timestamp") else None,
             "speed_error": ((sp.error or "")[:120] if sp is not None and not speed_ok else ""),

@@ -170,7 +170,7 @@
                 <th class="sortable" data-sort="ttft_ms"
                   title="首 Token 延迟（TTFT）：从发出请求到收到第一个内容 token 的时间，包含网络往返与上游排队。越小越跟手">首 Token <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="real_tps"
-                  title="实测生成速度：流式请求生成 128 个 token，只统计首 token 之后的解码阶段（token 数 − 1）÷ 解码耗时。只有点「⚡ 测速」才会更新，未测过显示 --">实测速度 <span class="sort-icon">⇅</span></th>
+                  title="实测生成速度：流式请求生成 128 个 token，只统计首 token 之后的解码阶段（token 数 − 1）÷ 解码耗时。数字前带 ≈ 表示上游把整段内容一次返回（没有逐 token 推流），解码速度测不出来，显示的是端到端吞吐（含首 Token 等待）。只有点「⚡ 测速」才会更新，未测过显示 --">实测速度 <span class="sort-icon">⇅</span></th>
               </tr>
             </thead>
             <tbody id="stableBody"></tbody>

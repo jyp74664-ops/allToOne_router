@@ -674,6 +674,53 @@ def test_stability_exposes_real_speed(initialized_db, local_client):
     assert row["tokens_per_sec"] == 10.0
 
 
+def test_decode_plausible_rejects_buffered_streams():
+    """整包返回时首个/末个 delta 只差几毫秒，算出的几万 tok/s 必须被判为不可信。"""
+    from services.speed_service import decode_plausible, MAX_PLAUSIBLE_TPS
+
+    # 真实事故数据：128 token 只用了 4ms（≈31750 tok/s）
+    assert decode_plausible(128, 4) is False
+    # 6 个 token 用了 1ms（≈5000 tok/s）
+    assert decode_plausible(6, 1) is False
+    # 正常逐 token 生成：128 token / 3 秒
+    assert decode_plausible(128, 3000) is True
+    # 极快但仍在物理上限内：按上限本身应当通过
+    assert decode_plausible(MAX_PLAUSIBLE_TPS + 1, 1000) is True
+    # 数据缺失一律不可信
+    assert decode_plausible(0, 100) is False
+    assert decode_plausible(128, None) is False
+
+
+def test_stability_hides_buffered_decode_speed(initialized_db, local_client):
+    """上游整包返回的测速记录：real_tps 置空、标记 buffered，只留端到端吞吐。"""
+    from datetime import datetime
+    from database import engine as engine_mod
+    from database.models import HealthRecord, SpeedRecord
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(HealthRecord(provider_name="p3", model="m3", status="ok", code=200,
+                               latency_ms=1253, prompt_tokens=5, completion_tokens=5,
+                               detail=""))
+            # 复刻历史里那条 31750 tok/s：128 token、decode 窗口仅 4ms
+            s.add(SpeedRecord(run_id="r3", provider_name="p3", model="m3", status="ok",
+                              ttft_ms=2271, decode_tps=31750.0, overall_tps=56.26,
+                              output_tokens=128, decode_ms=4, wall_ms=2275,
+                              estimated=False, tested_at=datetime.now()))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.get("/api/stability?hours=24")
+    assert r.status_code == 200, r.text
+    row = next(x for x in r.json() if x["provider"] == "p3" and x["model"] == "m3")
+    assert row["real_tps"] is None, "整包返回的 decode 速率不能当速度展示"
+    assert row["speed_buffered"] is True
+    assert row["speed_overall_tps"] == 56.26
+    assert row["ttft_ms"] == 2271
+
+
 def test_speed_test_status_unknown_run(local_client):
     """查询不存在的测速任务应返回 404，而不是空对象。"""
     r = local_client.get("/api/speed-test/status?run_id=nope")

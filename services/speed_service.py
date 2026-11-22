@@ -35,6 +35,7 @@ SPEED_PROMPT = (
 )
 
 DEFAULT_MAX_TOKENS = 128
+MAX_PLAUSIBLE_TPS = 800  # 解码速率物理上限：超过它的结果必然不是逐 token 生成测出来的
 MAX_ITEMS = 50          # 单次测速的模型上限，防止误点全表烧额度
 CONCURRENCY = 3         # 并发数：decode 阶段占带宽很少，适度并发能显著缩短总时长
 SPEED_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
@@ -49,6 +50,21 @@ def _delta_text(delta: dict) -> str:
     if not isinstance(delta, dict):
         return ""
     return delta.get("content") or delta.get("reasoning_content") or ""
+
+
+def decode_plausible(output_tokens: int, decode_ms: Optional[int]) -> bool:
+    """判断一次 decode 速率是否物理上说得通。
+
+    上游（尤其聚合站/CDN）有时并不逐 token 推流：它把整段内容攒完，一次性
+    塞进最后一两个 chunk。这时「首个 delta → 末个 delta」的窗口只有几毫秒，
+    128 个 token 会算出几万 tok/s —— 数字是真的算出来的，但测的不是解码速度。
+
+    这里用「每秒 800 token」当上限：超过它不可能是在正常硬件上逐 token 生成
+    的结果，直接判为不可信，交给调用方降级处理。
+    """
+    if not decode_ms or decode_ms <= 0 or not output_tokens or output_tokens <= 1:
+        return False
+    return (output_tokens - 1) / (decode_ms / 1000) <= MAX_PLAUSIBLE_TPS
 
 
 async def _stream_once(
@@ -153,10 +169,19 @@ async def _stream_once(
     if estimated:
         out_tokens = chunks
 
-    # 第一个 token 的耗时已经算进 TTFT，解码阶段只对剩余的 token 计速
+    # 第一个 token 的耗时已经算进 TTFT，解码阶段只对剩余的 token 计速。
+    # 窗口小到算出 >800 tok/s 时说明上游整包返回，这个速率无意义，置空并标记 buffered。
     decode_tps = None
-    if decode_ms > 0 and out_tokens > 1:
-        decode_tps = round((out_tokens - 1) / (decode_ms / 1000), 2)
+    buffered = False
+    if out_tokens > 1:
+        if decode_ms <= 0:
+            buffered = True
+        else:
+            raw_tps = (out_tokens - 1) / (decode_ms / 1000)
+            if raw_tps > MAX_PLAUSIBLE_TPS:
+                buffered = True
+            else:
+                decode_tps = round(raw_tps, 2)
 
     overall_tps = round(out_tokens / (wall_ms / 1000), 2) if wall_ms > 0 and out_tokens > 0 else None
 
@@ -167,9 +192,11 @@ async def _stream_once(
         "decode_ms": decode_ms,
         "wall_ms": wall_ms,
         "output_tokens": out_tokens,
+        "chunks": chunks,
         "decode_tps": decode_tps,
         "overall_tps": overall_tps,
         "estimated": estimated,
+        "buffered": buffered,
     }
 
 
@@ -247,9 +274,11 @@ async def run_speed_test(
             "decode_tps": res.get("decode_tps"),
             "overall_tps": res.get("overall_tps"),
             "output_tokens": res.get("output_tokens") or 0,
+            "chunks": res.get("chunks") or 0,
             "decode_ms": res.get("decode_ms"),
             "wall_ms": res.get("wall_ms"),
             "estimated": bool(res.get("estimated")),
+            "buffered": bool(res.get("buffered")),
             "error": res.get("error") or "",
         }
 
@@ -284,9 +313,11 @@ async def run_speed_test(
             run["results"].append(row)
             run["done"] = len(run["results"])
             logger.info(
-                "[speed %s] %s/%s %s ttft=%sms decode=%s t/s (%.1f%%)",
+                "[speed %s] %s/%s %s ttft=%sms decode=%s t/s%s (%.1f%%)",
                 run_id, row["provider"], row["model"], row["status"],
-                row["ttft_ms"], row["decode_tps"], run["done"] / max(1, run["total"]) * 100,
+                row["ttft_ms"], row["decode_tps"],
+                " buffered(整包返回，仅 %dms)" % (row["decode_ms"] or 0) if row["buffered"] else "",
+                run["done"] / max(1, run["total"]) * 100,
             )
     except asyncio.CancelledError:
         run["error"] = "任务被取消"

@@ -419,11 +419,13 @@
               const okRows = results.filter(x => x.status === 'ok');
               const speeds = okRows.map(x => Number(x.decode_tps)).filter(v => Number.isFinite(v) && v > 0);
               const best = speeds.length ? Math.max.apply(null, speeds).toFixed(1) : null;
+              const bufferedCount = okRows.filter(x => x.buffered).length;
               const fail = results.length - okRows.length;
               showToast(
                 `✅ 测速完成：${okRows.length} 成功` + (fail ? ` / ${fail} 失败` : '') +
-                (best ? `，最快 ${best} tok/s` : ''),
-                fail ? 'warn' : 'ok', 6000
+                (best ? `，最快 ${best} tok/s` : '') +
+                (bufferedCount ? `；另有 ${bufferedCount} 个上游整包返回，只能给端到端吞吐` : ''),
+                fail ? 'warn' : 'ok', 7000
               );
               await loadStability();
               resolve(true);
@@ -732,13 +734,27 @@
           : (ttft <= 800 ? 'var(--success)' : ttft <= 2500 ? 'var(--warning)' : 'var(--danger)');
         const rtps = Number(d.real_tps);
         const hasRtps = Number.isFinite(rtps) && rtps > 0;
-        const rtpsStr = hasRtps ? rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '') : '--';
-        const rtpsColor = !hasRtps ? 'var(--text-secondary)'
-          : (rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)');
+        // 上游整包返回：decode 速率测不出来，只能给端到端吞吐，用 ≈ 区分
+        const buffered = !hasRtps && !!d.speed_buffered;
+        const overallTps = Number(d.speed_overall_tps);
+        const hasOverall = Number.isFinite(overallTps) && overallTps > 0;
+        let rtpsStr = '--';
+        let rtpsColor = 'var(--text-secondary)';
+        if (hasRtps) {
+          rtpsStr = rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '');
+          rtpsColor = rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)';
+        } else if (buffered && hasOverall) {
+          rtpsStr = '≈' + overallTps.toFixed(1) + ' tok/s';
+          rtpsColor = 'var(--warning)';
+        }
         let rtpsTip = d.speed_error
           ? '测速失败：' + String(d.speed_error)
           : (d.speed_tested_at ? '测于 ' + new Date(d.speed_tested_at * 1000).toLocaleString('zh-CN') : '尚未测速，点上方「⚡ 测速」');
         if (hasRtps && d.speed_estimated) rtpsTip += '；token 数由 chunk 估算（上游未返回 usage），约有 ±10% 偏差';
+        if (buffered && hasOverall) {
+          rtpsTip += '；上游没有逐 token 推流，整段内容一次返回，解码速度无法测量。'
+            + '这里的 ≈ 是端到端吞吐 = 输出 token ÷ 总耗时（含首 Token 等待），比真实解码速度低。';
+        }
         const checks = Number(d.checks) || 0;
         const ok = Number(d.ok) || 0;
         const fail = (Number(d.fail) || 0) + (Number(d.error) || 0);
