@@ -21,6 +21,10 @@
       --danger-bg: rgba(255, 59, 48, 0.1);
       --unknown: #8E8E93;
       --glass-blur: blur(40px) saturate(200%);
+      /* 弹窗底色：必须是不透明实色。半透明 + backdrop-filter 在遮罩层内部会
+         因嵌套 backdrop root 渲染异常，导致整个弹窗内容不可见（2026-11-23）*/
+      --modal-surface: #FFFFFF;
+      --modal-mask: rgba(0, 0, 0, 0.42);
     }
 
 
@@ -42,6 +46,8 @@
       --danger-bg: rgba(255, 69, 58, 0.15);
       --unknown: #98989D;
       --glass-blur: blur(30px) saturate(180%);
+      --modal-surface: #2C2C2E;
+      --modal-mask: rgba(0, 0, 0, 0.55);
     }
 
     * {
@@ -781,9 +787,9 @@
       left: 0;
       right: 0;
       bottom: 0;
-      background: rgba(0, 0, 0, 0.4);
-      backdrop-filter: blur(5px);
-      -webkit-backdrop-filter: blur(5px);
+      background: var(--modal-mask);
+      /* 不再对遮罩加 backdrop-filter：它会建立 backdrop root，
+         与 .modal-content 的毛玻璃叠加时，Chrome 下会把弹窗内容整块吃掉 */
       display: none;
       justify-content: center;
       align-items: center;
@@ -798,15 +804,15 @@
     }
 
     .modal-content {
-      background: var(--mac-window-bg);
-      backdrop-filter: var(--glass-blur);
-      -webkit-backdrop-filter: var(--glass-blur);
+      position: relative;
+      z-index: 1;
+      background: var(--modal-surface);
       width: 90%;
       max-width: 600px;
       max-height: 85vh;
       border-radius: 12px;
       border: 1px solid var(--mac-border);
-      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.2);
+      box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.35);
       display: flex;
       flex-direction: column;
       overflow: hidden;

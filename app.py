@@ -116,9 +116,24 @@ app.include_router(webhook_router, prefix="")
 app.include_router(metrics_router, prefix="")
 
 # 静态资源（拆分后的 CSS/JS）
+class NoCacheStaticFiles(StaticFiles):
+    """静态资源一律要求浏览器协商缓存。
+
+    StaticFiles 默认不发 Cache-Control，浏览器会按启发式规则自行缓存，
+    导致改了 CSS/JS 后必须 Ctrl+F5 才生效（已多次踩坑）。
+    加 no-cache 后每次请求带 If-Modified-Since，未变返回 304（几十字节），
+    变了立刻拿新的。
+    """
+
+    async def get_response(self, path, scope):
+        resp = await super().get_response(path, scope)
+        resp.headers["Cache-Control"] = "no-cache"
+        return resp
+
+
 static_dir = Path(__file__).parent / "static"
 if static_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    app.mount("/static", NoCacheStaticFiles(directory=str(static_dir)), name="static")
 
 
 @app.get("/health")
