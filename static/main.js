@@ -159,6 +159,8 @@
     function closeCheckLog() {
       const modal = document.getElementById('checkLogModal');
       if (modal) modal.classList.remove('show');
+      // 关闭日志弹窗时顺带收起“检测完成”气泡，避免它一直挂着显示过期内容
+      dismissCheckLogBubble();
     }
 
     /* ============ 数据 ============ */
