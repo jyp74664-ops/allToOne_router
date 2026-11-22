@@ -160,6 +160,15 @@ def render_dashboard() -> str:
     html = template.read_text(encoding="utf-8")
     html = html.replace("{{ local_api_key }}", "")
     html = html.replace("{{app_version}}", app.version)
+    # 静态资源带上文件 mtime 版本号：CSS/JS 一改 URL 就变，
+    # 浏览器不可能再用旧缓存（历史问题：改了样式却看到旧效果，误判"没修好"）
+    static_dir = Path(__file__).parent / "static"
+    for asset in ("style.css", "main.js"):
+        try:
+            ver = int((static_dir / asset).stat().st_mtime)
+        except OSError:
+            continue
+        html = html.replace(f'/static/{asset}"', f'/static/{asset}?v={ver}"')
     return html
 
 
