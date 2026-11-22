@@ -4,6 +4,18 @@ import time
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+# ---------------------------------------------------------------------------
+# 必须在任何 httpx.Client 创建之前执行：
+# conda 环境装的是 brotlicffi 1.2.0.0，它解码上游 br 压缩响应时会抛
+#   "brotli: decoder process called with data when 'can_accept_more_data()' is False"
+# 导致拉模型列表（Kilo Code 这类 600KB+ 的大响应必触发）和转发请求全部失败，
+# 表现为「请求超时 / 上游拉取失败」。这里统一不向上游声明 br/zstd，
+# httpx 的 ACCEPT_ENCODING 是模块级常量、Client 初始化时读取，改它全局生效。
+# ---------------------------------------------------------------------------
+import httpx._client as _httpx_client
+
+_httpx_client.ACCEPT_ENCODING = "gzip, deflate"
+
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse

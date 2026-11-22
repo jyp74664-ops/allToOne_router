@@ -499,7 +499,10 @@ async def fetch_models(
     for headers, auth_type in auth_attempts:
         for attempt in range(1, max_retries + 1):
             try:
-                resp = await client.get(url, headers=headers or None, timeout=10)
+                # 单个请求 15 秒：Kilo Code 这类聚合网关的 /models 有 600KB+，
+                # 慢网下 10 秒会误判超时（最坏 2 认证 × 2 重试 = 60 秒，
+                # 前端 available-models 的超时已同步放宽到 60 秒）
+                resp = await client.get(url, headers=headers or None, timeout=15)
                 logger.info("fetch_models: %s attempt %d, status=%d, auth=%s", base_url, attempt, resp.status_code, auth_type)
                 if resp.status_code == 200:
                     data = resp.json()

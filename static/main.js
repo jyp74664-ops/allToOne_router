@@ -977,7 +977,7 @@
       modalSortAsc = true;
       document.getElementById('modalTitle').innerText = `${provider} - 模型管理`;
       document.getElementById('modalSearchInput').value = '';
-      document.getElementById('modalModelList').innerHTML = '<div class="empty">正在获取远端可用模型列表...<br><br><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation: spin 1s linear infinite"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="4.93"></line></svg></div>';
+      document.getElementById('modalModelList').innerHTML = '<div class="empty">正在从上游拉取模型列表（模型多的提供商需要十几秒）...<br><br><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="animation: spin 1s linear infinite"><line x1="12" y1="2" x2="12" y2="6"></line><line x1="12" y1="18" x2="12" y2="22"></line><line x1="4.93" y1="4.93" x2="7.76" y2="7.76"></line><line x1="16.24" y1="16.24" x2="19.07" y2="4.93"></line></svg></div>';
       document.getElementById('modalStatusText').innerText = '';
       document.getElementById('modelModal').classList.add('show');
 
@@ -993,18 +993,19 @@
         disabledModels = new Set(pData ? (pData.disabled_models || []) : []);
         const freeOnly = pData ? pData.free_only !== false : true;
 
-        // 使用 AbortController 控制超时（10秒）
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 10000);
-
+        // 大提供商（Kilo Code 这类 470 个模型 / 600KB+ 响应）拉取需要更久，
+        // 原来写死 10 秒会无视真实原因，一律报"请求超时"
         let availableData = { ok: false, models: [], detail: '请求超时' };
         try {
-          const rAvailable = await apiFetch(`/api/providers/${provider}/available-models`, { signal: controller.signal });
+          const rAvailable = await apiFetch(`/api/providers/${provider}/available-models`, {}, 60000);
           availableData = await rAvailable.json();
         } catch (fetchErr) {
           console.warn(`[${provider}] available-models 请求失败:`, fetchErr.message);
-        } finally {
-          clearTimeout(timeoutId);
+          if (fetchErr.name === 'AbortError') {
+            availableData = { ok: false, models: [], detail: '上游 60 秒内没有返回模型列表' };
+          } else if (fetchErr.message !== 'Unauthorized') {
+            availableData = { ok: false, models: [], detail: '请求失败：' + (fetchErr.message || '未知错误') };
+          }
         }
 
         let allModels = availableData.models || [];
