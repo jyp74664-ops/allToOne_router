@@ -165,6 +165,7 @@ class SpeedRecord(Base):
     decode_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     wall_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     estimated: Mapped[bool] = mapped_column(Boolean, default=False)  # token 数是否为 chunk 估算
+    attempts: Mapped[int] = mapped_column(Integer, default=1)        # 实际测了几次（>1 表示取了平均）
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     tested_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, index=True)
 

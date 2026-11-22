@@ -749,6 +749,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "real_tps": sp.decode_tps if decode_trusted else None,
             "speed_overall_tps": sp.overall_tps if speed_ok else None,
             "speed_buffered": speed_buffered,
+            "speed_attempts": int(getattr(sp, "attempts", 1) or 1) if speed_ok else 1,
             "speed_estimated": bool(sp.estimated) if speed_ok else False,
             "speed_tested_at": sp.tested_at.timestamp() if sp is not None and hasattr(sp.tested_at, "timestamp") else None,
             "speed_error": ((sp.error or "")[:120] if sp is not None and not speed_ok else ""),

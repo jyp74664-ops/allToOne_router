@@ -36,6 +36,8 @@ SPEED_PROMPT = (
 
 DEFAULT_MAX_TOKENS = 128
 MAX_PLAUSIBLE_TPS = 800  # 解码速率物理上限：超过它的结果必然不是逐 token 生成测出来的
+RETEST_TPS = 500        # 超过它视为「快得可疑」：单次 128 token 样本太小，重测两次取平均
+RETEST_EXTRA = 2        # 可疑时额外补测的次数（合计 3 次）
 MAX_ITEMS = 50          # 单次测速的模型上限，防止误点全表烧额度
 CONCURRENCY = 3         # 并发数：decode 阶段占带宽很少，适度并发能显著缩短总时长
 SPEED_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
@@ -200,6 +202,56 @@ async def _stream_once(
     }
 
 
+def combine_runs(runs: list[dict]) -> dict:
+    """把多次测量合成一条结果。
+
+    - 只用「物理上说得通」的那几次算平均（整包返回的样本没有 decode 数据，掺进去会毁掉均值）
+    - 一次可信样本都没有 → 保留 buffered 结论，并给出整体吞吐
+    - 只有一次 → 原样返回，attempts 记 1
+    """
+    base = dict(runs[0])
+    base["attempts"] = len(runs)
+    base["averaged"] = False
+    if len(runs) == 1:
+        return base
+
+    trusted = [
+        r for r in runs
+        if r.get("status") == "ok" and decode_plausible(r.get("output_tokens") or 0, r.get("decode_ms"))
+    ]
+
+    def avg(key: str, digits: int = 0, pool: Optional[list] = None):
+        vals = [r[key] for r in (pool if pool is not None else trusted) if r.get(key) is not None]
+        if not vals:
+            return None
+        v = sum(vals) / len(vals)
+        return round(v, digits) if digits else round(v)
+
+    if not trusted:
+        # 3 次都是整包返回 → 依然测不到解码速度，只平均端到端吞吐
+        base["ttft_ms"] = avg("ttft_ms", pool=runs)
+        base["wall_ms"] = avg("wall_ms", pool=runs)
+        base["overall_tps"] = avg("overall_tps", 2, pool=runs)
+        base["decode_tps"] = None
+        base["decode_ms"] = None
+        base["buffered"] = True
+        return base
+
+    base["status"] = "ok"
+    base["code"] = 200
+    base["ttft_ms"] = avg("ttft_ms")
+    base["decode_ms"] = avg("decode_ms")
+    base["wall_ms"] = avg("wall_ms")
+    base["output_tokens"] = avg("output_tokens")
+    base["chunks"] = avg("chunks")
+    base["decode_tps"] = avg("decode_tps", 2)
+    base["overall_tps"] = avg("overall_tps", 2)
+    base["estimated"] = any(bool(r.get("estimated")) for r in trusted)
+    base["buffered"] = False
+    base["averaged"] = len(trusted) > 1
+    return base
+
+
 async def measure_stream_speed(
     client: httpx.AsyncClient,
     base_url: str,
@@ -208,15 +260,35 @@ async def measure_stream_speed(
     aliases: Optional[dict] = None,
     max_tokens: int = DEFAULT_MAX_TOKENS,
 ) -> dict:
-    """测一个模型的真实生成速度。"""
+    """测一个模型的真实生成速度。
+
+    首测超过 ``RETEST_TPS``（500 tok/s）说明这次可能踩到抖动或半缓冲：
+    再补测 ``RETEST_EXTRA`` 次，取可信样本的平均值。三次都不可信时按整包返回处理。
+    """
     from services.health_service import normalize_model_name
 
     actual_model = normalize_model_name((aliases or {}).get(model, model))
+    use_usage_opt = True
 
-    result = await _stream_once(client, base_url, api_key, actual_model, max_tokens, True)
-    if result.get("status") == "retry_no_usage_opt":
-        result = await _stream_once(client, base_url, api_key, actual_model, max_tokens, False)
-    return result
+    async def once() -> dict:
+        nonlocal use_usage_opt
+        r = await _stream_once(client, base_url, api_key, actual_model, max_tokens, use_usage_opt)
+        if r.get("status") == "retry_no_usage_opt":
+            use_usage_opt = False
+            r = await _stream_once(client, base_url, api_key, actual_model, max_tokens, False)
+        return r
+
+    first = await once()
+    if first.get("status") != "ok":
+        return first
+
+    runs = [first]
+    if (first.get("decode_tps") or 0) > RETEST_TPS:
+        for _ in range(RETEST_EXTRA):
+            r = await once()
+            if r.get("status") == "ok":
+                runs.append(r)
+    return combine_runs(runs)
 
 
 def _prune_runs() -> None:
@@ -279,6 +351,8 @@ async def run_speed_test(
             "wall_ms": res.get("wall_ms"),
             "estimated": bool(res.get("estimated")),
             "buffered": bool(res.get("buffered")),
+            "attempts": int(res.get("attempts") or 1),
+            "averaged": bool(res.get("averaged")),
             "error": res.get("error") or "",
         }
 
@@ -297,6 +371,7 @@ async def run_speed_test(
                     decode_ms=row["decode_ms"],
                     wall_ms=row["wall_ms"],
                     estimated=row["estimated"],
+                    attempts=row["attempts"],
                     error=row["error"] or None,
                     tested_at=datetime.now(),
                 ))

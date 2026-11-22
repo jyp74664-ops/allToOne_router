@@ -691,6 +691,80 @@ def test_decode_plausible_rejects_buffered_streams():
     assert decode_plausible(128, None) is False
 
 
+def _fake_speed_result(tokens=128, tps=600.0, ttft=500):
+    """按目标 tok/s 反推 decode_ms，保证 decode_plausible 的判断和真实代码一致。"""
+    decode_ms = max(1, round((tokens - 1) / tps * 1000))
+    return {
+        "status": "ok", "code": 200, "ttft_ms": ttft, "decode_ms": decode_ms,
+        "wall_ms": ttft + decode_ms, "output_tokens": tokens, "chunks": tokens,
+        "decode_tps": round((tokens - 1) / (decode_ms / 1000), 2),
+        "overall_tps": round(tokens / ((ttft + decode_ms) / 1000), 2),
+        "estimated": False, "buffered": False,
+    }
+
+
+def test_speed_retest_above_500_and_average(monkeypatch):
+    """首测 >500 tok/s 时补测两次，取三次（可信样本）的平均值。"""
+    from services import speed_service
+
+    calls = []
+    script = [_fake_speed_result(tps=600), _fake_speed_result(tps=700), _fake_speed_result(tps=800)]
+
+    async def fake_stream_once(*args, **kwargs):
+        calls.append(kwargs)
+        return script[len(calls) - 1]
+
+    monkeypatch.setattr(speed_service, "_stream_once", fake_stream_once)
+    res = asyncio.run(speed_service.measure_stream_speed(None, "https://x/v1", "k", "m"))
+
+    assert len(calls) == 3, "超过 500 tok/s 必须补测两次"
+    assert res["attempts"] == 3
+    assert res["averaged"] is True
+    assert res["buffered"] is False
+    # 600/700/800 三次的 decode_tps 均值
+    assert 680 < res["decode_tps"] < 720, res["decode_tps"]
+
+
+def test_speed_no_retest_below_500(monkeypatch):
+    """没超过 500 tok/s 就只测一次，不浪费额度。"""
+    from services import speed_service
+
+    calls = []
+
+    async def fake_stream_once(*args, **kwargs):
+        calls.append(1)
+        return _fake_speed_result(tps=300)
+
+    monkeypatch.setattr(speed_service, "_stream_once", fake_stream_once)
+    res = asyncio.run(speed_service.measure_stream_speed(None, "https://x/v1", "k", "m"))
+
+    assert len(calls) == 1
+    assert res["attempts"] == 1
+    assert res["averaged"] is False
+    assert 290 < res["decode_tps"] < 310
+
+
+def test_speed_retest_all_buffered_stays_buffered(monkeypatch):
+    """三次都是整包返回（几万 tok/s）时，平均也救不回来，只能标 buffered。"""
+    from services import speed_service
+
+    calls = []
+    script = [_fake_speed_result(tps=31750), _fake_speed_result(tps=25000), _fake_speed_result(tps=40000)]
+
+    async def fake_stream_once(*args, **kwargs):
+        calls.append(1)
+        return script[len(calls) - 1]
+
+    monkeypatch.setattr(speed_service, "_stream_once", fake_stream_once)
+    res = asyncio.run(speed_service.measure_stream_speed(None, "https://x/v1", "k", "m"))
+
+    assert len(calls) == 3
+    assert res["attempts"] == 3
+    assert res["buffered"] is True
+    assert res["decode_tps"] is None
+    assert res["overall_tps"] is not None
+
+
 def test_stability_hides_buffered_decode_speed(initialized_db, local_client):
     """上游整包返回的测速记录：real_tps 置空、标记 buffered，只留端到端吞吐。"""
     from datetime import datetime

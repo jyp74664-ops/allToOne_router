@@ -420,10 +420,12 @@
               const speeds = okRows.map(x => Number(x.decode_tps)).filter(v => Number.isFinite(v) && v > 0);
               const best = speeds.length ? Math.max.apply(null, speeds).toFixed(1) : null;
               const bufferedCount = okRows.filter(x => x.buffered).length;
+              const retestedCount = okRows.filter(x => (Number(x.attempts) || 1) > 1).length;
               const fail = results.length - okRows.length;
               showToast(
                 `✅ 测速完成：${okRows.length} 成功` + (fail ? ` / ${fail} 失败` : '') +
                 (best ? `，最快 ${best} tok/s` : '') +
+                (retestedCount ? `，${retestedCount} 个复测取均值` : '') +
                 (bufferedCount ? `；另有 ${bufferedCount} 个上游整包返回，只能给端到端吞吐` : ''),
                 fail ? 'warn' : 'ok', 7000
               );
@@ -740,11 +742,14 @@
         const hasOverall = Number.isFinite(overallTps) && overallTps > 0;
         let rtpsStr = '--';
         let rtpsColor = 'var(--text-secondary)';
+        const speedAttempts = Number(d.speed_attempts) || 1;
         if (hasRtps) {
-          rtpsStr = rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '');
+          rtpsStr = rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '')
+            + (speedAttempts > 1 ? `<span style="color:var(--text-secondary);font-size:10px">×${speedAttempts}</span>` : '');
           rtpsColor = rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)';
         } else if (buffered && hasOverall) {
-          rtpsStr = '≈' + overallTps.toFixed(1) + ' tok/s';
+          rtpsStr = '≈' + overallTps.toFixed(1) + ' tok/s'
+            + (speedAttempts > 1 ? `<span style="color:var(--text-secondary);font-size:10px">×${speedAttempts}</span>` : '');
           rtpsColor = 'var(--warning)';
         }
         let rtpsTip = d.speed_error
@@ -754,6 +759,9 @@
         if (buffered && hasOverall) {
           rtpsTip += '；上游没有逐 token 推流，整段内容一次返回，解码速度无法测量。'
             + '这里的 ≈ 是端到端吞吐 = 输出 token ÷ 总耗时（含首 Token 等待），比真实解码速度低。';
+        }
+        if (speedAttempts > 1) {
+          rtpsTip += `；该数值为 ${speedAttempts} 次测量的平均值（首测超过 500 tok/s 会自动补测两次）`;
         }
         const checks = Number(d.checks) || 0;
         const ok = Number(d.ok) || 0;
