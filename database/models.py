@@ -16,6 +16,7 @@ class Provider(Base):
     api_key: Mapped[str] = mapped_column(Text)
     models: Mapped[list] = mapped_column(JSON, default=list)
     disabled_models: Mapped[list] = mapped_column(JSON, default=list)
+    retired_models: Mapped[list] = mapped_column(JSON, default=list)  # 检测确认 EOL/404 后永久移除的模型
     free_only: Mapped[bool] = mapped_column(Boolean, default=True)
     provider_status: Mapped[str] = mapped_column(String(20), default="unknown")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

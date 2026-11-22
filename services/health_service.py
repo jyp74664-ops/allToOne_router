@@ -260,6 +260,10 @@ def explain_status(status: str, code: int | None, detail: str = "") -> dict:
     if status == "ok" or code == 200:
         return {"kind": "ok", "label": "模型可用，上次探测成功", "short": "正常"}
 
+    # EOL：检测确认已下线，会自动从配置中移除
+    if status == "eol" or code == 410:
+        return {"kind": "offline", "label": "模型已下线（EOL），已从配置中移除", "short": "已下线"}
+
     # 429 / 503 限流
     if status == "rate_limited" or code == 429:
         kind, label, short = "rate_limited", "触发速率限制（429），稍后自动冷却重试", "限流"
@@ -366,6 +370,14 @@ async def check_model(
                     "detail": resp.text[:200],
                     "retry_after": retry_after,
                     "attempt": attempt,
+                }
+            if resp.status_code == 410:
+                # EOL：上游已永久下线，检测入口据此从配置中移除，不再出现
+                return {
+                    "status": "eol",
+                    "code": 410,
+                    "latency_ms": latency,
+                    "detail": resp.text[:200],
                 }
             if resp.status_code == 404:
                 return {
@@ -514,6 +526,39 @@ def mask_key(key: str) -> str:
     return key[:6] + "****" + key[-4:]
 
 
+async def retire_models(provider_name: str, model_names: list[str]) -> list[str]:
+    """把 EOL(410)/404 模型从配置中永久移除，记入退役名单。
+
+    移除后：模型管理弹窗不再显示、稳定性列表过滤、同步免费模型不会加回。
+    返回实际移除的模型名列表。
+    """
+    from sqlalchemy import select
+    from database.engine import db
+    from database.models import Provider
+
+    if not model_names:
+        return []
+    targets = set(model_names)
+    removed: list[str] = []
+    async with db.SessionLocal() as session:
+        result = await session.execute(select(Provider).where(Provider.name == provider_name))
+        provider = result.scalar_one_or_none()
+        if not provider:
+            return []
+        current = set(provider.models or []) | set(provider.disabled_models or [])
+        removed = sorted(targets & current)
+        if removed:
+            retired = set(provider.retired_models or [])
+            provider.models = [m for m in (provider.models or []) if m not in targets]
+            provider.disabled_models = [m for m in (provider.disabled_models or []) if m not in targets]
+            provider.retired_models = sorted(retired | set(removed))
+            await session.commit()
+    for m in removed:
+        health_state.health_status.pop(f"{provider_name}||{m}", None)
+    if removed:
+        logger.info("\033[91m♻ 已永久移除不可用模型 %s: %s\033[0m", provider_name, ", ".join(removed))
+    return removed
+
 async def run_full_check(on_progress=None) -> dict:
     """检查所有启用模型并更新健康状态。
     
@@ -543,6 +588,7 @@ async def run_full_check(on_progress=None) -> dict:
     async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
         # 记录本次检测中已确认删除的模型，避免重复探测
         already_deleted: set[str] = set()
+        retire_by_provider: dict[str, list[str]] = {}  # EOL/404 待永久移除
         for provider in providers:
             # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测，
             # 以便后台能看到被禁用模型的上游状态；但它们不参与路由，
@@ -575,7 +621,9 @@ async def run_full_check(on_progress=None) -> dict:
                 # 跳过上次检测已确认删除的模型（内存中持久保留，直到同步清除）
                 prev_status = health_state.health_status.get(key, {}).get("status")
                 if prev_status == "deleted":
-                    logger.info("  [跳过] %s | %s (上一轮已 deleted)", provider.name, model)
+                    # 上一轮已确认不可用：直接退役，不再每轮跳过占位
+                    retire_by_provider.setdefault(provider.name, []).append(model)
+                    logger.info("  [退役] %s | %s (上一轮已 deleted)", provider.name, model)
                     if on_progress:
                         on_progress(provider.name, model, "deleted", current + 1, total)
                     current += 1
@@ -589,6 +637,10 @@ async def run_full_check(on_progress=None) -> dict:
                 health_state.update_quality(key, result)
                 
                 status = result.get("status", "unknown")
+                
+                # EOL(410)/404 永久不可用：收集后从配置移除，不再占位
+                if status in ("eol", "deleted"):
+                    retire_by_provider.setdefault(provider.name, []).append(model)
                 
                 # 如果是 429 限速，记录冷却时间
                 if status == "rate_limited":
@@ -620,6 +672,10 @@ async def run_full_check(on_progress=None) -> dict:
                 if on_progress:
                     on_progress(provider.name, model, status, current, total)
                 logger.info("  [%d/%d] %s | %s -> %s", current, total, provider.name, model, status)
+    
+    # 统一移除已确认 EOL/404 的模型（持久化，重启和同步都不会加回）
+    for prov, models in retire_by_provider.items():
+        await retire_models(prov, models)
     
     ok_count = sum(1 for v in results.values() if v.get("status") == "ok")
     fail_count = len(results) - ok_count

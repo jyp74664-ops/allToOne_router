@@ -393,6 +393,7 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         
         meta = ModelMetaService()
         results = {}
+        retire_list: list[str] = []  # EOL/404 待永久移除
         enabled_set = set(provider.models or [])
         total = len(provider.models or []) + len(provider.disabled_models or [])
         current = 0
@@ -413,6 +414,8 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 # 检查是否已标记为 deleted
                 prev_status = health_state.health_status.get(key, {}).get("status")
                 if prev_status == "deleted":
+                    # 上一轮已确认不可用：直接退役
+                    retire_list.append(model)
                     if on_progress:
                         on_progress(provider.name, model, "deleted", current + 1, total)
                     current += 1
@@ -426,6 +429,10 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 health_state.update_quality(key, result)
                 
                 status = result.get("status", "unknown")
+                
+                # EOL(410)/404 永久不可用：收集后从配置移除
+                if status in ("eol", "deleted"):
+                    retire_list.append(model)
                 
                 if status == "rate_limited":
                     retry_after = result.get("retry_after")
@@ -454,6 +461,10 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 if on_progress:
                     on_progress(provider.name, model, status, current, total)
         
+        # 统一移除已确认 EOL/404 的模型
+        from services.health_service import retire_models
+        if retire_list:
+            await retire_models(name, retire_list)
         return results
     
     # 进度回调
@@ -603,11 +614,19 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     """获取稳定性统计"""
     from services.usage_service import read_health_history
     from services.health_service import health_state, explain_status
+    from database.models import Provider
+    from database.engine import db
     records = await read_health_history(hours)
+    # 已永久移除的模型不再出现在统计列表
+    async with db.SessionLocal() as s:
+        retired_provs = (await s.execute(select(Provider))).scalars().all()
+    retired_keys = {f"{p.name}||{m}" for p in retired_provs for m in (p.retired_models or [])}
     
     model_stats = {}
     for rec in records:
         for key, info in rec.get("data", {}).items():
+            if key in retired_keys:
+                continue
             if key not in model_stats:
                 model_stats[key] = {"ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": []}
             model_stats[key]["total"] += 1

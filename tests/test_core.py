@@ -163,3 +163,78 @@ def test_check_log_endpoint(local_client, initialized_db):
     assert "下线" in by_model["google/gemma-2b"]["reason"]
     assert by_model["agnes-3.0-flash"]["kind"] == "ok"
     assert "api_key" not in r.text.lower()
+
+
+def test_retire_models_removes_eol_and_404(initialized_db):
+    """检测确认 EOL/404 后，模型从启用+限额列表移除并进入退役名单。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    from services.health_service import retire_models
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="retire-test", base_url="https://x/v1", api_key="k",
+                           models=["good", "eol-model"],
+                           disabled_models=["not-open"], retired_models=[]))
+            await s.commit()
+    asyncio.run(seed())
+
+    removed = asyncio.run(retire_models("retire-test", ["eol-model", "not-open"]))
+    assert set(removed) == {"eol-model", "not-open"}
+
+    async def verify():
+        async with db.SessionLocal() as s:
+            from sqlalchemy import select
+            p_ = (await s.execute(select(Provider).where(Provider.name == "retire-test"))).scalar_one()
+            assert p_.models == ["good"]
+            assert p_.disabled_models == []
+            assert set(p_.retired_models) == {"eol-model", "not-open"}
+    asyncio.run(verify())
+
+
+def test_explain_status_eol():
+    """EOL 状态应显示为已下线并标注会自动移除。"""
+    from services.health_service import explain_status
+    ex = explain_status("eol", 410, "end of life")
+    assert ex["kind"] == "offline"
+    assert "移除" in ex["label"]
+
+
+def test_sync_skips_retired_models(initialized_db, monkeypatch):
+    """同步免费模型时不会把已退役的模型加回来。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.provider_service as ps
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="sync-test", base_url="https://x/v1", api_key="k",
+                           models=[], disabled_models=[],
+                           retired_models=["dead-model"]))
+            await s.commit()
+    asyncio.run(seed())
+
+    async def fake_fetch(*a, **kw):
+        return ["dead-model", "live-model"]
+    monkeypatch.setattr(ps, "_fetch_models", fake_fetch)
+
+    svc = ps.ProviderService()
+    import httpx
+    results = asyncio.run(svc.sync_free_models(
+        httpx.AsyncClient(), {}, {}, {}
+    ))
+    r = next(x for x in results if x["name"] == "sync-test")
+    assert r["removed_retired"] >= 1
+
+    async def verify():
+        async with db.SessionLocal() as s:
+            from sqlalchemy import select
+            p_ = (await s.execute(select(Provider).where(Provider.name == "sync-test"))).scalar_one()
+            assert p_.models == ["live-model"]
+    asyncio.run(verify())

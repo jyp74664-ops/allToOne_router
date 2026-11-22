@@ -202,6 +202,9 @@ class ProviderService:
                 deleted_keys = {k for k, v in health_status.items() if v and v.get("status") == "deleted"}
                 deleted_models = {k.split("||", 1)[1] for k in deleted_keys if k.startswith(p.name + "||")}
                 models = [m for m in models if m not in deleted_models]
+                # 持久过滤：检测确认 EOL/404 后永久移除的模型不再加回
+                retired = set(p.retired_models or [])
+                models = [m for m in models if m not in retired]
                 
                 p.models = models
                 p.disabled_models = []
@@ -211,5 +214,6 @@ class ProviderService:
                     "ok": True,
                     "count": len(models),
                     "removed_deleted": len(deleted_models & set(models)),
+                    "removed_retired": len(retired),
                 })
         return results
