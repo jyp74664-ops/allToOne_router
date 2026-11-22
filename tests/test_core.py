@@ -308,3 +308,32 @@ def test_providers_list_exposes_check_enabled(local_client, initialized_db):
     by_name = {p["name"]: p for p in r.json()}
     assert by_name["p-on"]["check_enabled"] is True
     assert by_name["p-off"]["check_enabled"] is False
+
+
+def test_full_check_skips_unchecked_models(initialized_db, monkeypatch):
+    """立即检测只探测已勾选（models）的模型，未勾选（disabled_models）不探测。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import Provider
+    import services.health_service as hs
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="mix", base_url="https://a/v1", api_key="k",
+                           models=["m-on"], disabled_models=["m-off"],
+                           retired_models=[], check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    called = []
+
+    async def fake_check(client, base_url, api_key, model, aliases, **kw):
+        called.append(model)
+        return {"status": "ok", "code": 200, "latency_ms": 1}
+    monkeypatch.setattr(hs, "check_model", fake_check)
+
+    results = asyncio.run(hs.run_full_check())
+    assert called == ["m-on"], called
+    assert list(results) == ["mix||m-on"], list(results)

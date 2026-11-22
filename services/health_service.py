@@ -580,7 +580,12 @@ async def run_full_check(on_progress=None) -> dict:
     async with db.SessionLocal() as session:
         providers = (await session.execute(select(Provider))).scalars().all()
     
-    total = sum(len(p.models or []) + len(p.disabled_models or []) for p in providers)
+    # 只统计真正参与检测的模型（关闭检测的提供商、未勾选的模型都不算）
+    total = sum(
+        len(p.models or [])
+        for p in providers
+        if getattr(p, "check_enabled", True) is not False
+    )
     current = 0
     
     logger.info("\033[93m▶ 开始全量健康检测，共 %d 个服务商，%d 个模型\033[0m", len(providers), total)
@@ -594,16 +599,13 @@ async def run_full_check(on_progress=None) -> dict:
             if getattr(provider, "check_enabled", True) is False:
                 logger.info("  [跳过检测] %s (已关闭检测)", provider.name)
                 continue
-            # 同时检查启用的模型和限额型模型（disabled_models 也要健康探测，
-            # 以便后台能看到被禁用模型的上游状态；但它们不参与路由，
-            # 探测结果不应计入熔断/失败计数，避免污染 provider 状态）
-            enabled_set = set(provider.models or [])
-            models_to_check = list(dict.fromkeys((provider.models or []) + (provider.disabled_models or [])))
+            # 只探测已勾选（启用）的模型。未勾选的 disabled_models 不参与路由，
+            # 探测它们只会白烧上游额度，因此不再纳入全量检测（2026-11-23 用户要求）。
+            models_to_check = list(dict.fromkeys(provider.models or []))
             logger.info("\033[94m  检测服务商: %s (%d 个模型)\033[0m", provider.name, len(models_to_check))
             
             for model in models_to_check:
                 key = f"{provider.name}||{model}"
-                is_disabled = model not in enabled_set
                 
                 # 检查是否在冷却期内（429 限速后跳过）
                 if health_state.is_model_rate_limited(key):
@@ -660,11 +662,7 @@ async def run_full_check(on_progress=None) -> dict:
                     if prev_status == "deleted":
                         already_deleted.discard(key)
                         logger.info("  [恢复] %s | %s -> ok (取消 deleted 标记)", provider.name, model)
-                    if not is_disabled:
-                        health_state.record_success(key)
-                elif is_disabled:
-                    # 被禁用的模型：仅记录探测结果，不计入失败/熔断
-                    logger.info("  [禁用] %s | %s -> %s (不计入失败)", provider.name, model, status)
+                    health_state.record_success(key)
                 elif status in ("deleted", "rate_limited"):
                     # 404 下架 / 429 限速不是稳定性失败：不计入熔断，
                     # 避免每轮全量检测把熔断器打爆（下架模型本来就不会被路由选中）

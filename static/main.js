@@ -504,10 +504,22 @@
         return true;
       });
 
-      /* ---- 排序 ---- */
-      if (sortCol) {
+      /* ---- 排序：可用模型固定排在前，不可用的沉到后面 ---- */
+      // 可用 = 未被禁用（限额型），且最近一次巡检状态为空/ok/unknown
+      // （还没有证据表明不可用）。error/offline/rate_limited/no_auth/not_enabled 一律算不可用。
+      const isAvailable = (d) => {
+        if (d._disabled) return false;
+        const k = d.status_kind;
+        return !k || k === 'ok' || k === 'unknown';
+      };
+      {
         const asc = sortAsc;
         filtered.sort((a, b) => {
+          // 第一优先级：可用性分组，无论点哪列表头都不打乱
+          const ga = isAvailable(a) ? 0 : 1;
+          const gb = isAvailable(b) ? 0 : 1;
+          if (ga !== gb) return ga - gb;
+          if (!sortCol) return 0;  // 没有列排序时保持后端原有顺序（sort 稳定）
           let va, vb;
           switch (sortCol) {
             case 'model':
