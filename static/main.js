@@ -584,7 +584,21 @@
 
       const tbody = document.getElementById('stableBody');
       if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="10" class="empty">No records found in this timeframe.</td></tr>';
+        const h = document.getElementById('stabilityHours').value || '24';
+        const hideZS = document.getElementById('hideZeroSuccess').checked;
+        // 所有行探针次数都是 0（含后端无记录时前端兜底生成的空行）＝这个时间段真的没检测过
+        const noChecks = !stabilityData.length || stabilityData.every(d => !Number(d.checks));
+        let why;
+        if (noChecks) {
+          // 本表统计的是「检测探针」结果，不包含经网关转发的聊天请求
+          why = `最近 ${h} 小时没有任何检测记录。这里统计的是「检测」的结果（不是经网关转发的聊天请求）——点右上角「立即检测」或服务商卡片上的「🔍 检查」跑一次，结果就会出现在这里。`;
+          if (hideZS) why += ' 另外「隐藏从未成功调用的模型」是勾选状态，未成功过的模型一律不显示。';
+        } else if (hideZS) {
+          why = `最近 ${h} 小时的检测记录里，没有任何模型成功过；你勾选了「隐藏从未成功调用的模型」，所以全部被隐藏。取消勾选即可看到它们。`;
+        } else {
+          why = '没有匹配的模型，试试调整筛选条件或搜索词。';
+        }
+        tbody.innerHTML = `<tr><td colspan="10" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);line-height:1.7;">${esc(why)}</td></tr>`;
         return;
       }
 
