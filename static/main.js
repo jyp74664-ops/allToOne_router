@@ -405,13 +405,41 @@
       }
     }
 
-    function pollSpeedTest(runId, btn, original) {
+    // 单行测速：只测表格里某一个模型，不依赖当前筛选/勾选
+    async function speedTestOne(btn, ev) {
+      if (ev) { ev.stopPropagation(); }
+      if (!btn || btn.disabled) return;
+      if (_speedPollTimer) { showToast('已有测速任务在进行中，等它跑完再点', 'warn', 5000); return; }
+      const provider = btn.dataset.provider || '';
+      const model = btn.dataset.model || '';
+      if (!provider || !model) return;
+
+      const original = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = '⏳';
+      try {
+        const r = await apiFetch('/api/speed-test/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ items: [{ provider: provider, model: model }], max_tokens: 128 }),
+        }, 30000);
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
+        await pollSpeedTest(d.run_id, btn, original, true);
+      } catch (e) {
+        btn.disabled = false;
+        btn.innerHTML = original;
+        if (e.message !== 'Unauthorized') showToast('测速失败：' + (e.message || '未知错误'), 'error', 6000);
+      }
+    }
+
+    function pollSpeedTest(runId, btn, original, compact) {
       return new Promise((resolve) => {
         const tick = async () => {
           try {
             const r = await apiFetch('/api/speed-test/status?run_id=' + encodeURIComponent(runId), {}, 15000);
             const d = await r.json();
-            if (btn) btn.innerHTML = `⏳ 测速 ${d.done}/${d.total}`;
+            if (btn) btn.innerHTML = compact ? '⏳' : `⏳ 测速 ${d.done}/${d.total}`;
             if (d.finished) {
               clearTimeout(_speedPollTimer); _speedPollTimer = null;
               if (btn) { btn.disabled = false; btn.innerHTML = original; }
@@ -823,7 +851,7 @@
       </td>
       <td class="latency ${d.avg_latency_ms && d.avg_latency_ms < 3000 ? 'fast' : d.avg_latency_ms && d.avg_latency_ms < 8000 ? 'medium' : ''}">${avgL}</td>
       <td class="latency" style="font-size:12px;color:${ttftColor}">${ttftStr}</td>
-      <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}">${rtpsStr}</td>
+      <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end;white-space:nowrap;"><span>${rtpsStr}</span><button class="speed-one-btn" title="只测这一个模型（流式 128 token；首测超过 500 tok/s 会自动补测两次）。不点这个按钮不会消耗额度" data-provider="${esc(d.provider)}" data-model="${esc(d.model)}" onclick="speedTestOne(this, event)">⚡</button></span></td>
     </tr>`;
       }).join('');
     }
