@@ -337,6 +337,41 @@
       }
     }
 
+    /* 手动刷新：重拉提供商列表与模型状态（不发起检测） */
+    async function refreshProviderList(btn) {
+      const original = btn ? btn.innerText : '';
+      if (btn) { btn.disabled = true; btn.innerText = '刷新中...'; }
+      try {
+        await load();
+        showToast('提供商列表已刷新', 'ok');
+      } catch (e) {
+        if (e.message !== 'Unauthorized') {
+          console.error('Refresh failed', e);
+          showToast('刷新失败：' + (e.message || '未知错误'), 'error');
+        }
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerText = original; }
+      }
+    }
+
+    /* 手动刷新：重拉模型清单 + 当前时间窗口的检测统计（不发起检测） */
+    async function refreshMonitorList(btn) {
+      const original = btn ? btn.innerText : '';
+      if (btn) { btn.disabled = true; btn.innerText = '刷新中...'; }
+      try {
+        await load();          // 提供商卡片 + 模型清单
+        await loadStability(); // 当前“最近 N 小时”的统计
+        showToast('列表已刷新', 'ok');
+      } catch (e) {
+        if (e.message !== 'Unauthorized') {
+          console.error('Refresh failed', e);
+          showToast('刷新失败：' + (e.message || '未知错误'), 'error');
+        }
+      } finally {
+        if (btn) { btn.disabled = false; btn.innerText = original; }
+      }
+    }
+
     async function loadStability(hours, renderFn) {
       const h = hours || document.getElementById('stabilityHours').value;
       try {
