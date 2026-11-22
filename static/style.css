@@ -1099,14 +1099,6 @@
       cursor: pointer;
     }
     .check-log-bubble-btn:hover { filter: brightness(1.08); }
-    .check-log-bubble-close {
-      cursor: pointer;
-      font-size: 17px;
-      line-height: 1;
-      color: var(--text-secondary);
-      padding: 0 2px;
-    }
-    .check-log-bubble-close:hover { color: var(--danger); }
     .check-log-section {
       margin-bottom: 18px;
     }
