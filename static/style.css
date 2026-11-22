@@ -1043,6 +1043,110 @@
       border-left: 4px solid var(--danger);
     }
 
+    /* 检测完成日志气泡 */
+    .check-log-bubble {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin: 0 0 16px;
+      padding: 10px 14px;
+      border-radius: 10px;
+      border: 1px solid var(--mac-border);
+      background: var(--mac-window-bg);
+      box-shadow: 0 4px 14px rgba(0, 0, 0, 0.10);
+      font-size: 13px;
+      animation: bubbleIn 0.3s ease-out;
+    }
+    @keyframes bubbleIn {
+      from { opacity: 0; transform: translateY(-8px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+    .check-log-bubble-icon { font-size: 15px; }
+    .check-log-bubble-text { flex: 1; font-weight: 500; color: var(--text-primary); }
+    .check-log-bubble-btn {
+      border: none;
+      background: var(--accent-primary, #6B5CE6);
+      color: #fff;
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .check-log-bubble-btn:hover { filter: brightness(1.08); }
+    .check-log-bubble-close {
+      cursor: pointer;
+      font-size: 17px;
+      line-height: 1;
+      color: var(--text-secondary);
+      padding: 0 2px;
+    }
+    .check-log-bubble-close:hover { color: var(--danger); }
+    .check-log-body {
+      max-height: 56vh;
+      overflow-y: auto;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      background: rgba(0, 0, 0, 0.04);
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+    .check-log-row {
+      display: flex;
+      gap: 8px;
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(0, 0, 0, 0.05);
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .check-log-row:last-child { border-bottom: none; }
+    .check-log-kind {
+      flex-shrink: 0;
+      min-width: 62px;
+      font-weight: 600;
+    }
+    .check-log-kind[data-kind="ok"] { color: var(--success, #0a0); }
+    .check-log-kind[data-kind="not_enabled"] { color: #8a5cd6; }
+    .check-log-kind[data-kind="offline"] { color: var(--danger, #c00); }
+    .check-log-kind[data-kind="rate_limited"] { color: #d07c00; }
+    .check-log-kind[data-kind="error"] { color: var(--danger, #c00); }
+    .check-log-msg { flex: 1; color: var(--text-primary); }
+    .check-log-code { flex-shrink: 0; color: var(--text-secondary); }
+
+    /* 状态真实含义问号图标 */
+    .status-reason-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 14px;
+      height: 14px;
+      margin-left: 5px;
+      border-radius: 50%;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1;
+      cursor: help;
+      color: var(--warning, #b8860b);
+      background: rgba(255, 204, 0, 0.18);
+      border: 1px solid rgba(255, 204, 0, 0.5);
+      user-select: none;
+    }
+    .status-reason-icon[data-kind="offline"] {
+      color: var(--danger, #c00);
+      background: rgba(220, 53, 69, 0.12);
+      border-color: rgba(220, 53, 69, 0.45);
+    }
+    .status-reason-icon[data-kind="not_enabled"] {
+      color: #8a5cd6;
+      background: rgba(138, 92, 214, 0.14);
+      border-color: rgba(138, 92, 214, 0.45);
+    }
+    .status-reason-icon[data-kind="rate_limited"] {
+      color: #d07c00;
+      background: rgba(255, 152, 0, 0.15);
+      border-color: rgba(255, 152, 0, 0.5);
+    }
+
     /* 管理门禁 */
     .admin-gate {
       position: absolute;

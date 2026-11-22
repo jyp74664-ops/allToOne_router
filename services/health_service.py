@@ -244,6 +244,65 @@ def _schedule_notify(event: str, data: dict) -> None:
     loop.create_task(notify_webhooks(event, data))
 
 
+def explain_status(status: str, code: int | None, detail: str = "") -> dict:
+    """把探测结果翻译成人话，供前端状态图标 tooltip 展示。
+
+    返回 {label, kind, short}：
+      label - 一句话真实含义（中文）
+      kind  - 语义分类：ok / not_enabled / offline / rate_limited / no_auth / error / cooldown / unknown
+      short - 极简短标（用于紧凑展示）
+    仅依据 status + code + detail 文本，不发任何网络请求、不改任何状态。
+    """
+    detail = (detail or "")[:400]
+    dl = detail.lower()
+    kind, label, short = "unknown", "状态未知", "?"
+
+    if status == "ok" or code == 200:
+        return {"kind": "ok", "label": "模型可用，上次探测成功", "short": "正常"}
+
+    # 429 / 503 限流
+    if status == "rate_limited" or code == 429:
+        kind, label, short = "rate_limited", "触发速率限制（429），稍后自动冷却重试", "限流"
+    elif code == 503:
+        kind, label, short = "rate_limited", "上游服务过载（503），通常视为限流", "限流"
+
+    # 410 Gone —— 模型已下线（nvidia 等返回 end of life）
+    elif code == 410 or "end of life" in dl or "no longer available" in dl or "已下线" in detail:
+        kind, label, short = "offline", "模型已下线（EOL），上游永久停止提供", "已下线"
+
+    # 404 —— 细分：未开通 vs 真不存在
+    elif code == 404 or status == "deleted":
+        if "not found for account" in dl or "function" in dl and "account" in dl:
+            kind, label, short = "not_enabled", "账号未开通该模型（404），需在提供商控制台申请权限", "未开通"
+        else:
+            kind, label, short = "offline", "模型不存在或已移除（404）", "已移除"
+
+    # 401 / 403 —— 鉴权
+    elif code in (401, 403):
+        if "function" in dl and "account" in dl:
+            kind, label, short = "not_enabled", "账号无权限访问该模型（403），需先开通", "未开通"
+        else:
+            kind, label, short = "no_auth", "鉴权失败（%d），请检查 API Key 是否有效" % code, "鉴权失败"
+
+    # 400 —— 多为模型名不被接受 / 非对话模型
+    elif code == 400:
+        kind, label, short = "error", "请求被上游拒绝（400），模型名可能无效或不支持对话接口", "请求被拒"
+
+    # 5xx
+    elif code is not None and 500 <= code < 600:
+        kind, label, short = "error", "上游服务错误（%d），可能是临时故障" % code, "上游错误"
+
+    # 无 HTTP 码的失败：网络/超时
+    elif status == "error":
+        kind, label, short = "error", "网络错误或超时，未能连上上游", "网络错误"
+    elif status == "fail":
+        kind, label, short = "error", "探测失败（无 HTTP 状态码）", "失败"
+
+    if detail:
+        label += "｜" + detail.replace("\n", " ")[:120]
+    return {"kind": kind, "label": label, "short": short}
+
+
 def normalize_model_name(model: str) -> str:
     """去除常见前缀，使模型名适合发送到上游 API。
     例如 Google AI Studio 的 models/xxx 需要转为 xxx。"""

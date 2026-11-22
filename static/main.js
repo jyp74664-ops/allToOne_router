@@ -90,6 +90,67 @@
       _toastTimer = setTimeout(() => { el.className = 'toast ' + type; }, 3000);
     }
 
+    /* ============ 检测完成日志气泡 ============ */
+    function showCheckLogBubble(summary, hasFail) {
+      const box = document.getElementById('checkLogBubble');
+      const txt = document.getElementById('checkLogBubbleText');
+      if (!box || !txt) return;
+      txt.textContent = summary;
+      const icon = box.querySelector('.check-log-bubble-icon');
+      if (icon) icon.textContent = hasFail ? '⚠️' : '✅';
+      box.style.display = 'flex';
+    }
+
+    function dismissCheckLogBubble() {
+      const box = document.getElementById('checkLogBubble');
+      if (box) box.style.display = 'none';
+    }
+
+    async function openCheckLog() {
+      const modal = document.getElementById('checkLogModal');
+      const body = document.getElementById('checkLogBody');
+      const meta = document.getElementById('checkLogMeta');
+      if (!modal || !body) return;
+      modal.style.display = 'flex';
+      body.textContent = '加载中...';
+      if (meta) meta.textContent = '';
+      try {
+        const r = await apiFetch('/api/check-log');
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        const items = d.items || [];
+        if (!items.length) {
+          body.textContent = '暂无检查记录。';
+          return;
+        }
+        if (meta) {
+          const t = d.checked_at ? new Date(d.checked_at * 1000).toLocaleString('zh-CN') : '未知';
+          meta.textContent = `检查时间：${t}　·　共 ${d.count} 条记录`;
+        }
+        body.innerHTML = items.map(it => {
+          const kind = esc(it.kind || 'unknown');
+          const short = esc(it.status_short || it.status || '?');
+          const reason = esc(it.reason || '');
+          const code = it.code != null ? '[' + esc(String(it.code)) + ']' : '';
+          const who = esc(it.provider + ' · ' + it.model);
+          return `<div class="check-log-row">` +
+            `<span class="check-log-kind" data-kind="${kind}">${short}</span>` +
+            `<span class="check-log-msg">${who} — ${reason}</span>` +
+            `<span class="check-log-code">${code}</span>` +
+            `</div>`;
+        }).join('');
+      } catch (e) {
+        if (e.message !== 'Unauthorized') {
+          body.textContent = '加载失败：' + (e.message || '未知错误');
+        }
+      }
+    }
+
+    function closeCheckLog() {
+      const modal = document.getElementById('checkLogModal');
+      if (modal) modal.style.display = 'none';
+    }
+
     /* ============ 数据 ============ */
     let data = [];
     let stabilityData = [];
@@ -510,13 +571,16 @@
         const rateLimitRaw = esc(typeof rateLimit === 'object' ? (rateLimit.raw || '--') : rateLimit);
         const rateLimitTip = esc(typeof rateLimit === 'object' ? (rateLimit.tooltip || '') : '');
 
-        let lastStatusHtml = '';
-        if (d.last_status === 'ok') {
-          lastStatusHtml = `<span title="上次巡检：正常" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--success);margin-left:6px;"></span>`;
-        } else if (d.last_status === 'fail' || d.last_status === 'error') {
-          lastStatusHtml = `<span title="上次巡检：异常 (通常为提供商限流或报错)" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--danger);margin-left:6px;animation: pulse 2s infinite;"></span>`;
-        } else {
-          lastStatusHtml = `<span title="上次巡检：等待中..." style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--text-secondary);margin-left:6px;"></span>`;
+        // 状态圆点 + 真实含义问号：hover 看 code/detail 翻译后的人话
+        const statusKind = d.status_kind || '';
+        const statusReason = esc(d.status_reason || '');
+        const statusShort = esc(d.status_short || '');
+        const dotColor = statusKind === 'ok' ? 'var(--success)'
+          : (statusKind === 'unknown' ? 'var(--text-secondary)' : 'var(--danger)');
+        const dotPulse = (statusKind && statusKind !== 'ok' && statusKind !== 'unknown') ? 'animation:pulse 2s infinite;' : '';
+        let lastStatusHtml = `<span title="${statusReason || '上次巡检：等待中...'}" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${dotColor};margin-left:6px;${dotPulse}"></span>`;
+        if (statusReason && statusKind && statusKind !== 'ok') {
+          lastStatusHtml += `<span class="status-reason-icon" title="${statusReason}" data-kind="${esc(statusKind)}">?</span>`;
         }
 
         const disabledBadge = isDisabled ? ' <span style="font-size:10px;background:var(--warning);color:#000;padding:1px 5px;border-radius:3px;margin-left:4px;">限额型</span>' : '';
@@ -640,6 +704,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
+                showCheckLogBubble(`检测完成：${ok} 正常 / ${fail} 异常 — 点击查看最新日志`, fail > 0);
               } else if (event.provider === providerName) {
                 const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
                 const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
@@ -711,6 +776,7 @@
                 ok = Object.values(results).filter(v => v && v.status === 'ok').length;
                 fail = Object.values(results).filter(v => !['ok', 'cooldown'].includes(v.status)).length;
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
+                showCheckLogBubble(`检测完成：${ok} 正常 / ${fail} 异常 — 点击查看最新日志`, fail > 0);
               } else if (event.provider && event.model) {
                 total = event.total;
                 current = event.current;

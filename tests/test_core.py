@@ -75,3 +75,91 @@ def test_webhook_crud_and_validation(local_client):
     assert listed[0]["secret"] == "****"
     assert local_client.delete(f"/api/webhooks/configs/{wid}").status_code == 200
     assert local_client.post("/api/webhooks/test", json={"url": "ftp://bad"}).status_code == 400
+
+
+def test_check_provider_route_not_shadowed(local_client, monkeypatch):
+    """/check/provider/{name} 必须匹配具体路由，不能被 /check/{name}/{model} 吞掉。"""
+    import asyncio
+    from database.models import Provider
+    from database import engine as engine_mod
+    import api.admin as admin_mod
+    import services.health_service as hs
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="agnes-test", base_url="https://x/v1", api_key="k",
+                           models=["m1"], disabled_models=[]))
+            await s.commit()
+    asyncio.run(seed())
+
+    # 用假的探测函数，避免任何真实上游请求
+    async def fake_check(client, base_url, api_key, model, aliases, **kw):
+        return {"status": "ok", "code": 200, "latency_ms": 1}
+    monkeypatch.setattr(admin_mod, "check_model", fake_check)
+    monkeypatch.setattr(hs, "is_model_rate_limited", lambda k: False, raising=False)
+
+    r = local_client.post("/api/check/provider/agnes-test")
+    assert r.status_code == 200, r.text
+    assert "text/event-stream" in r.headers.get("content-type", "")
+    assert "\"done\":true" in r.text.replace(" ", "")
+
+
+def test_explain_status_real_meanings():
+    """404/410/429 必须翻译成正确的人话，供前端图标展示。"""
+    from services.health_service import explain_status
+
+    not_open = explain_status("deleted", 404,
+        "Function 'ee47' Not found for account 'NSo'")
+    assert not_open["kind"] == "not_enabled"
+    assert "未开通" in not_open["label"]
+
+    eol = explain_status("fail", 410,
+        "The model 'google/gemma-2b' has reached its end of life and is no longer available.")
+    assert eol["kind"] == "offline"
+    assert "下线" in eol["label"]
+
+    limited = explain_status("rate_limited", 429, "rate limit exceeded")
+    assert limited["kind"] == "rate_limited"
+
+    ok = explain_status("ok", 200, "")
+    assert ok["kind"] == "ok"
+
+    auth = explain_status("fail", 403, "invalid api key")
+    assert auth["kind"] == "no_auth"
+
+
+def test_check_log_endpoint(local_client, initialized_db):
+    """/api/check-log 返回最近检查明细，且带 reason。"""
+    import asyncio
+    from datetime import datetime
+    from database import engine as engine_mod
+    from database.models import HealthRecord
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(HealthRecord(
+                provider_name="nvidia", model="google/gemma-2b",
+                status="fail", code=410, latency_ms=100,
+                detail="end of life", checked_at=datetime.now(),
+            ))
+            s.add(HealthRecord(
+                provider_name="agnes", model="agnes-3.0-flash",
+                status="ok", code=200, latency_ms=300,
+                checked_at=datetime.now(),
+            ))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.get("/api/check-log")
+    assert r.status_code == 200, r.text
+    d = r.json()
+    assert d["count"] >= 2
+    by_model = {i["model"]: i for i in d["items"]}
+    assert by_model["google/gemma-2b"]["kind"] == "offline"
+    assert "下线" in by_model["google/gemma-2b"]["reason"]
+    assert by_model["agnes-3.0-flash"]["kind"] == "ok"
+    assert "api_key" not in r.text.lower()

@@ -72,6 +72,14 @@
         </div>
       </div>
 
+      <!-- 检测完成日志气泡 -->
+      <div id="checkLogBubble" class="check-log-bubble" style="display:none;">
+        <span class="check-log-bubble-icon">✅</span>
+        <span id="checkLogBubbleText" class="check-log-bubble-text">检测完成</span>
+        <button class="check-log-bubble-btn" onclick="openCheckLog()">查看日志</button>
+        <span class="check-log-bubble-close" onclick="dismissCheckLogBubble()" title="关闭">×</span>
+      </div>
+
       <div id="monitor-view">
         <div class="poll-bar">
           <div class="live">
@@ -377,6 +385,24 @@
           <button class="btn" onclick="closeProviderEditor()">取消</button>
           <button class="btn btn-primary" id="providerSaveBtn" onclick="submitProviderForm()">保存并拉取模型</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 最近检查日志弹窗 -->
+  <div class="modal-overlay" id="checkLogModal" onclick="if(event.target===this) closeCheckLog()">
+    <div class="modal-content" style="max-width: 860px;">
+      <div class="modal-header">
+        <div class="modal-title">最近一次检查日志</div>
+        <div class="mac-btn close" onclick="closeCheckLog()" style="cursor: pointer;"></div>
+      </div>
+      <div class="modal-body">
+        <div id="checkLogMeta" style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;"></div>
+        <div id="checkLogBody" class="check-log-body">加载中...</div>
+      </div>
+      <div class="modal-footer">
+        <span style="font-size:12px;color:var(--text-secondary);">仅展示最近一次检查，日志不含 API Key</span>
+        <button class="btn btn-primary" onclick="closeCheckLog()">关闭</button>
       </div>
     </div>
   </div>

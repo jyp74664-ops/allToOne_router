@@ -321,30 +321,6 @@ async def delete_router(name: str, _=Depends(verify_admin)):
 # ============================================================
 # 健康探测接口
 # ============================================================
-@router.post("/check/{name}/{model}")
-async def manual_check(name: str, model: str, _=Depends(verify_admin)):
-    """手动探测单个模型"""
-    from database.models import Provider
-    from database.engine import db
-    
-    async with db.SessionLocal() as session:
-        result = await session.execute(
-            select(Provider).where(Provider.name == name)
-        )
-        p = result.scalar_one_or_none()
-        if not p:
-            raise HTTPException(404, "未找到")
-    
-    meta = ModelMetaService()
-    async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
-        check_result = await check_model(
-            client, p.base_url, p.api_key, model, meta.aliases
-        )
-    key = f"{name}||{model}"
-    health_state.health_status[key] = check_result
-    return check_result
-
-
 @router.post("/check/all")
 async def check_all(_=Depends(verify_admin)):
     """全量探测（流式返回进度）"""
@@ -512,6 +488,30 @@ async def check_provider(name: str, _=Depends(verify_admin)):
     
     return StreamingResponse(generate_progress(), media_type="text/event-stream")
 
+@router.post("/check/{name}/{model}")
+async def manual_check(name: str, model: str, _=Depends(verify_admin)):
+    """手动探测单个模型"""
+    from database.models import Provider
+    from database.engine import db
+    
+    async with db.SessionLocal() as session:
+        result = await session.execute(
+            select(Provider).where(Provider.name == name)
+        )
+        p = result.scalar_one_or_none()
+        if not p:
+            raise HTTPException(404, "未找到")
+    
+    meta = ModelMetaService()
+    async with httpx.AsyncClient(timeout=30, verify=settings.load().verify_ssl) as client:
+        check_result = await check_model(
+            client, p.base_url, p.api_key, model, meta.aliases
+        )
+    key = f"{name}||{model}"
+    health_state.health_status[key] = check_result
+    return check_result
+
+
 
 # ============================================================
 # 自动验证接口
@@ -602,7 +602,7 @@ async def get_usage(days: int = 1, _=Depends(verify_admin)):
 async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     """获取稳定性统计"""
     from services.usage_service import read_health_history
-    from services.health_service import health_state
+    from services.health_service import health_state, explain_status
     records = await read_health_history(hours)
     
     model_stats = {}
@@ -638,6 +638,22 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "max_latency_ms": max(s["latencies"]) if s["latencies"] else None,
             "last_status": health_state.health_status.get(key, {}).get("status", "unknown"),
         })
+        latest = health_state.health_status.get(key, {})
+        # 内存里没有时，兜底取最近一条历史记录（含 code/detail）
+        code = latest.get("code")
+        detail = latest.get("detail", "")
+        if code is None and not detail:
+            for rec in records:
+                hist = rec.get("data", {}).get(key, {})
+                if hist.get("code") is not None or hist.get("detail"):
+                    code = hist.get("code")
+                    detail = hist.get("detail", "") or ""
+                    break
+        explain = explain_status(result[-1]["last_status"], code, detail)
+        result[-1]["status_code"] = code
+        result[-1]["status_reason"] = explain["label"]
+        result[-1]["status_kind"] = explain["kind"]
+        result[-1]["status_short"] = explain["short"]
     result.sort(key=lambda x: (-x["availability"], x["avg_latency_ms"] or 99999))
     return result
 
@@ -650,6 +666,56 @@ async def get_history(hours: int = 24, _=Depends(verify_admin)):
     """获取健康历史"""
     from services.usage_service import read_health_history
     return await read_health_history(hours)
+
+
+@router.get("/check-log")
+async def get_check_log(limit: int = 300, _=Depends(verify_admin)):
+    """最近一次检查的逐模型日志（含真实含义），供前端日志气泡展示。
+
+    取最近一条记录往前 window 秒内的所有记录作为一次检查批次；
+    没有精确批次边界时退化为「最近 limit 条」。不含 API Key。
+    """
+    from datetime import datetime, timedelta
+    from sqlalchemy import select, desc
+    from database.models import HealthRecord
+    from database.engine import db
+    from services.health_service import explain_status
+
+    limit = max(1, min(limit, 1000))
+    async with db.SessionLocal() as session:
+        latest = (await session.execute(
+            select(HealthRecord.checked_at).order_by(desc(HealthRecord.checked_at)).limit(1)
+        )).scalar_one_or_none()
+        if latest is None:
+            return {"checked_at": None, "count": 0, "items": []}
+        cutoff = latest - timedelta(minutes=10)
+        rows = (await session.execute(
+            select(HealthRecord)
+            .where(HealthRecord.checked_at >= cutoff)
+            .order_by(desc(HealthRecord.checked_at))
+            .limit(limit)
+        )).scalars().all()
+
+    items = []
+    for r in rows:
+        ex = explain_status(r.status, r.code, r.detail or "")
+        ts = r.checked_at.timestamp() if hasattr(r.checked_at, "timestamp") else None
+        items.append({
+            "provider": r.provider_name,
+            "model": r.model,
+            "status": r.status,
+            "code": r.code,
+            "latency_ms": r.latency_ms,
+            "detail": (r.detail or "")[:300],
+            "reason": ex["label"],
+            "kind": ex["kind"],
+            "time": ts,
+        })
+    return {
+        "checked_at": latest.timestamp() if hasattr(latest, "timestamp") else None,
+        "count": len(items),
+        "items": items,
+    }
 
 
 # ============================================================

@@ -78,6 +78,7 @@ async def append_health_history(snapshot: dict) -> None:
                 latency_ms=info.get("latency_ms"),
                 prompt_tokens=info.get("prompt_tokens", 0),
                 completion_tokens=info.get("completion_tokens", 0),
+                detail=info.get("detail", "")[:1000] if info.get("detail") else None,
                 checked_at=datetime.now(),
             )
             session.add(record)
