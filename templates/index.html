@@ -265,6 +265,9 @@
             style="padding:4px 8px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-secondary);font-size:12px;outline:none;"
             onclick="document.getElementById('routerSearchFilter').value='';renderRouterModelTable();"
             title="清除搜索">✕</button>
+          <button class="btn" onclick="runRouterSpeedTest(this)"
+            style="padding:4px 8px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:12px;outline:none;white-space:nowrap;"
+            title="对下面筛选出的模型逐个发一次流式请求（128 token），测首 Token 与真实解码速度；首测超过 500 tok/s 会自动补测两次取平均。会消耗上游额度">⚡ 测速</button>
           <select id="routerStabilityHours" onchange="loadRouterStability()"
             style="padding:4px 8px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:13px;outline:none;">
             <option value="1">最近 1 小时</option>
@@ -319,7 +322,13 @@
                 </th>
                 <th
                   style="padding:6px 8px;text-align:center;font-size:12px;border-bottom:1px solid var(--mac-border);width:80px;cursor:pointer;user-select:none;"
-                  onclick="toggleRouterSort('latency')">延迟 <span class="sort-icon" id="routerSortIcon_latency">⇅</span>
+                  onclick="toggleRouterSort('ttft')" title="首 Token 延迟：来自手动「⚡ 测速」（流式 128 token），未测过显示 --">首 Token
+                  <span class="sort-icon" id="routerSortIcon_ttft">⇅</span>
+                </th>
+                <th
+                  style="padding:6px 8px;text-align:center;font-size:12px;border-bottom:1px solid var(--mac-border);width:96px;cursor:pointer;user-select:none;"
+                  onclick="toggleRouterSort('real_tps')" title="实测生成速度：首 token 之后的解码速率，点行尾 ⚡ 可单独测这一个模型。带 ≈ 表示上游整包返回，只能给端到端吞吐；×N 表示 N 次均值">实测速度
+                  <span class="sort-icon" id="routerSortIcon_real_tps">⇅</span>
                 </th>
               </tr>
             </thead>

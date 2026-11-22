@@ -382,13 +382,13 @@
     /* ---- 真实生成速度测速（手动触发，流式 128 token） ---- */
     let _speedPollTimer = null;
 
-    async function runSpeedTest(btn) {
-      if (_speedPollTimer) { showToast('上一轮测速还在进行中，请稍等', 'warn'); return; }
-      const items = (lastFilteredRows || []).map(d => ({ provider: d.provider, model: d.model }));
-      if (!items.length) { showToast('当前筛选结果为空，没有可测速的模型', 'warn'); return; }
-
+    // 统一入口：把一批 (provider, model) 提交给后端测速并盯进度
+    async function startSpeedRun(items, btn, opts) {
+      const o = opts || {};
+      if (_speedPollTimer) { showToast('上一轮测速还在进行中，请稍等', 'warn', 5000); return; }
+      if (!items.length) { showToast(o.emptyMsg || '当前筛选结果为空，没有可测速的模型', 'warn'); return; }
       const original = btn ? btn.innerHTML : '';
-      if (btn) { btn.disabled = true; btn.innerHTML = '⏳ 启动中...'; }
+      if (btn) { btn.disabled = true; btn.innerHTML = o.compact ? '⏳' : '⏳ 启动中...'; }
       try {
         const r = await apiFetch('/api/speed-test/start', {
           method: 'POST',
@@ -398,39 +398,32 @@
         const d = await r.json().catch(() => ({}));
         if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
         if (d.skipped) showToast(`已跳过 ${d.skipped} 个（提供商已删除或数据不完整）`, 'warn', 5000);
-        await pollSpeedTest(d.run_id, btn, original);
+        await pollSpeedTest(d.run_id, btn, original, o.compact);
       } catch (e) {
         if (btn) { btn.disabled = false; btn.innerHTML = original; }
         if (e.message !== 'Unauthorized') showToast('测速启动失败：' + (e.message || '未知错误'), 'error', 6000);
       }
     }
 
+    async function runSpeedTest(btn) {
+      await startSpeedRun((lastFilteredRows || []).map(d => ({ provider: d.provider, model: d.model })), btn, {});
+    }
+
+    // 自定义路由配置里的「⚡ 测速」：测这个列表当前筛选出来的模型
+    async function runRouterSpeedTest(btn) {
+      await startSpeedRun((lastRouterRows || []).map(d => ({ provider: d.provider, model: d.model })), btn, {
+        emptyMsg: '当前路由列表筛选结果为空，没有可测速的模型',
+      });
+    }
+
     // 单行测速：只测表格里某一个模型，不依赖当前筛选/勾选
     async function speedTestOne(btn, ev) {
       if (ev) { ev.stopPropagation(); }
       if (!btn || btn.disabled) return;
-      if (_speedPollTimer) { showToast('已有测速任务在进行中，等它跑完再点', 'warn', 5000); return; }
       const provider = btn.dataset.provider || '';
       const model = btn.dataset.model || '';
       if (!provider || !model) return;
-
-      const original = btn.innerHTML;
-      btn.disabled = true;
-      btn.innerHTML = '⏳';
-      try {
-        const r = await apiFetch('/api/speed-test/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ items: [{ provider: provider, model: model }], max_tokens: 128 }),
-        }, 30000);
-        const d = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(d.detail || ('HTTP ' + r.status));
-        await pollSpeedTest(d.run_id, btn, original, true);
-      } catch (e) {
-        btn.disabled = false;
-        btn.innerHTML = original;
-        if (e.message !== 'Unauthorized') showToast('测速失败：' + (e.message || '未知错误'), 'error', 6000);
-      }
+      await startSpeedRun([{ provider: provider, model: model }], btn, { compact: true });
     }
 
     function pollSpeedTest(runId, btn, original, compact) {
@@ -458,6 +451,9 @@
                 fail ? 'warn' : 'ok', 7000
               );
               await loadStability();
+              // 路由配置弹窗开着时同步重画，否则那边还显示旧数值
+              const rm = document.getElementById('routerModal');
+              if (rm && rm.classList.contains('show')) renderRouterModelTable();
               resolve(true);
               return;
             }
@@ -629,6 +625,52 @@
 
     /* 当前筛选后的行（供「⚡ 测速」取模型清单） */
     let lastFilteredRows = [];
+    let lastRouterRows = [];   // 「自定义路由配置」里当前筛选出的行，供 ⚡ 测速 使用
+
+    // 测速两列（首 Token / 实测速度）的展示逻辑，主表与「自定义路由配置」表共用
+    function buildSpeedCells(d) {
+      const ttft = Number(d.ttft_ms);
+      const hasTtft = Number.isFinite(ttft) && ttft > 0;
+      const ttftStr = hasTtft ? Math.round(ttft) + ' ms' : '--';
+      const ttftColor = !hasTtft ? 'var(--text-secondary)'
+        : (ttft <= 800 ? 'var(--success)' : ttft <= 2500 ? 'var(--warning)' : 'var(--danger)');
+
+      const rtps = Number(d.real_tps);
+      const hasRtps = Number.isFinite(rtps) && rtps > 0;
+      // 上游整包返回：decode 速率测不出来，只能给端到端吞吐，用 ≈ 区分
+      const buffered = !hasRtps && !!d.speed_buffered;
+      const overallTps = Number(d.speed_overall_tps);
+      const hasOverall = Number.isFinite(overallTps) && overallTps > 0;
+      const attempts = Number(d.speed_attempts) || 1;
+      const timesMark = attempts > 1
+        ? `<span style="color:var(--text-secondary);font-size:10px">×${attempts}</span>` : '';
+
+      let rtpsStr = '--';
+      let rtpsColor = 'var(--text-secondary)';
+      if (hasRtps) {
+        rtpsStr = rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '') + timesMark;
+        rtpsColor = rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)';
+      } else if (buffered && hasOverall) {
+        rtpsStr = '≈' + overallTps.toFixed(1) + ' tok/s' + timesMark;
+        rtpsColor = 'var(--warning)';
+      }
+
+      let tip = d.speed_error
+        ? '测速失败：' + String(d.speed_error)
+        : (d.speed_tested_at ? '测于 ' + new Date(d.speed_tested_at * 1000).toLocaleString('zh-CN') : '尚未测速，点该行 ⚡ 或上方「⚡ 测速」');
+      if (hasRtps && d.speed_estimated) tip += '；token 数由 chunk 估算（上游未返回 usage），约有 ±10% 偏差';
+      if (buffered && hasOverall) {
+        tip += '；上游没有逐 token 推流，整段内容一次返回，解码速度无法测量。'
+          + '这里的 ≈ 是端到端吞吐 = 输出 token ÷ 总耗时（含首 Token 等待），比真实解码速度低。';
+      }
+      if (attempts > 1) tip += `；该数值为 ${attempts} 次测量的平均值（首测超过 500 tok/s 会自动补测两次）`;
+      return { ttftStr, ttftColor, rtpsStr, rtpsColor, rtpsTip: tip };
+    }
+
+    // 单元格里的「只测这一个模型」按钮，主表与路由配置表共用
+    function speedOneBtnHtml(d) {
+      return `<button class="speed-one-btn" title="只测这一个模型（流式 128 token；首测超过 500 tok/s 会自动补测两次）" data-provider="${esc(d.provider)}" data-model="${esc(d.model)}" onclick="speedTestOne(this, event)">⚡</button>`;
+    }
 
     function renderStability() {
       const filter = document.getElementById('stableFilter').value;
@@ -757,40 +799,12 @@
         const formatLatency = value => Number.isFinite(Number(value)) ? Math.round(Number(value)) + ' ms' : '--';
         const avgL = formatLatency(d.avg_latency_ms);
         // 真实测速（手动「⚡ 测速」写入）：首 token 延迟 + 首 token 之后的解码速率
-        const ttft = Number(d.ttft_ms);
-        const hasTtft = Number.isFinite(ttft) && ttft > 0;
-        const ttftStr = hasTtft ? Math.round(ttft) + ' ms' : '--';
-        const ttftColor = !hasTtft ? 'var(--text-secondary)'
-          : (ttft <= 800 ? 'var(--success)' : ttft <= 2500 ? 'var(--warning)' : 'var(--danger)');
-        const rtps = Number(d.real_tps);
-        const hasRtps = Number.isFinite(rtps) && rtps > 0;
-        // 上游整包返回：decode 速率测不出来，只能给端到端吞吐，用 ≈ 区分
-        const buffered = !hasRtps && !!d.speed_buffered;
-        const overallTps = Number(d.speed_overall_tps);
-        const hasOverall = Number.isFinite(overallTps) && overallTps > 0;
-        let rtpsStr = '--';
-        let rtpsColor = 'var(--text-secondary)';
-        const speedAttempts = Number(d.speed_attempts) || 1;
-        if (hasRtps) {
-          rtpsStr = rtps.toFixed(1) + ' tok/s' + (d.speed_estimated ? '*' : '')
-            + (speedAttempts > 1 ? `<span style="color:var(--text-secondary);font-size:10px">×${speedAttempts}</span>` : '');
-          rtpsColor = rtps >= 20 ? 'var(--success)' : rtps >= 8 ? 'var(--warning)' : 'var(--danger)';
-        } else if (buffered && hasOverall) {
-          rtpsStr = '≈' + overallTps.toFixed(1) + ' tok/s'
-            + (speedAttempts > 1 ? `<span style="color:var(--text-secondary);font-size:10px">×${speedAttempts}</span>` : '');
-          rtpsColor = 'var(--warning)';
-        }
-        let rtpsTip = d.speed_error
-          ? '测速失败：' + String(d.speed_error)
-          : (d.speed_tested_at ? '测于 ' + new Date(d.speed_tested_at * 1000).toLocaleString('zh-CN') : '尚未测速，点上方「⚡ 测速」');
-        if (hasRtps && d.speed_estimated) rtpsTip += '；token 数由 chunk 估算（上游未返回 usage），约有 ±10% 偏差';
-        if (buffered && hasOverall) {
-          rtpsTip += '；上游没有逐 token 推流，整段内容一次返回，解码速度无法测量。'
-            + '这里的 ≈ 是端到端吞吐 = 输出 token ÷ 总耗时（含首 Token 等待），比真实解码速度低。';
-        }
-        if (speedAttempts > 1) {
-          rtpsTip += `；该数值为 ${speedAttempts} 次测量的平均值（首测超过 500 tok/s 会自动补测两次）`;
-        }
+        const S = buildSpeedCells(d);
+        const rtpsColor = S.rtpsColor;
+        const ttftColor = S.ttftColor;
+        const ttftStr = S.ttftStr;
+        const rtpsStr = S.rtpsStr;
+        const rtpsTip = S.rtpsTip;
         const checks = Number(d.checks) || 0;
         const ok = Number(d.ok) || 0;
         const fail = (Number(d.fail) || 0) + (Number(d.error) || 0);
@@ -851,7 +865,7 @@
       </td>
       <td class="latency ${d.avg_latency_ms && d.avg_latency_ms < 3000 ? 'fast' : d.avg_latency_ms && d.avg_latency_ms < 8000 ? 'medium' : ''}">${avgL}</td>
       <td class="latency" style="font-size:12px;color:${ttftColor}">${ttftStr}</td>
-      <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end;white-space:nowrap;"><span>${rtpsStr}</span><button class="speed-one-btn" title="只测这一个模型（流式 128 token；首测超过 500 tok/s 会自动补测两次）。不点这个按钮不会消耗额度" data-provider="${esc(d.provider)}" data-model="${esc(d.model)}" onclick="speedTestOne(this, event)">⚡</button></span></td>
+      <td class="latency" style="font-size:12px;color:${rtpsColor}" title="${esc(rtpsTip)}"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:flex-end;white-space:nowrap;"><span>${rtpsStr}</span>${speedOneBtnHtml(d)}</span></td>
     </tr>`;
       }).join('');
     }
@@ -1693,7 +1707,7 @@
         routerSortAsc = true;
       }
       // 更新排序图标
-      ['model', 'size', 'availability', 'ok', 'latency', 'context_length'].forEach(c => {
+      ['model', 'size', 'availability', 'ok', 'ttft', 'real_tps', 'context_length'].forEach(c => {
         const el = document.getElementById('routerSortIcon_' + c);
         if (el) el.textContent = c === routerSortCol ? (routerSortAsc ? '↑' : '↓') : '⇅';
       });
@@ -1949,12 +1963,14 @@
       const tbody = document.getElementById('routerModelTableBody');
       const countEl = document.getElementById('routerSelectedCount');
       if (!selectedRouter) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">请先选择或创建一个路由组</td></tr>';
+        lastRouterRows = [];
+        tbody.innerHTML = '<tr><td colspan="9" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">请先选择或创建一个路由组</td></tr>';
         if (countEl) countEl.textContent = '';
         return;
       }
       if (!stabilityData || !stabilityData.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">稳定性数据加载中…</td></tr>';
+        lastRouterRows = [];
+        tbody.innerHTML = '<tr><td colspan="9" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">稳定性数据加载中…</td></tr>';
         if (countEl) countEl.textContent = '';
         return;
       }
@@ -2016,8 +2032,13 @@
           vb = (modelDetails[B.model] || {}).context_length || B.context_length || B.max_model_len || 0;
         } else if (routerSortCol === 'availability') {
           va = A.availability || 0; vb = B.availability || 0;
-        } else if (routerSortCol === 'latency') {
-          va = A.avg_latency_ms ?? 999999; vb = B.avg_latency_ms ?? 999999;
+        } else if (routerSortCol === 'ttft') {
+          va = Number.isFinite(Number(A.ttft_ms)) ? Number(A.ttft_ms) : Infinity;
+          vb = Number.isFinite(Number(B.ttft_ms)) ? Number(B.ttft_ms) : Infinity;
+        } else if (routerSortCol === 'real_tps') {
+          // 没测过的排最后（用 -1 表示未知）
+          va = Number.isFinite(Number(A.real_tps)) ? Number(A.real_tps) : -1;
+          vb = Number.isFinite(Number(B.real_tps)) ? Number(B.real_tps) : -1;
         } else if (routerSortCol === 'ok') {
           va = A.ok || 0; vb = B.ok || 0;
         }
@@ -2026,16 +2047,20 @@
       });
 
       if (!list.length && !orphans.length) {
-        tbody.innerHTML = '<tr><td colspan="8" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">没有匹配的模型，试试调整筛选条件</td></tr>';
+        lastRouterRows = [];
+        tbody.innerHTML = '<tr><td colspan="9" class="empty" style="padding:24px;text-align:center;color:var(--text-secondary);">没有匹配的模型，试试调整筛选条件</td></tr>';
         if (countEl) countEl.textContent = '';
         return;
       }
+
+      // 记下当前筛选结果，供表头旁的「⚡ 测速」按这个范围测
+      lastRouterRows = list.map(x => x.d);
 
       let html = list.map(({ d, saved }) => {
         const checked = saved ? 'checked' : '';
         const pct = typeof d.availability === 'number' ? d.availability.toFixed(1) : parseFloat(d.availability || 0).toFixed(1);
         const barColor = pct >= 90 ? 'var(--success)' : pct >= 50 ? 'var(--warning)' : 'var(--danger)';
-        const avgL = Number.isFinite(Number(d.avg_latency_ms)) ? Math.round(Number(d.avg_latency_ms)) + ' ms' : '--';
+        const S = buildSpeedCells(d);
         const ok = Number(d.ok) || 0;
         const fail = (Number(d.fail) || 0) + (Number(d.error) || 0);
         const checks = Number(d.checks) || 0;
@@ -2066,7 +2091,8 @@
       <td style="padding:4px 8px;text-align:center;font-size:12px;">
         ${errMark}
       </td>
-      <td style="padding:4px 8px;text-align:center;font-size:12px;color:var(--text-secondary);">${avgL}</td>
+      <td style="padding:4px 8px;text-align:center;font-size:12px;color:${S.ttftColor};font-variant-numeric:tabular-nums;">${S.ttftStr}</td>
+      <td style="padding:4px 8px;text-align:center;font-size:12px;color:${S.rtpsColor};font-variant-numeric:tabular-nums;" title="${esc(S.rtpsTip)}"><span style="display:inline-flex;align-items:center;gap:3px;justify-content:center;white-space:nowrap;"><span>${S.rtpsStr}</span>${speedOneBtnHtml(d)}</span></td>
     </tr>`;
       }).join('');
 
@@ -2074,7 +2100,7 @@
       orphans.forEach(m => {
         html += `<tr style="opacity:0.6;">
       <td style="padding:4px 8px;text-align:center;"><input type="checkbox" class="router-model-cb" value="__orphan__||${m}" checked onchange="onRouterModelToggle(this)" title="该模型不在当前供应商列表中，取消勾选并保存可移除"></td>
-      <td colspan="7" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${m} <span style="font-size:11px;">（不在当前供应商列表中）</span></td>
+      <td colspan="8" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${m} <span style="font-size:11px;">（不在当前供应商列表中）</span></td>
     </tr>`;
       });
 
