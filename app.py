@@ -59,7 +59,6 @@ async def _auto_validate_loop():
     """后台自动验证循环：根据配置定时执行全量健康检测。"""
     import asyncio
     from services.health_service import run_full_check, update_provider_status, health_state
-    from services.usage_service import append_health_history
     logger.info("auto_validate_loop started")
     while True:
         cfg = settings.load()
@@ -72,7 +71,7 @@ async def _auto_validate_loop():
                 health_state.health_status.update(results)
                 for name in {key.split("||", 1)[0] for key in results}:
                     update_provider_status(name)
-                await append_health_history(results)
+                # 健康历史已由 run_full_check 内部统一写入，这里不再重复写
                 import time
                 settings._last_check_time = time.time()
                 ok = sum(1 for v in results.values() if v.get("status") == "ok")

@@ -147,6 +147,7 @@ async def read_health_history(hours: int = 24) -> list[dict]:
                         "latency_ms": r.latency_ms,
                         "prompt_tokens": r.prompt_tokens,
                         "completion_tokens": r.completion_tokens,
+                        "detail": r.detail,
                     }
                 },
             }

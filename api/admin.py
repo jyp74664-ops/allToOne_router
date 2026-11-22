@@ -495,8 +495,10 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         if retire_list:
             await retire_models(name, retire_list)
         # 单服务商日志写入固定槽位（覆盖上一家）
-        from services.usage_service import save_check_log
+        from services.usage_service import save_check_log, append_health_history
         await save_check_log("provider", results, scope=name)
+        # 健康历史落库：实时监控列表的成功率/延迟/速度都靠它统计
+        await append_health_history(results)
         return results
     
     # 进度回调
@@ -558,6 +560,9 @@ async def manual_check(name: str, model: str, _=Depends(verify_admin)):
         )
     key = f"{name}||{model}"
     health_state.health_status[key] = check_result
+    # 单模型探测同样计入健康历史，实时监控里能立刻看到这次结果
+    from services.usage_service import append_health_history
+    await append_health_history({key: check_result})
     return check_result
 
 
@@ -666,13 +671,18 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             if key in retired_keys:
                 continue
             if key not in model_stats:
-                model_stats[key] = {"ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": []}
+                model_stats[key] = {
+                    "ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": [],
+                    "completion_tokens": 0, "ok_total_ms": 0,  # 用于估算生成速度
+                }
             model_stats[key]["total"] += 1
             st = info.get("status", "unknown")
             if st == "ok":
                 model_stats[key]["ok"] += 1
                 if info.get("latency_ms"):
                     model_stats[key]["latencies"].append(info["latency_ms"])
+                    model_stats[key]["ok_total_ms"] += info["latency_ms"]
+                model_stats[key]["completion_tokens"] += info.get("completion_tokens") or 0
             elif st == "fail":
                 model_stats[key]["fail"] += 1
             elif st == "error":
@@ -682,6 +692,11 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     for key, s in model_stats.items():
         name, model = key.split("||", 1)
         avg_lat = sum(s["latencies"]) / len(s["latencies"]) if s["latencies"] else None
+        # 生成速度：探测请求实际产出的 completion token ÷ 这些请求的总耗时。
+        # 注意探测只生成 5 个 token 且含网络往返，数值偏保守，只适合横向比较。
+        tps = None
+        if s["completion_tokens"] > 0 and s["ok_total_ms"] > 0:
+            tps = round(s["completion_tokens"] / (s["ok_total_ms"] / 1000), 2)
         result.append({
             "provider": name,
             "model": model,
@@ -693,6 +708,7 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "avg_latency_ms": round(avg_lat) if avg_lat else None,
             "min_latency_ms": min(s["latencies"]) if s["latencies"] else None,
             "max_latency_ms": max(s["latencies"]) if s["latencies"] else None,
+            "tokens_per_sec": tps,
             "last_status": health_state.health_status.get(key, {}).get("status", "unknown"),
         })
         latest = health_state.health_status.get(key, {})

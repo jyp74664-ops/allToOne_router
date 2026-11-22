@@ -480,3 +480,25 @@ def test_check_provider_rejects_empty_models(local_client, initialized_db):
     r = local_client.post("/api/check/provider/empty")
     assert r.status_code == 400, r.text
     assert "模型列表为空" in r.text
+
+
+def test_stability_returns_tokens_per_sec(local_client, initialized_db):
+    """稳定性接口按 completion_token ÷ 耗时给出生成速度。"""
+    import asyncio
+    from database import engine as engine_mod
+    from database.models import HealthRecord
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(HealthRecord(provider_name="p", model="m", status="ok", code=200,
+                               latency_ms=1000, prompt_tokens=10,
+                               completion_tokens=5, detail=""))
+            await s.commit()
+    asyncio.run(seed())
+
+    r = local_client.get("/api/stability?hours=24")
+    assert r.status_code == 200, r.text
+    row = next(x for x in r.json() if x["provider"] == "p" and x["model"] == "m")
+    assert row["tokens_per_sec"] == 5.0

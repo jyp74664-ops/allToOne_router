@@ -758,8 +758,11 @@ async def run_full_check(on_progress=None) -> dict:
         await retire_models(prov, models)
     
     # 全量日志写入固定槽位（只保留最新一份）
-    from services.usage_service import save_check_log
+    from services.usage_service import save_check_log, append_health_history
     await save_check_log("all", results)
+    # 写健康历史：前端「实时监控」表的成功率/延迟/速度都从这里统计，
+    # 手动点「立即检测」也必须落库，否则列表停在上一轮自动巡检的数据上
+    await append_health_history(results)
     
     ok_count = sum(1 for v in results.values() if v.get("status") == "ok")
     fail_count = len(results) - ok_count

@@ -153,6 +153,8 @@
                 <th class="sortable" data-sort="ok">成功 / 失败 <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="avg_latency_ms">平均延迟 <span class="sort-icon">⇅</span></th>
                 <th class="sortable" data-sort="min_latency_ms">极速 / 最慢 <span class="sort-icon">⇅</span></th>
+                <th class="sortable" data-sort="tokens_per_sec"
+                  title="生成速度：检测请求实际产出的 completion token ÷ 该次请求总耗时（含网络往返）。检测只生成 5 个 token，数值偏保守，适合横向比较不同模型/提供商，不代表真实会话的峰值速度">生成速度 <span class="sort-icon">⇅</span></th>
               </tr>
             </thead>
             <tbody id="stableBody"></tbody>

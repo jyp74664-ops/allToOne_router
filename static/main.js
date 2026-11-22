@@ -560,6 +560,11 @@
             case 'min_latency_ms':
               va = a.min_latency_ms ?? Infinity; vb = b.min_latency_ms ?? Infinity;
               return asc ? va - vb : vb - va;
+            case 'tokens_per_sec':
+              // 没有速度数据的排到最后（用 -1 表示未知）
+              va = Number.isFinite(Number(a.tokens_per_sec)) ? Number(a.tokens_per_sec) : -1;
+              vb = Number.isFinite(Number(b.tokens_per_sec)) ? Number(b.tokens_per_sec) : -1;
+              return asc ? va - vb : vb - va;
             default:
               return 0;
           }
@@ -576,7 +581,7 @@
 
       const tbody = document.getElementById('stableBody');
       if (!filtered.length) {
-        tbody.innerHTML = '<tr><td colspan="9" class="empty">No records found in this timeframe.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="10" class="empty">No records found in this timeframe.</td></tr>';
         return;
       }
 
@@ -587,6 +592,12 @@
         const avgL = formatLatency(d.avg_latency_ms);
         const minL = formatLatency(d.min_latency_ms);
         const maxL = formatLatency(d.max_latency_ms);
+        // 生成速度：后端按「completion token ÷ 请求总耗时」估算（样本 5 token，偏保守）
+        const tps = Number(d.tokens_per_sec);
+        const hasTps = Number.isFinite(tps) && tps > 0;
+        const tpsStr = hasTps ? tps.toFixed(1) + ' tok/s' : '--';
+        const tpsColor = !hasTps ? 'var(--text-secondary)'
+          : (tps >= 15 ? 'var(--success)' : tps >= 5 ? 'var(--warning)' : 'var(--danger)');
         const checks = Number(d.checks) || 0;
         const ok = Number(d.ok) || 0;
         const fail = (Number(d.fail) || 0) + (Number(d.error) || 0);
@@ -651,6 +662,7 @@
         <span style="color:var(--text-secondary);margin:0 4px">~</span>
         <span style="color:var(--text-secondary)">${maxL}</span>
       </td>
+      <td class="latency" style="font-size:12px;color:${tpsColor}">${tpsStr}</td>
     </tr>`;
       }).join('');
     }
