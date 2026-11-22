@@ -111,7 +111,7 @@
       const body = document.getElementById('checkLogBody');
       const meta = document.getElementById('checkLogMeta');
       if (!modal || !body) return;
-      modal.style.display = 'flex';
+      modal.classList.add('show');
       body.textContent = '加载中...';
       if (meta) meta.textContent = '';
       try {
@@ -148,7 +148,7 @@
 
     function closeCheckLog() {
       const modal = document.getElementById('checkLogModal');
-      if (modal) modal.style.display = 'none';
+      if (modal) modal.classList.remove('show');
     }
 
     /* ============ 数据 ============ */
