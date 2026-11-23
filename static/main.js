@@ -205,6 +205,22 @@
       try {
         const r = await apiFetch('/api/providers');
         const list = await r.json();
+        // 「上游提供商」列表：可用的排最前，组内按中文正序（拼音）排列。
+        // 不可用口径与卡片的红名一致：上游报错、模型列表为空，或所有模型都被探测为失败。
+        // 从未探测过的一律算可用（不能因为没数据就把整家沉底）。
+        const _badStatus = new Set(['fail', 'error', 'deleted']);
+        const _isUsableProvider = p => {
+          const models = p.models || [];
+          if (p.provider_status === 'error' || models.length === 0) return false;
+          const health = p.health || {};
+          const probed = models.filter(m => health[m] && health[m].status);
+          return probed.length === 0 || probed.some(m => !_badStatus.has(health[m].status));
+        };
+        const _zhCollator = new Intl.Collator('zh-Hans-CN');
+        list.sort((a, b) =>
+          (_isUsableProvider(b) ? 1 : 0) - (_isUsableProvider(a) ? 1 : 0)
+          || _zhCollator.compare(a.name || '', b.name || '')
+        );
         data = [];
         window.modelEnabledMap = {};
 
