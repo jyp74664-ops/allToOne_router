@@ -35,8 +35,8 @@
           <div class="main-tabs" role="tablist">
             <button id="tab-monitor" class="btn main-tab-btn active-tab" onclick="switchMainTab('monitor')">📡 实时监控</button>
             <button id="tab-provider" class="btn main-tab-btn" onclick="switchMainTab('provider')">🔌 上游提供商</button>
-            <button id="tab-usage" class="btn main-tab-btn" onclick="switchMainTab('usage')">📊 消耗统计</button>
             <button id="tab-quota" class="btn main-tab-btn" onclick="switchMainTab('quota')">🎚 额度管家</button>
+            <button id="tab-usage" class="btn main-tab-btn" onclick="switchMainTab('usage')">📊 消耗统计</button>
             <button id="tab-requests" class="btn main-tab-btn" onclick="switchMainTab('requests')">🧾 最近请求</button>
           </div>
           <div class="switch-pills">
@@ -58,7 +58,8 @@
         </div>
 
         <div class="tool-bar">
-          <button class="btn btn-primary" onclick="checkAll()" id="checkAllBtn"
+          <button class="btn btn-primary" onclick="openRouterManager()">🔀 路由配置</button>
+          <button class="btn btn-quiet" onclick="checkAll()" id="checkAllBtn"
             title="只检测各服务商下已勾选（启用）的模型，未勾选的模型不会探测，也不消耗上游额度">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
@@ -66,7 +67,6 @@
             </svg>
             立即检测
           </button>
-          <button class="btn btn-quiet" onclick="openRouterManager()">🔀 路由配置</button>
           <span class="tool-sep"></span>
           <button class="btn btn-quiet" onclick="syncRateLimits()" id="syncRateBtn"
             title="从 GitHub awesome-free-llm-apis 自动同步最新模型速率限制信息，并匹配到本地模型列表中">
