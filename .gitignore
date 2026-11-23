@@ -6,6 +6,11 @@ __pycache__/
 venv/
 .env
 *.db
+# SQLite 的 WAL 侧车文件（flowgate.db-wal / -shm / -journal）不被 *.db 匹配，
+# 服务跑着时它们会一直存在，不加这两行 `git add -A` 会把几十 MB 二进制带进提交
+*.db-wal
+*.db-shm
+*.db-journal
 *.jsonl
 providers.json
 config.json
