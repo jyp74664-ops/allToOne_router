@@ -655,18 +655,96 @@
       setSavedReqRouter(reqRouter);
       const sel = document.getElementById('reqRouterFilter');
       if (sel && sel.value !== reqRouter) sel.value = reqRouter;
+      reqLastSig = '';          // 换了筛选条件，同一份数据也要重绘
       loadRequestLogs();
     }
 
-    async function loadRequestLogs() {
+    // 请求日志只读，可以放心轮询；停在页签里时每 5 秒自己拉一次，
+    // 不用手动点刷新，也不用切走再切回来。
+    const REQ_AUTO_MS = 5000;
+    let reqAutoOn = (() => {
+      try { return localStorage.getItem('gateway_req_auto') !== '0'; } catch (e) { return true; }
+    })();
+    let reqAutoTimer = null;
+    let reqLoading = false;
+    let reqLastSig = '';        // 上次渲染的数据指纹：内容没变就不重绘，避免表格闪、滚动条跳
+
+    async function loadRequestLogs(opts) {
+      const silent = !!(opts && opts.silent);
+      // 自动刷新撞上正在进行的请求就直接跳过，避免堆积；手动刷新照常执行
+      if (silent && reqLoading) return;
+      reqLoading = true;
       try {
         await ensureReqRouterOptions();
         const failedQuery = onlyFailedRequests ? '&only_failed=true' : '';
         const modelQuery = reqRouter ? `&model=${encodeURIComponent(reqRouter)}` : '';
         const l = await apiFetch(`/api/request-logs?hours=${logHours}&limit=100${failedQuery}${modelQuery}`).then(r => r.json());
-        renderRequestLogs(l);
+        const sig = JSON.stringify(l);
+        if (sig !== reqLastSig) {
+          reqLastSig = sig;
+          renderRequestLogs(l);
+        }
+        markReqUpdated();
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error('loadRequestLogs failed:', e);
+      } finally {
+        reqLoading = false;
+      }
+    }
+
+    function markReqUpdated() {
+      const el = document.getElementById('requestUpdatedAt');
+      if (el) el.textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+    }
+
+    function syncReqAutoBtn() {
+      const btn = document.getElementById('reqAutoBtn');
+      if (!btn) return;
+      btn.classList.toggle('btn-primary', reqAutoOn);
+      btn.textContent = reqAutoOn ? '⏱ 自动刷新：开' : '⏱ 自动刷新：关';
+      btn.title = reqAutoOn
+        ? `停在「最近请求」时每 ${REQ_AUTO_MS / 1000} 秒自动拉一次（只读，不消耗上游额度）；点一下关掉`
+        : '已关闭自动刷新，只能手动点「↻ 刷新」；点一下打开';
+    }
+
+    function stopReqAuto() {
+      if (reqAutoTimer) { clearTimeout(reqAutoTimer); reqAutoTimer = null; }
+    }
+
+    function scheduleReqAuto() {
+      stopReqAuto();
+      if (!reqAutoOn) return;
+      if (document.visibilityState !== 'visible') return;   // 页面在后台就别空转
+      const view = document.getElementById('request-view');
+      if (!view || view.style.display === 'none') return;   // 不在这个页签上也不拉
+      reqAutoTimer = setTimeout(async () => {
+        reqAutoTimer = null;
+        await loadRequestLogs({ silent: true });
+        scheduleReqAuto();
+      }, REQ_AUTO_MS);
+    }
+
+    function toggleReqAuto() {
+      reqAutoOn = !reqAutoOn;
+      try { localStorage.setItem('gateway_req_auto', reqAutoOn ? '1' : '0'); } catch (e) {}
+      syncReqAutoBtn();
+      if (reqAutoOn) {
+        loadRequestLogs({ silent: true });
+        scheduleReqAuto();
+      } else {
+        stopReqAuto();
+      }
+    }
+
+    async function refreshRequests(btn) {
+      const original = btn ? btn.textContent : '';
+      if (btn) { btn.disabled = true; btn.textContent = '刷新中...'; }
+      reqLastSig = '';              // 手动刷新一定重绘
+      try {
+        await loadRequestLogs();
+      } finally {
+        if (btn) { btn.disabled = false; btn.textContent = original; }
+        scheduleReqAuto();          // 手动刷新后重新计时，别等下一轮
       }
     }
 
@@ -675,7 +753,9 @@
       document.querySelectorAll('.log-range').forEach(b => {
         b.classList.toggle('btn-primary', Number(b.dataset.hours) === h);
       });
+      reqLastSig = '';
       loadRequestLogs();
+      scheduleReqAuto();
     }
 
     function renderQuotas(rows) {
@@ -818,7 +898,9 @@
       onlyFailedRequests = !onlyFailedRequests;
       const btn = document.getElementById('reqOnlyFailed');
       if (btn) btn.classList.toggle('btn-primary', onlyFailedRequests);
+      reqLastSig = '';
       loadRequestLogs();
+      scheduleReqAuto();
     }
 
     // ---- 高级设置：缓存 / 路由策略 / 虚拟 Key ----
@@ -2068,13 +2150,17 @@
     }
     // 切换到当前页签，如果有 token 则立即刷新数据并开始轮询，否则停止轮询
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) stopPolling();
-      else if (getToken()) {
+      if (document.hidden) {
+        stopPolling();
+        stopReqAuto();
+      } else if (getToken()) {
         load();
         startPolling();
         // 立即刷新统计数据，避免切回后看到旧数据
         loadStability();
         loadUsage();
+        // 回到前台：如果正停在「最近请求」页签，接着自动刷新
+        scheduleReqAuto();
       }
     });
 
@@ -2091,6 +2177,7 @@
       const providerView = document.getElementById('provider-view');
 
       // Reset all buttons
+      stopReqAuto();   // 离开「最近请求」就停掉自动刷新，别在后台空转
       [monitorBtn, usageBtn, quotaBtn, requestsBtn, providerBtn].forEach(btn => {
         btn.classList.remove('active-tab');
         btn.style.background = '';
@@ -2117,7 +2204,9 @@
       } else if (tab === 'requests') {
         requestsBtn.classList.add('active-tab');
         requestsView.style.display = 'block';
+        reqLastSig = '';
         loadRequestLogs();
+        scheduleReqAuto();     // 停在这个页签时自动刷新（只读，不消耗额度）
       } else if (tab === 'provider') {
         providerBtn.classList.add('active-tab');
         providerView.style.display = 'block';
@@ -2753,6 +2842,7 @@
       restoreLangHint();
       loadClientKey();
       loadModelDetails();
+      syncReqAutoBtn();   // 按钮文字跟 localStorage 里的开关状态对齐
       await load();
       loadStability();
       loadUsage();
