@@ -257,6 +257,38 @@ def _content_chars(content) -> int:
     return 0
 
 
+def _upstream_error_text(resp, limit: int = 300) -> str:
+    """从上游错误响应里提取一句能看懂的原文。
+
+    上游格式并不统一：
+      - OpenAI 风格 {"error": {"message": "..."}}
+      - Google 原生 [{"error": {"code": 400, "message": "..."}}]（顶层是数组）
+      - 网关/中转直接吐纯文本
+    以前 4xx/5xx 只保留状态码，400 的真实原因全部丢失，客户端和日志里都只剩
+    「HTTP 400」，排查时无从下手。
+    """
+    try:
+        text = (resp.text or "").strip()
+    except Exception:
+        return ""
+    if not text:
+        return ""
+    try:
+        data = json.loads(text)
+    except Exception:
+        return text.replace("\n", " ")[:limit]
+    if isinstance(data, list) and data:
+        data = data[0]
+    msg = ""
+    if isinstance(data, dict):
+        err = data.get("error", data)
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("detail") or err.get("type") or ""
+        elif isinstance(err, str):
+            msg = err
+    return str(msg or text).replace("\n", " ")[:limit]
+
+
 def estimate_request_tokens(body: dict) -> int:
     """粗估这次请求要占多少 token（输入 + max_tokens）。
 
@@ -353,6 +385,12 @@ async def forward_chat(
 
     est_tokens = estimate_request_tokens(body)
     candidates = []
+    # 逐个候选记录「为什么被跳过」。不记录的话，「无可用的模型候选」只能靠猜，
+    # 以前一律归因于 token 超限，真实原因可能是熔断、限流冷却，甚至模型根本没匹配上。
+    matched = 0
+    skip_ctx: list[str] = []
+    skip_unhealthy = 0
+    skip_cooldown = 0
     for wanted in wanted_models:
         actual_model = normalize_model_name(meta.aliases.get(wanted, wanted))
         for provider in providers:
@@ -369,9 +407,11 @@ async def forward_chat(
                 continue
             if wanted in (provider.disabled_models or []) or actual_model in (provider.disabled_models or []):
                 continue
+            matched += 1
             # 上下文窗口过滤：长请求不打给小窗口模型，否则路由成功、上游直接 400
             ctx = meta.context_limits.get(actual_model) or meta.context_limits.get(wanted)
             if ctx and est_tokens > ctx * 0.95:
+                skip_ctx.append(f"{provider.name}·{actual_model} 上限 {ctx}")
                 logger.info(
                     "\033[93m↷ 跳过 %s · %s：请求约 %d tokens 超出上下文 %d\033[0m",
                     provider.name, actual_model, est_tokens, ctx,
@@ -381,20 +421,38 @@ async def forward_chat(
             if not force and (
                 health_state.is_circuit_open(key)
                 or health_state.health_status.get(key, {}).get("status") in {"deleted", "fail", "error"}
-                or health_state.check_rate_limit(provider.name)
             ):
+                skip_unhealthy += 1
+                continue
+            if not force and health_state.check_rate_limit(provider.name):
+                skip_cooldown += 1
                 continue
             candidates.append((provider, actual_model, wanted))
 
     if not candidates:
-        logger.error("\033[91m✗ 无可用的模型候选: %s\033[0m", requested_model)
+        if matched == 0:
+            reason = f"没有任何服务商提供该模型（请求约 {est_tokens} tokens）"
+        elif skip_ctx and not skip_unhealthy and not skip_cooldown:
+            reason = "请求约 %d tokens 超出全部 %d 个候选的上下文（%s）" % (
+                est_tokens, len(skip_ctx), "、".join(skip_ctx[:3]),
+            )
+        else:
+            parts = []
+            if skip_unhealthy:
+                parts.append(f"{skip_unhealthy} 个熔断/上轮失败")
+            if skip_cooldown:
+                parts.append(f"{skip_cooldown} 个限流冷却")
+            if skip_ctx:
+                parts.append(f"{len(skip_ctx)} 个上下文不足")
+            reason = "全部候选被跳过（%s，请求约 %d tokens）" % ("、".join(parts), est_tokens)
+        logger.error("\033[91m✗ 无可用的模型候选: %s｜%s\033[0m", requested_model, reason)
         await record_request(
             trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
             stream=bool(body.get("stream")), ok=False, status_code=503, attempts=0,
             latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
-            error=f"无可用的模型候选（请求约 {est_tokens} tokens）",
+            error=f"无可用的模型候选：{reason}",
         )
-        raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
+        raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}｜{reason}")
 
     # 按质量分与延迟择优：质量分高、延迟低、失败少、模型大的优先
     # 无历史数据时质量分默认 1.0、延迟用大数占位，退化为按失败次数与大小排序
@@ -461,27 +519,29 @@ async def forward_chat(
                             await stream_client.aclose()
                         raise
                     if upstream.status_code >= 400:
+                        # 先把响应体读出来再关连接：上游的错误原文（限流原因、参数非法、
+                        # 内容超长）只有这里有，以前读完只打进控制台，last_error 里仍只有
+                        # 状态码，客户端和 request_logs 都看不到原因。
+                        detail = ""
+                        try:
+                            await upstream.aread()
+                            detail = _upstream_error_text(upstream)
+                        except Exception:
+                            detail = ""
                         last_error = f"{provider.name}: HTTP {upstream.status_code}"
-                        logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, upstream.status_code)
+                        if detail:
+                            last_error += " — " + detail
+                        logger.warning(
+                            "\033[91m✗ 失败: %s · %s (HTTP %d) %s\033[0m",
+                            provider.name, actual_model, upstream.status_code, detail[:200],
+                        )
                         # 记录失败，并让 429/5xx 进冷却（以前只在非流式路径记，流式请求会一直撞同一家）
                         health_state.record_fail(f"{provider.name}||{requested}")
                         note_rate_limit(provider.name, upstream.status_code, upstream.headers)
-                        # 所有错误都尝试下一候选（包括限流和其他错误）
-                        try:
-                            _body = await upstream.aread()
-                            detail = _body.decode("utf-8", errors="replace")
-                            try:
-                                import json as _json
-                                detail = _json.loads(_body).get("error", {}).get("message") or detail[:300]
-                            except Exception:
-                                detail = detail[:300]
-                        except Exception:
-                            detail = ""
                         await upstream.aclose()
                         if stream_client is not None:
                             await stream_client.aclose()
-                        # 记录错误详情供日志使用，然后尝试下一候选
-                        logger.warning("\033[91m✗ 上游错误: %s · %s · %s\033[0m", provider.name, actual_model, detail[:200])
+                        # 所有错误都尝试下一候选（包括限流和其他错误）
                         continue
 
                     async def stream_response():
@@ -627,13 +687,16 @@ async def forward_chat(
                     response_json = response.json()
                 except (json.JSONDecodeError, ValueError):
                     # 响应不是有效的 JSON，记录后尝试下一个候选
-                    last_error = f"{provider.name}: 非JSON响应"
+                    _txt = (response.text or "").replace("\n", " ")[:200]
+                    last_error = f"{provider.name}: 非JSON响应" + (f" — {_txt}" if _txt else "")
                     logger.warning("\033[91m✗ 失败: %s · %s (非JSON响应)\033[0m", provider.name, actual_model)
                     health_state.record_fail(f"{provider.name}||{requested}")
                     continue
 
                 if not isinstance(response_json, dict):
-                    last_error = f"{provider.name}: JSON响应顶层不是对象"
+                    # Google 原生错误体就是一个数组：[{"error":{"code":400,"message":...}}]
+                    _txt = _upstream_error_text(response) or "非对象 JSON"
+                    last_error = f"{provider.name}: 顶层不是对象 — {_txt}"
                     logger.warning("\033[91m✗ 失败: %s · %s (JSON顶层不是对象)\033[0m", provider.name, actual_model)
                     health_state.record_fail(f"{provider.name}||{requested}")
                     continue
@@ -687,8 +750,12 @@ async def forward_chat(
                     if vkey_id:
                         add_tokens(vkey_id, pt + ct)
                     return JSONResponse(result, status_code=response.status_code)
-                last_error = f"{provider.name}: HTTP {response.status_code}"
-                logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
+                _txt = _upstream_error_text(response)
+                last_error = f"{provider.name}: HTTP {response.status_code}" + (f" — {_txt}" if _txt else "")
+                logger.warning(
+                    "\033[91m✗ 失败: %s · %s (HTTP %d) %s\033[0m",
+                    provider.name, actual_model, response.status_code, _txt[:200],
+                )
                 # 记录失败并尝试下一候选（含400等继续尝试下一候选）
                 health_state.record_fail(f"{provider.name}||{requested}")
                 note_rate_limit(provider.name, response.status_code, response.headers)

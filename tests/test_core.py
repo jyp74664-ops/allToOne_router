@@ -1772,3 +1772,135 @@ def test_embeddings_passthrough(initialized_db):
         assert r.json()["data"][0]["embedding"] == [0.1, 0.2]
     finally:
         c.__exit__(None, None, None)
+
+
+def test_upstream_error_body_survives_to_client_and_log(initialized_db):
+    """上游 4xx/5xx 的原文必须留到响应 detail 与 request_logs.error。
+
+    以前 proxy 只把状态码写进 last_error，400 到底是「内容超长」「参数非法」还是
+    「额度不足」全丢了，客户端只能看到一句 503。
+    这里用 Google 原生格式（顶层是数组）覆盖「顶层不是对象」那条分支。
+    """
+    import httpx
+    from sqlalchemy import select
+    from database import engine as engine_mod
+    from database.models import RequestLog
+
+    def handler(request):
+        return httpx.Response(400, json=[{
+            "error": {"code": 400, "message": "The input token count (900000) exceeds the maximum allowed"}
+        }])
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p-errbody", "base_url": "https://errbody/v1", "api_key": "k", "models": ["m-errbody"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m-errbody", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer " + key})
+    finally:
+        c.__exit__(None, None, None)
+
+    assert r.status_code == 503, r.text
+    assert "exceeds the maximum allowed" in r.text, r.text
+
+    async def read_logs():
+        async with engine_mod.db.SessionLocal() as s:
+            return (await s.execute(select(RequestLog))).scalars().all()
+
+    logs = asyncio.run(read_logs())
+    assert logs, "失败请求也必须落 request_logs"
+    assert "exceeds the maximum allowed" in (logs[-1].error or ""), logs[-1].error
+
+
+def test_no_candidate_reason_is_not_always_token_count(initialized_db):
+    """无候选时的文案要说明真实原因（熔断/上轮失败），不能一律甩锅给 token 数。"""
+    import httpx
+    from services.health_service import health_state
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "never"}}]})
+
+    health_state.health_status["p-unhealthy||m-unhealthy"] = {"status": "fail"}
+    try:
+        c, key = _proxy_test_client(handler, [
+            {"name": "p-unhealthy", "base_url": "https://uh/v1", "api_key": "k", "models": ["m-unhealthy"]},
+        ])
+        try:
+            r = c.post("/v1/chat/completions",
+                       json={"model": "m-unhealthy", "messages": [{"role": "user", "content": "hi"}]},
+                       headers={"Authorization": "Bearer " + key})
+        finally:
+            c.__exit__(None, None, None)
+    finally:
+        health_state.health_status.pop("p-unhealthy||m-unhealthy", None)
+
+    assert r.status_code == 503, r.text
+    assert "熔断" in r.text, r.text
+    assert "超出全部" not in r.text, r.text
+
+
+def test_upstream_error_body_survives_to_client_and_log(initialized_db):
+    """上游 4xx/5xx 的原文必须留到响应 detail 与 request_logs.error。
+
+    以前 proxy 只把状态码写进 last_error，400 到底是「内容超长」「参数非法」还是
+    「额度不足」全丢了，客户端只能看到一句 503。
+    这里用 Google 原生格式（顶层是数组）覆盖「顶层不是对象」那条分支。
+    """
+    import httpx
+    from sqlalchemy import select
+    from database import engine as engine_mod
+    from database.models import RequestLog
+
+    def handler(request):
+        return httpx.Response(400, json=[{
+            "error": {"code": 400, "message": "The input token count (900000) exceeds the maximum allowed"}
+        }])
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p-errbody", "base_url": "https://errbody/v1", "api_key": "k", "models": ["m-errbody"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m-errbody", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer " + key})
+    finally:
+        c.__exit__(None, None, None)
+
+    assert r.status_code == 503, r.text
+    assert "exceeds the maximum allowed" in r.text, r.text
+
+    async def read_logs():
+        async with engine_mod.db.SessionLocal() as s:
+            return (await s.execute(select(RequestLog))).scalars().all()
+
+    logs = asyncio.run(read_logs())
+    assert logs, "失败请求也必须落 request_logs"
+    assert "exceeds the maximum allowed" in (logs[-1].error or ""), logs[-1].error
+
+
+def test_no_candidate_reason_is_not_always_token_count(initialized_db):
+    """无候选时的文案要说明真实原因（熔断/上轮失败），不能一律甩锅给 token 数。"""
+    import httpx
+    from services.health_service import health_state
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "never"}}]})
+
+    health_state.health_status["p-unhealthy||m-unhealthy"] = {"status": "fail"}
+    try:
+        c, key = _proxy_test_client(handler, [
+            {"name": "p-unhealthy", "base_url": "https://uh/v1", "api_key": "k", "models": ["m-unhealthy"]},
+        ])
+        try:
+            r = c.post("/v1/chat/completions",
+                       json={"model": "m-unhealthy", "messages": [{"role": "user", "content": "hi"}]},
+                       headers={"Authorization": "Bearer " + key})
+        finally:
+            c.__exit__(None, None, None)
+    finally:
+        health_state.health_status.pop("p-unhealthy||m-unhealthy", None)
+
+    assert r.status_code == 503, r.text
+    assert "熔断" in r.text, r.text
+    assert "超出全部" not in r.text, r.text
