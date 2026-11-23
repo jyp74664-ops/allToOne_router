@@ -988,7 +988,7 @@
                 showCheckLogBubble(`单服务商 ${providerName} 检测完成：${ok} 正常 / ${fail} 异常`, fail > 0);
               } else if (event.provider === providerName) {
                 if (event.status === 'reconfirm_wait') {
-                  btn.innerHTML = `⏳ ${esc(event.model)}返回 404，等 60 秒复测…`;
+                  btn.innerHTML = `⏳ ${esc(event.model)}，等 60 秒复测…`;
                 } else if (event.status === 'reconfirm') {
                   btn.innerHTML = `🔁 复测 ${esc(event.model)}`;
                 } else {
@@ -1073,7 +1073,7 @@
               } else if (event.provider && event.model) {
                 if (event.status === 'reconfirm_wait') {
                   // 404 候选在等 60 秒复测：不覆盖 total/current，避免进度条归零
-                  statusEl.innerHTML = `⏳ ${esc(event.model)}返回 404，等待 60 秒复测…`;
+                  statusEl.innerHTML = `⏳ ${esc(event.model)}，60 秒后确认是否退役…`;
                 } else if (event.status === 'reconfirm') {
                   statusEl.innerHTML = `🔁 复测中 | ${esc(event.provider)} · ${esc(event.model)}`;
                 } else {

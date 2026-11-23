@@ -720,7 +720,7 @@ async def reconfirm_retire_candidates(
     )
     if on_progress:
         first_provider = todo[0][0]
-        on_progress(first_provider, f"{len(todo)} 个 404 模型", "reconfirm_wait", len(todo), len(todo))
+        on_progress(first_provider, f"等待复测：{len(todo)} 个 404 模型", "reconfirm_wait", len(todo), len(todo))
     if wait > 0:
         await asyncio.sleep(wait)
 
