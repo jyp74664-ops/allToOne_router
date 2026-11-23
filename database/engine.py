@@ -60,6 +60,17 @@ class Database:
             def _enable_fk(dbapi_conn, _record):
                 cur = dbapi_conn.cursor()
                 cur.execute("PRAGMA foreign_keys=ON")
+                # WAL：读写不互相阻塞。全量检测一次写上千行、代理同时写 usage_records，
+                # 默认的 delete 日志模式下这两件事会互锁（database is locked）。
+                # journal_mode 写在库文件里，对已有连接只影响后续；重复设置有幂等性。
+                try:
+                    cur.execute("PRAGMA journal_mode=WAL")
+                    # WAL 下 synchronous=NORMAL 已能保证不损坏，只是断电可能丢最后几个事务，
+                    # 对本地网关完全可以接受，换来的是每次提交少一次 fsync
+                    cur.execute("PRAGMA synchronous=NORMAL")
+                except Exception as exc:  # 例如库被别的进程以独占方式占用
+                    logger.warning("启用 WAL 失败（继续用原日志模式）: %s", exc)
+                cur.execute("PRAGMA busy_timeout=8000")
                 cur.close()
 
             # 静默 aiosqlite 在请求取消时的无害 ERROR 日志

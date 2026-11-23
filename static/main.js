@@ -1275,8 +1275,8 @@
         const cbTitle = isDisabled ? 'title="限额型模型，取消勾选后仍会保留在监控列表中"' : '';
         
         html += `<tr style="border-bottom:1px solid var(--mac-border);${rowStyle}">
-          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${m}" data-has-success="${checks > 0 ? 1 : 0}" ${isChecked} ${cbTitle} onchange="syncModalSelectAllState()"></td>
-          <td style="padding:6px 8px;${nameStyle}">${m}${badgeHtml}</td>
+          <td style="padding:6px 8px;text-align:center;"><input type="checkbox" class="modal-model-checkbox" value="${esc(m)}" data-has-success="${checks > 0 ? 1 : 0}" ${isChecked} ${cbTitle} onchange="syncModalSelectAllState()"></td>
+          <td style="padding:6px 8px;${nameStyle}">${esc(m)}${badgeHtml}</td>
           <td style="padding:6px 8px;text-align:center;color:var(--text-secondary);">${sizeStr}</td>
           <td style="padding:6px 8px;text-align:center;color:${availColor};font-size:12px;">${availStr}</td>
         </tr>`;
@@ -2099,8 +2099,8 @@
       // 追加孤儿行：已保存但不在当前供应商列表中
       orphans.forEach(m => {
         html += `<tr style="opacity:0.6;">
-      <td style="padding:4px 8px;text-align:center;"><input type="checkbox" class="router-model-cb" value="__orphan__||${m}" checked onchange="onRouterModelToggle(this)" title="该模型不在当前供应商列表中，取消勾选并保存可移除"></td>
-      <td colspan="8" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${m} <span style="font-size:11px;">（不在当前供应商列表中）</span></td>
+      <td style="padding:4px 8px;text-align:center;"><input type="checkbox" class="router-model-cb" value="__orphan__||${esc(m)}" checked onchange="onRouterModelToggle(this)" title="该模型不在当前供应商列表中，取消勾选并保存可移除"></td>
+      <td colspan="8" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${esc(m)} <span style="font-size:11px;">（不在当前供应商列表中）</span></td>
     </tr>`;
       });
 

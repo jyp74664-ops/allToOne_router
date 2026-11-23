@@ -71,11 +71,20 @@ async def _auto_validate_loop():
     """后台自动验证循环：根据配置定时执行全量健康检测。"""
     import asyncio
     from services.health_service import run_full_check, update_provider_status, health_state
+    from services.usage_service import cleanup_old_records
     logger.info("auto_validate_loop started")
     while True:
         cfg = settings.load()
         interval = cfg.auto_validate_interval or 1800
         await asyncio.sleep(interval)
+        # 过期记录清理：函数内部有 6 小时闸门，重复调用只做一次时间比较，几乎零成本。
+        # 以前只在启动时跑一次，长期运行（服务一开就是几天）就再没清理过，库会一直涨。
+        try:
+            removed_h, removed_u = await cleanup_old_records()
+            if removed_h or removed_u:
+                logger.info("cleanup_old_records: 删除健康记录 %d 条、用量记录 %d 条", removed_h, removed_u)
+        except Exception:
+            logger.exception("cleanup_old_records failed")
         if cfg.auto_validate:
             try:
                 logger.info("auto_validate: running full check")

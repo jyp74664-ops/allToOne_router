@@ -1,5 +1,6 @@
 """服务层：健康探测"""
 import asyncio
+import json
 import re
 import time
 import logging
@@ -313,6 +314,34 @@ def normalize_model_name(model: str) -> str:
     return model.removeprefix("models/")
 
 
+def _parse_chat_body(resp) -> tuple[dict, str]:
+    """解析 HTTP 200 的聊天响应体，返回 (body, 错误描述)。
+
+    错误描述非空表示「状态码 200 但内容不算成功」，调用方应判 fail。
+    判定口径：
+    - 有顶层 error（含非空 dict）/ 响应不是 JSON 对象 → 错
+    - 没有 choices 列表，或 choices 是空列表 → 错（空壳响应，没有真正生成）
+    注意：choices 里 content 为空字符串是合法的（触发了内容过滤/停止词），不算错。
+    """
+    try:
+        body = resp.json()
+    except Exception:
+        return {}, "响应不是合法 JSON"
+    if not isinstance(body, dict):
+        return {}, "响应顶层不是对象"
+    err = body.get("error")
+    if err:
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("type") or json.dumps(err, ensure_ascii=False)
+        else:
+            msg = str(err)
+        return body, "响应含 error：" + str(msg)[:150]
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return body, "响应里没有 choices（未真正生成内容）"
+    return body, ""
+
+
 async def check_model(
     client: httpx.AsyncClient,
     base_url: str,
@@ -345,7 +374,18 @@ async def check_model(
             last_response = resp
             
             if resp.status_code == 200:
-                usage = resp.json().get("usage", {})
+                # 200 不等于成功：部分上游（网关/中转）用 200 包一个 error 体，
+                # 或者返回结构根本不是 chat 补全（例如只有 {"status":"ok"} 的空壳）。
+                # 只认「有 choices 且没有 error」才算探测通过，否则监控会误报 100% 可用。
+                body, body_error = _parse_chat_body(resp)
+                if body_error:
+                    return {
+                        "status": "fail",
+                        "code": resp.status_code,
+                        "latency_ms": latency,
+                        "detail": ("HTTP 200 但" + body_error)[:200],
+                    }
+                usage = body.get("usage") if isinstance(body.get("usage"), dict) else {}
                 return {
                     "status": "ok",
                     "code": resp.status_code,
@@ -506,6 +546,11 @@ async def fetch_models(
                 logger.info("fetch_models: %s attempt %d, status=%d, auth=%s", base_url, attempt, resp.status_code, auth_type)
                 if resp.status_code == 200:
                     data = resp.json()
+                    # 200 包 error：直接换下一种认证方式，别在同一方式上重试
+                    if isinstance(data, dict) and data.get("error"):
+                        last_error = f"HTTP 200 但响应含 error ({auth_type})"
+                        logger.warning("fetch_models: %s %s", base_url, last_error)
+                        break
                     # 兼容不同提供商的响应格式：OpenAI 用 "data"，部分用 "models"
                     model_list = data.get("data") or data.get("models")
                     if isinstance(model_list, list):
@@ -542,6 +587,15 @@ async def fetch_models(
                         if free_out is not None and not is_paid_model_item:
                             free_out.add(model_id)
                         result.append(model_id)
+                    if not result and auth_type == "no_auth" and api_key:
+                        # 匿名请求 200 但列表为空：部分提供商对未认证请求回空壳。
+                        # 直接 return [] 会让这些家的模型列表永远是空的（审计 #5）。
+                        # break 跳出重试循环，落到下方「换带认证再试一次」的分支。
+                        logger.info(
+                            "fetch_models: %s 匿名请求 200 但列表为空，改用认证重试", base_url
+                        )
+                        last_error = "匿名请求返回空列表"
+                        break
                     return result
                 last_error = f"HTTP {resp.status_code} ({auth_type})"
                 logger.warning("fetch_models attempt %d/%d failed for %s: %s", attempt, max_retries, base_url, last_error)

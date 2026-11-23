@@ -799,3 +799,195 @@ def test_speed_test_status_unknown_run(local_client):
     """查询不存在的测速任务应返回 404，而不是空对象。"""
     r = local_client.get("/api/speed-test/status?run_id=nope")
     assert r.status_code == 404
+
+
+# ============================================================
+# 审计修复回归（2026-11-23 第一批）
+# ============================================================
+
+def _mock_http(handler):
+    """造一个只走内存的 AsyncClient。"""
+    import httpx
+    return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+
+def test_check_model_rejects_200_with_error_body():
+    """HTTP 200 但响应体是 error：不能判 ok（审计 #1，已复现的那条）。"""
+    import httpx
+    from services.health_service import check_model
+
+    def handler(request):
+        return httpx.Response(200, json={"error": {"message": "insufficient quota"}})
+
+    res = asyncio.run(check_model(_mock_http(handler), "https://x/v1", "k", "m", {}))
+    assert res["status"] == "fail", res
+    assert "quota" in res["detail"]
+
+
+def test_check_model_rejects_200_without_choices():
+    """200 但结构不是一次正常补全（没有 choices），同样不能判 ok。"""
+    import httpx
+    from services.health_service import check_model
+
+    def handler(request):
+        return httpx.Response(200, json={"status": "ok"})
+
+    res = asyncio.run(check_model(_mock_http(handler), "https://x/v1", "k", "m", {}))
+    assert res["status"] == "fail", res
+    assert "choices" in res["detail"]
+
+
+def test_check_model_accepts_normal_completion():
+    """正常补全（有 choices、无 error）仍要判 ok，别把好的误杀。"""
+    import httpx
+    from services.health_service import check_model
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    res = asyncio.run(check_model(_mock_http(handler), "https://x/v1", "k", "m", {}))
+    assert res["status"] == "ok", res
+    assert res["completion_tokens"] == 1
+
+
+def test_fetch_models_retries_with_auth_when_anonymous_empty():
+    """匿名请求 200 但列表为空时必须再试带 Key 的那次（审计 #5，已复现）。"""
+    import httpx
+    from services.health_service import fetch_models
+
+    seen = []
+
+    def handler(request):
+        auth = request.headers.get("authorization")
+        seen.append(auth)
+        if auth:
+            return httpx.Response(200, json={"data": [{"id": "m-a"}, {"id": "m-b"}]})
+        return httpx.Response(200, json={"data": []})
+
+    models = asyncio.run(fetch_models(_mock_http(handler), "https://x/v1", "k", False, {}, {}, None))
+    assert models == ["m-a", "m-b"], models
+    assert any(a and a.startswith("Bearer") for a in seen), "必须真的试过认证请求"
+
+
+def test_fetch_models_200_with_error_is_failure_not_empty():
+    """200 包 error 属于拉取失败，要返回 None（保住原配置），不能当成空列表。"""
+    import httpx
+    from services.health_service import fetch_models
+
+    def handler(request):
+        return httpx.Response(200, json={"error": {"message": "invalid api key"}})
+
+    res = asyncio.run(fetch_models(_mock_http(handler), "https://x/v1", "k", False, {}, {}, None))
+    assert res is None, res
+
+
+def test_db_runs_in_wal_mode(initialized_db):
+    """库应跑在 WAL 模式，避免检测批量写与代理写用量互相锁库（审计 #9）。"""
+    import sqlite3
+    from database import engine as engine_mod
+
+    conn = sqlite3.connect(engine_mod.db.db_path)
+    try:
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    assert str(mode).lower() == "wal", mode
+
+
+def _proxy_test_client(handler, provider_rows):
+    """起一个 TestClient，并把 api.proxy 里的 httpx 换成内存 transport。"""
+    import types
+    import httpx
+    from fastapi.testclient import TestClient
+    import app
+    from api import proxy as proxy_mod
+    from database import engine as engine_mod
+    from config.settings import settings
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            for row in provider_rows:
+                s.add(Provider(**row))
+            await s.commit()
+    asyncio.run(seed())
+
+    real_client = httpx.AsyncClient
+
+    def fake_client(*args, **kwargs):
+        return real_client(transport=httpx.MockTransport(handler), **kwargs)
+
+    shim = types.SimpleNamespace(
+        AsyncClient=fake_client, Timeout=httpx.Timeout,
+        HTTPError=httpx.HTTPError, MockTransport=httpx.MockTransport,
+    )
+    proxy_mod.httpx = shim
+
+    c = TestClient(app.app, client=("127.0.0.1", 50002))
+    c.__enter__()
+    key = settings.load().local_api_key
+    return c, key
+
+
+def test_proxy_falls_back_when_upstream_returns_200_with_error(initialized_db, monkeypatch):
+    """上游 200 包 error 时换下一个候选，而不是把错误直接抛给客户端（审计 #3）。"""
+    import httpx
+    from api import proxy as proxy_mod
+    from services.health_service import health_state
+
+    # 让 p-bad 排在前面，才能真正走到 fallback
+    monkeypatch.setattr(health_state, "get_quality_score",
+                        lambda key: 2.0 if key.startswith("p-bad") else 1.0)
+
+    def handler(request):
+        if request.url.host == "bad":
+            return httpx.Response(200, json={"error": {"message": "insufficient quota"}})
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p-bad", "base_url": "https://bad/v1", "api_key": "k1", "models": ["m1"]},
+        {"name": "p-good", "base_url": "https://good/v1", "api_key": "k2", "models": ["m1"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m1", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer " + key})
+    finally:
+        c.__exit__(None, None, None)
+        proxy_mod.httpx = httpx
+
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "ok"
+
+
+def test_proxy_stream_429_puts_provider_in_cooldown(initialized_db):
+    """流式请求撞 429 也要记 provider 冷却（审计 #4，原来只有非流式记）。"""
+    import httpx
+    from api import proxy as proxy_mod
+    from services.health_service import health_state
+
+    def handler(request):
+        return httpx.Response(429, json={"error": {"message": "rate limit exceeded"}},
+                              headers={"retry-after": "30"})
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p-429", "base_url": "https://only429/v1", "api_key": "k", "models": ["m9"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m9", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+                   headers={"Authorization": "Bearer " + key})
+    finally:
+        c.__exit__(None, None, None)
+        proxy_mod.httpx = httpx
+
+    assert r.status_code == 503, r.text
+    assert health_state.check_rate_limit("p-429") is True, "429 后该 provider 应进冷却"
+

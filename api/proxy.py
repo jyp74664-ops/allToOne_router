@@ -292,8 +292,9 @@ async def proxy_chat(request: Request, force: bool = False):
                     if upstream.status_code >= 400:
                         last_error = f"{provider.name}: HTTP {upstream.status_code}"
                         logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, upstream.status_code)
-                        # 记录失败
+                        # 记录失败，并让 429/5xx 进冷却（以前只在非流式路径记，流式请求会一直撞同一家）
                         health_state.record_fail(f"{provider.name}||{requested}")
+                        note_rate_limit(provider.name, upstream.status_code, upstream.headers)
                         # 所有错误都尝试下一候选（包括限流和其他错误）
                         try:
                             _body = await upstream.aread()
@@ -456,10 +457,15 @@ async def proxy_chat(request: Request, force: bool = False):
                         last_error = f"{provider.name}: {error_detail}"
                         logger.warning("\033[91m✗ 失败: %s · %s (响应包含 error)\033[0m", provider.name, actual_model)
                         health_state.record_fail(f"{provider.name}||{requested}")
-                        raise HTTPException(
-                            status_code=response.status_code,
-                            detail=f"上游响应错误 ({provider.name}): {error_detail}"
-                        )
+                        # 200 包 error 时也要换候选（原来这里直接 raise，注释却写「尝试下一候选」，
+                        # 一家通道坏了整个请求就失败，完全不走 fallback）
+                        err_text = str(error_detail).lower()
+                        if any(k in err_text for k in (
+                            "quota", "insufficient", "rate limit", "rate_limit",
+                            "too many requests", "exceeded", "余额", "额度", "欠费",
+                        )):
+                            note_rate_limit(provider.name, 429, None)
+                        continue
                     health_state.record_success(f"{provider.name}||{requested}")
                     logger.info("\033[32m✓ 成功: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
                     result.setdefault("model", f"{provider.name} · {actual_model}")
