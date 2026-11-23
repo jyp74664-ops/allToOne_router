@@ -6,7 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import APIRouter, Request, HTTPException, Depends
+from fastapi import APIRouter, Request, HTTPException, Depends, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy import select
@@ -16,6 +16,9 @@ from config.settings import settings
 from services.health_service import health_state, RATE_LIMIT_STATUS_CODES
 from services.usage_service import append_usage
 from services.upstream_client import get_shared_client
+from services import cache_service
+from services.observability import new_trace_id, record_request
+from services.virtual_key_service import add_tokens, check_limits, note_request, resolve as resolve_vkey
 
 logger = logging.getLogger("flowgate.proxy")
 UPSTREAM_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
@@ -41,17 +44,38 @@ security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/v1")
 
 
-def verify_client(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """客户端鉴权。
+async def verify_client(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    """客户端鉴权：主 Key 或任一启用的虚拟 Key。
 
-    用 compare_digest 而不是 != ：字符串比较是短路的，逐字符比到不同就返回，
-    理论上可以用响应时间差一点点猜出 Key（时序侧信道）。
+    主 Key 用 compare_digest 而不是 != ：字符串比较是短路的，逐字符比到不同
+    就返回，理论上可以用响应时间差猜 Key（时序侧信道）。
+    虚拟 Key 走数据库查表，各自受 RPM/TPM 限制；鉴权结果写到 request.state，
+    转发层据此把用量归属到具体 Key。
     """
     expected = settings.load().local_api_key or ""
     provided = credentials.credentials if credentials else ""
-    if not expected or not provided or not hmac.compare_digest(provided, expected):
-        raise HTTPException(status_code=401, detail="Invalid or missing API Key")
-    return credentials.credentials
+
+    if expected and provided and hmac.compare_digest(provided, expected):
+        request.state.api_key_name = "主 Key"
+        request.state.vkey_id = None
+        request.state.vkey = None
+        return "master"
+
+    vk = await resolve_vkey(provided)
+    if vk is not None:
+        allowed, reason = check_limits(vk["id"], vk["rpm_limit"], vk["tpm_limit"])
+        if not allowed:
+            raise HTTPException(status_code=429, detail=reason, headers={"Retry-After": "60"})
+        request.state.api_key_name = vk["name"]
+        request.state.vkey_id = vk["id"]
+        request.state.vkey = vk
+        note_request(vk["id"], 0)
+        return vk["name"]
+
+    raise HTTPException(status_code=401, detail="Invalid or missing API Key")
 
 
 # Hermes 工具名压缩 / 还原
@@ -219,27 +243,84 @@ async def get_router_aliases():
     return {"object": "list", "data": aliases}
 
 
-@router.api_route("/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
-async def proxy_chat(request: Request, force: bool = False):
-    """代理聊天补全请求"""
-    # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
-    cfg = settings.load()
-    merge_reasoning_enabled = bool(cfg.merge_reasoning)
-    lang_hint_mode = str(getattr(cfg, "lang_hint", "auto") or "auto")
+def _content_chars(content) -> int:
+    if isinstance(content, str):
+        return len(content)
+    if isinstance(content, list):
+        total = 0
+        for seg in content:
+            if isinstance(seg, dict):
+                text = seg.get("text")
+                if isinstance(text, str):
+                    total += len(text)
+        return total
+    return 0
+
+
+def estimate_request_tokens(body: dict) -> int:
+    """粗估这次请求要占多少 token（输入 + max_tokens）。
+
+    只用于「上下文窗口装不下就跳过这个模型」的过滤，不要求精确。
+    中文约 1.5 字/token、英文约 4 字符/token，2.5 是折中值：宁可略高估
+    （少试一个边缘模型），也不要投进去换一个 400。
+    """
+    chars = 0
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict):
+                chars += _content_chars(m.get("content"))
+    chars += _content_chars(body.get("prompt"))
+    msg_count = len(msgs) if isinstance(msgs, list) else 0
+    est_in = int(chars / 2.5) + 8 * msg_count
     try:
-        body = await request.json()
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise HTTPException(400, "请求体必须是有效的 JSON") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(400, "请求体必须是 JSON 对象")
-    body = compress_hermes(body)
-    body = ensure_lang_reply(body, lang_hint_mode)
-    requested_model = body.get("model")
-    # 规范化路由组名称（支持英文别名，直接从数据库查询）
-    requested_model = await normalize_router_name(requested_model)
-    
-    if not isinstance(requested_model, str) or not requested_model:
-        raise HTTPException(400, "请求缺少 model")
+        est_out = int(body.get("max_tokens") or body.get("max_completion_tokens") or 0)
+    except (TypeError, ValueError):
+        est_out = 0
+    return est_in + max(0, est_out)
+
+
+async def forward_chat(
+    body: dict,
+    requested_model: str,
+    merge_reasoning_enabled: bool,
+    force: bool = False,
+    trace_id: str | None = None,
+    endpoint: str = "/v1/chat/completions",
+    api_key_name: str = "",
+    vkey_id: int | None = None,
+) -> Response:
+    """候选筛选 + 上游转发 + 失败换下一家。
+
+    从 proxy_chat 抽出来的原因：多协议入口（/v1/messages、Gemini）把请求
+    转成 OpenAI 格式后可以直接复用这一整套逻辑，不用把 fallback 再写一遍。
+    """
+    cfg = settings.load()
+    trace_id = trace_id or new_trace_id()
+    started = time.time()
+    attempts = 0
+    last_error = "上游无响应"
+
+    # ---- 请求缓存：只对确定性调用生效，命中不消耗上游额度 ----
+    cache_key = None
+    if bool(getattr(cfg, "cache_enabled", True)) and cache_service.cacheable(body):
+        cache_key = cache_service.make_key(body, requested_model)
+        hit = cache_service.get(cache_key, int(getattr(cfg, "cache_ttl", 300) or 0))
+        if hit is not None:
+            payload = dict(hit)
+            meta_info = payload.pop("_fg_meta", {}) or {}
+            logger.info("\033[36m✓ 缓存命中: %s\033[0m", requested_model)
+            usage = payload.get("usage") or {}
+            await record_request(
+                trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+                provider=meta_info.get("provider"), upstream_model=meta_info.get("model"),
+                stream=False, ok=True, status_code=200, attempts=0,
+                latency_ms=int((time.time() - started) * 1000),
+                prompt_tokens=usage.get("prompt_tokens", 0) or 0,
+                completion_tokens=usage.get("completion_tokens", 0) or 0,
+                cached=True, api_key_name=api_key_name,
+            )
+            return JSONResponse(payload)
 
     # 路由名展开为模型优先级列表；普通模型名则只匹配自身。
     from database.engine import db
@@ -270,6 +351,7 @@ async def proxy_chat(request: Request, force: bool = False):
                 # （如 "ab" 与 "ab-2"）就会直接放弃后续所有 provider，导致 503。
                 continue
 
+    est_tokens = estimate_request_tokens(body)
     candidates = []
     for wanted in wanted_models:
         actual_model = normalize_model_name(meta.aliases.get(wanted, wanted))
@@ -287,6 +369,14 @@ async def proxy_chat(request: Request, force: bool = False):
                 continue
             if wanted in (provider.disabled_models or []) or actual_model in (provider.disabled_models or []):
                 continue
+            # 上下文窗口过滤：长请求不打给小窗口模型，否则路由成功、上游直接 400
+            ctx = meta.context_limits.get(actual_model) or meta.context_limits.get(wanted)
+            if ctx and est_tokens > ctx * 0.95:
+                logger.info(
+                    "\033[93m↷ 跳过 %s · %s：请求约 %d tokens 超出上下文 %d\033[0m",
+                    provider.name, actual_model, est_tokens, ctx,
+                )
+                continue
             key = f"{provider.name}||{wanted}"
             if not force and (
                 health_state.is_circuit_open(key)
@@ -298,11 +388,17 @@ async def proxy_chat(request: Request, force: bool = False):
 
     if not candidates:
         logger.error("\033[91m✗ 无可用的模型候选: %s\033[0m", requested_model)
+        await record_request(
+            trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+            stream=bool(body.get("stream")), ok=False, status_code=503, attempts=0,
+            latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
+            error=f"无可用的模型候选（请求约 {est_tokens} tokens）",
+        )
         raise HTTPException(503, f"无可用的模型: {requested_model or '任意'}")
 
     # 按质量分与延迟择优：质量分高、延迟低、失败少、模型大的优先
     # 无历史数据时质量分默认 1.0、延迟用大数占位，退化为按失败次数与大小排序
-    def _route_key(c):
+    def _quality_key(c):
         k = f"{c[0].name}||{c[2]}"
         quality = health_state.get_quality_score(k)
         latency = health_state.get_avg_latency(k)
@@ -312,16 +408,28 @@ async def proxy_chat(request: Request, force: bool = False):
             health_state.get_fail_count(k),
             -health_state.get_model_size(k),
         )
-    candidates.sort(key=_route_key)
-    
+
+    if str(getattr(cfg, "routing_strategy", "quality") or "quality").lower() == "cost":
+        from services.cost_service import _price_maps
+        exact_prices, lowest_prices = await _price_maps()
+
+        def _cost_key(c):
+            price = exact_prices.get((c[0].name, c[1])) or lowest_prices.get(c[1])
+            cost = ((price[0] or 0.0) + (price[1] or 0.0)) if price else float("inf")
+            return (cost,) + _quality_key(c)
+
+        candidates.sort(key=_cost_key)
+    else:
+        candidates.sort(key=_quality_key)
+
     logger.info("\033[93m▶ 路由请求: %s (%d 个候选)\033[0m", requested_model, len(candidates))
 
-    last_error = "上游无响应"
     verify_ssl = bool(cfg.verify_ssl)
     # 复用进程级连接池：同一家上游的第二个请求可以直接走已有 TLS 连接，
     # TTFT 少 100~300ms（原先每个请求都新建 client，握手开销全算在首字延迟里）
     async with _upstream_client(verify_ssl) as (client, shared_conn):
         for provider, actual_model, requested in candidates:
+            attempts += 1
             upstream_body = dict(body)
             upstream_body["model"] = normalize_model_name(actual_model)
             # 若是流式：默认请求上游返回 usage（部分上游需显式要求 stream_options.include_usage）
@@ -474,6 +582,7 @@ async def proxy_chat(request: Request, force: bool = False):
                             await upstream.aclose()
                             if stream_client is not None:
                                 await stream_client.aclose()
+                            usage_obj = usage_obj or {}
                             if _stream_ok:
                                 health_state.record_success(f"{provider.name}||{requested}")
                                 logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
@@ -486,12 +595,26 @@ async def proxy_chat(request: Request, force: bool = False):
                                             prompt_tokens=usage_obj.get("prompt_tokens", 0) or 0,
                                             completion_tokens=usage_obj.get("completion_tokens", 0) or 0,
                                             total_tokens=usage_obj.get("total_tokens", 0) or 0,
+                                            upstream_model=actual_model,
                                         )
                                     except Exception as e:
                                         logger.warning(f"Failed to record stream usage: {e}")
                             else:
                                 health_state.record_fail(f"{provider.name}||{requested}")
                                 logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
+                            pt = usage_obj.get("prompt_tokens", 0) or 0
+                            ct = usage_obj.get("completion_tokens", 0) or 0
+                            await record_request(
+                                trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+                                provider=provider.name, upstream_model=actual_model, stream=True,
+                                ok=_stream_ok, status_code=200 if _stream_ok else None,
+                                attempts=attempts,
+                                latency_ms=int((time.time() - started) * 1000),
+                                prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
+                                error=None if _stream_ok else "流未正常结束（客户端断开或上游截断）",
+                            )
+                            if vkey_id:
+                                add_tokens(vkey_id, pt + ct)
 
                     return StreamingResponse(
                         stream_response(),
@@ -514,7 +637,7 @@ async def proxy_chat(request: Request, force: bool = False):
                     logger.warning("\033[91m✗ 失败: %s · %s (JSON顶层不是对象)\033[0m", provider.name, actual_model)
                     health_state.record_fail(f"{provider.name}||{requested}")
                     continue
-                
+
                 if response.status_code < 400:
                     result = merge_reasoning(response_json) if merge_reasoning_enabled else response_json
                     if isinstance(result, dict) and result.get("error"):
@@ -534,19 +657,35 @@ async def proxy_chat(request: Request, force: bool = False):
                     health_state.record_success(f"{provider.name}||{requested}")
                     logger.info("\033[32m✓ 成功: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
                     result.setdefault("model", f"{provider.name} · {actual_model}")
+                    usage = result.get("usage") or {}
+                    pt = usage.get("prompt_tokens", 0) or 0
+                    ct = usage.get("completion_tokens", 0) or 0
                     # 记录用量
                     try:
-                        usage = result.get("usage", {})
                         if usage:
                             await append_usage(
                                 provider=provider.name,
                                 model=requested,
-                                prompt_tokens=usage.get("prompt_tokens", 0) or 0,
-                                completion_tokens=usage.get("completion_tokens", 0) or 0,
+                                prompt_tokens=pt,
+                                completion_tokens=ct,
                                 total_tokens=usage.get("total_tokens", 0) or 0,
+                                upstream_model=actual_model,
                             )
                     except Exception as e:
                         logger.warning(f"Failed to record usage: {e}")
+                    if cache_key is not None:
+                        cached_value = dict(result)
+                        cached_value["_fg_meta"] = {"provider": provider.name, "model": actual_model}
+                        cache_service.put(cache_key, cached_value)
+                    await record_request(
+                        trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+                        provider=provider.name, upstream_model=actual_model, stream=False,
+                        ok=True, status_code=response.status_code, attempts=attempts,
+                        latency_ms=int((time.time() - started) * 1000),
+                        prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
+                    )
+                    if vkey_id:
+                        add_tokens(vkey_id, pt + ct)
                     return JSONResponse(result, status_code=response.status_code)
                 last_error = f"{provider.name}: HTTP {response.status_code}"
                 logger.warning("\033[91m✗ 失败: %s · %s (HTTP %d)\033[0m", provider.name, actual_model, response.status_code)
@@ -561,7 +700,40 @@ async def proxy_chat(request: Request, force: bool = False):
                 logger.warning("\033[91m✗ 失败: %s · %s (%s)\033[0m", provider.name, actual_model, exc)
                 health_state.record_fail(f"{provider.name}||{requested}")
 
+    await record_request(
+        trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+        stream=bool(body.get("stream")), ok=False, status_code=503, attempts=attempts,
+        latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
+        error=last_error,
+    )
     raise HTTPException(503, f"所有路由候选均不可用: {last_error}")
+
+
+@router.api_route("/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
+async def proxy_chat(request: Request, force: bool = False):
+    """代理聊天补全请求（OpenAI 兼容入口）。"""
+    # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
+    cfg = settings.load()
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise HTTPException(400, "请求体必须是有效的 JSON") from exc
+    if not isinstance(body, dict):
+        raise HTTPException(400, "请求体必须是 JSON 对象")
+    body = compress_hermes(body)
+    body = ensure_lang_reply(body, str(getattr(cfg, "lang_hint", "auto") or "auto"))
+    requested_model = body.get("model")
+    # 规范化路由组名称（支持英文别名，直接从数据库查询）
+    requested_model = await normalize_router_name(requested_model)
+    if not isinstance(requested_model, str) or not requested_model:
+        raise HTTPException(400, "请求缺少 model")
+    return await forward_chat(
+        body, requested_model, bool(cfg.merge_reasoning), force=force,
+        endpoint="/v1/chat/completions",
+        api_key_name=getattr(request.state, "api_key_name", ""),
+        vkey_id=getattr(request.state, "vkey_id", None),
+    )
+
 
 
 @router.get("/models", dependencies=[Depends(verify_client)])

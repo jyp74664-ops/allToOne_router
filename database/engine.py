@@ -119,6 +119,12 @@ class Database:
                 ))
             except Exception:
                 pass  # 列已存在则忽略
+            try:
+                await conn.execute(text(
+                    "ALTER TABLE usage_records ADD COLUMN upstream_model VARCHAR(200)"
+                ))
+            except Exception:
+                pass  # 列已存在则忽略
             # 路由别名唯一：先把历史重复（保留 id 最小的那个）置空，再建部分唯一索引兜底。
             # 没有这条约束时，两个组用同一别名会让 model 解析出现歧义。
             try:

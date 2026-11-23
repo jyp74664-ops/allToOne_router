@@ -191,6 +191,7 @@
           <div style="display: flex; gap: 8px;">
             <button class="btn" id="refreshProvidersBtn" onclick="refreshProviderList(this)"
               title="重新拉取提供商列表与各模型状态（只读数据，不发起检测、不消耗上游额度）">↻ 刷新</button>
+            <button class="btn" onclick="openAdvanced()" title="缓存、路由策略、虚拟 Key">⚙️ 高级</button>
             <button class="btn" onclick="syncAllFreeModels()" id="syncFreeModelsBtn"
               title="对每个提供商重新拉一次上游 /models，按上游 pricing 只保留免费模型，并覆盖该提供商的模型列表（会清空未勾选列表和手动勾选的结果，已确认下线的模型不会加回）。只改模型清单，不做健康检测、不改 Key">↻ 同步全部免费模型</button>
             <button class="btn btn-primary" onclick="openProviderEditor()" id="addProviderBtn">+ 添加提供商</button>
@@ -204,6 +205,8 @@
           style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; margin-top: 8px;">
           <h2 style="font-size: 16px; font-weight: 600;">消耗统计</h2>
           <div style="display: flex; gap: 8px;">
+            <button class="btn" onclick="refreshPrices(this)"
+              title="只拉上游 /models 里的价格写入价格表，不改动模型列表、不发起检测；用于让成本账本有数据">↻ 同步价格</button>
             <button class="btn btn-primary usage-tab" data-days="1" onclick="switchUsageTab(1)">今日</button>
             <button class="btn usage-tab" data-days="7" onclick="switchUsageTab(7)">近 7 天</button>
             <button class="btn usage-tab" data-days="30" onclick="switchUsageTab(30)">近 30 天</button>
@@ -229,11 +232,106 @@
             </tbody>
           </table>
         </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; margin:22px 0 10px;">
+          <h2 style="font-size:16px; font-weight:600;">额度管家</h2>
+          <span style="font-size:12px; color:var(--text-secondary);"
+            title="今日已用 = 真实转发 + 健康探针（探针同样消耗免费额度）。上限填 0 表示不限；到顶后自动跳过这家检测。">
+            今日已用含探针 · 上限 0 = 不限 · 到顶自动停检</span>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th>提供商</th>
+                <th width="120">今日请求</th>
+                <th width="130">每日请求上限</th>
+                <th width="120">今日 Token</th>
+                <th width="140">每日 Token 上限</th>
+                <th width="100">状态</th>
+                <th width="150">操作</th>
+              </tr>
+            </thead>
+            <tbody id="quotaBody">
+              <tr><td colspan="7" class="empty">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <div style="display:flex; justify-content:space-between; align-items:center; margin:22px 0 10px;">
+          <h2 style="font-size:16px; font-weight:600;">最近请求</h2>
+          <div style="display:flex; gap:8px; align-items:center;">
+            <span id="requestSummary" style="font-size:12px; color:var(--text-secondary);"></span>
+            <button class="btn" id="reqOnlyFailed" onclick="toggleOnlyFailed()">只看失败</button>
+          </div>
+        </div>
+        <div class="table-container">
+          <table>
+            <thead>
+              <tr>
+                <th width="150">时间</th>
+                <th>模型 / 渠道</th>
+                <th width="90">结果</th>
+                <th width="90">耗时</th>
+                <th width="70">尝试</th>
+                <th width="110">Token</th>
+                <th width="120">来源</th>
+                <th>错误</th>
+              </tr>
+            </thead>
+            <tbody id="requestBody">
+              <tr><td colspan="8" class="empty">加载中...</td></tr>
+            </tbody>
+          </table>
+        </div>
       </div> <!-- end usage-view -->
     </div>
   </div>
 
 
+
+  <!-- Advanced Modal（缓存 / 路由策略 / 虚拟 Key） -->
+  <div class="modal-overlay" id="advancedModal"
+    onclick="if(event.target===this) this.classList.remove('show')">
+    <div class="modal-content" style="max-width: 780px;">
+      <div class="modal-header">
+        <div class="modal-title">⚙️ 高级设置</div>
+        <div class="mac-btn close" onclick="document.getElementById('advancedModal').classList.remove('show')"
+          style="cursor:pointer;"></div>
+      </div>
+      <div class="modal-body">
+        <h3 style="font-size:14px;margin:4px 0 10px;">请求缓存</h3>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:6px;">
+          <label style="display:flex;align-items:center;gap:6px;font-size:13px;">
+            <input type="checkbox" id="cacheEnabled" onchange="saveCacheConfig()"> 启用
+          </label>
+          <label style="font-size:13px;">TTL
+            <input type="number" id="cacheTtl" min="0" max="86400" style="width:90px;" onchange="saveCacheConfig()"> 秒
+          </label>
+          <span id="cacheStats" style="font-size:12px;color:var(--text-secondary);"></span>
+          <button class="btn" onclick="clearCache()">清空缓存</button>
+        </div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:16px;">
+          只缓存 temperature ≤ 0.2 的非流式请求（带 tools 的不缓存）。命中不消耗上游额度。
+        </div>
+
+        <h3 style="font-size:14px;margin:4px 0 10px;">路由策略</h3>
+        <select id="routingStrategy" onchange="saveRoutingStrategy()"
+          style="padding:6px 10px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:13px;">
+          <option value="quality">质量优先（可用率 / 延迟 / 模型大小）</option>
+          <option value="cost">成本优先（先便宜的模型）</option>
+        </select>
+
+        <h3 style="font-size:14px;margin:20px 0 10px;">虚拟 Key</h3>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;">
+          <input id="vkName" placeholder="用途（如 手机）" style="width:140px;padding:6px 10px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:13px;">
+          <input id="vkRpm" type="number" min="0" placeholder="RPM" style="width:80px;padding:6px 10px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:13px;">
+          <input id="vkTpm" type="number" min="0" placeholder="TPM" style="width:100px;padding:6px 10px;border-radius:6px;border:1px solid var(--mac-border);background:transparent;color:var(--text-primary);font-size:13px;">
+          <button class="btn btn-primary" onclick="createVirtualKey()">生成</button>
+        </div>
+        <div id="vkList" style="font-size:13px;"></div>
+      </div>
+    </div>
+  </div>
 
   <!-- Router Modal -->
   <div class="modal-overlay" id="routerModal"

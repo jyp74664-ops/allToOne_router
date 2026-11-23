@@ -465,6 +465,20 @@ async def check_model(
     return {"status": "error", "latency_ms": latency, "detail": last_error}
 
 
+# 走不了 /chat/completions 的模型关键词：embedding、图像、音频、视频生成等。
+# 它们保留在模型列表里（供 /v1/embeddings 等入口使用），但不参与聊天探测。
+NON_CHAT_KEYWORDS = (
+    "image", "dall-e", "whisper", "tts", "audio",
+    "text-embedding", "embed", "rerank", "moderation",
+    "lyria", "veo", "sora",
+)
+
+
+def is_non_chat_model(model: str) -> bool:
+    lower = (model or "").lower()
+    return any(kw in lower for kw in NON_CHAT_KEYWORDS)
+
+
 def _pricing_is_paid(pricing: dict) -> bool:
     """单个价格对象是否收费（prompt / completion 任一非 0）。
 
@@ -505,6 +519,39 @@ def model_pricing_is_paid(item: dict) -> bool:
     if not pricings:
         return False
     return all(_pricing_is_paid(pr) for pr in pricings)
+
+
+def extract_pricing(item: dict) -> tuple[float | None, float | None]:
+    """从上游模型条目里取出 (prompt, completion) 原始单价。
+
+    与 model_pricing_is_paid 同样的两种结构（扁平 pricing / providers[].pricing）。
+    取「最便宜的那一档」：一个模型有多个渠道时，实际会路由到免费或最低价渠道。
+    负数（-1 表示动态定价/未知）直接跳过；完全没有价格时返回 (None, None)，
+    表示「未知」，成本账本不会把它当成 0。
+    """
+    if item.get("isFree") is True:
+        return 0.0, 0.0
+    pricings: list[dict] = []
+    flat = item.get("pricing")
+    if isinstance(flat, dict):
+        pricings.append(flat)
+    for pv in item.get("providers") or []:
+        if isinstance(pv, dict):
+            pr = pv.get("pricing")
+            if isinstance(pr, dict):
+                pricings.append(pr)
+    best: tuple[float, float] | None = None
+    for pr in pricings:
+        try:
+            p = float(pr.get("prompt", 0) or 0)
+            c = float(pr.get("completion", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if p < 0 or c < 0:
+            continue
+        if best is None or (p + c) < (best[0] + best[1]):
+            best = (p, c)
+    return best if best is not None else (None, None)
 
 
 def describe_fetch_error(exc=None, status: int | None = None) -> str:
@@ -559,6 +606,7 @@ async def fetch_models(
     context_limits: dict,
     free_out: set | None = None,
     diag_out: dict | None = None,
+    pricing_out: dict | None = None,
 ) -> list[str] | None:
     """拉取模型列表。
 
@@ -567,6 +615,9 @@ async def fetch_models(
 
     diag_out: 传入 dict 时写入失败现场（status: HTTP 码，error: 异常文本），
     供调用方用 describe_fetch_error() 翻译成可定位问题的提示。
+
+    pricing_out: 传入 dict 时收集 {模型名: {"prompt": 原始单价, "completion": 原始单价}}，
+    供成本账本落库。收集范围不受 free_only 影响（收费模型也要算价）。
 
     返回值：
     - list[str]：请求成功（可能为空列表，表示上游确实没有可用模型）
@@ -625,15 +676,13 @@ async def fetch_models(
                         if model_id in seen:
                             continue
                         seen.add(model_id)
-                        # 过滤非聊天模型
-                        lower = model_id.lower()
-                        non_chat = [
-                            "image", "dall-e", "whisper", "tts", "audio",
-                            "text-embedding", "embed", "rerank", "moderation",
-                            "lyria", "veo", "sora",  # 音乐 / 视频生成，走不了 chat/completions
-                        ]
-                        if any(kw in lower for kw in non_chat):
-                            continue
+                        # 非聊天模型（embedding / 图像 / 音频）照样保留在列表里：
+                        # /v1/embeddings 需要它们，多模态透传也靠它。检测阶段由
+                        # checkable_models() 排除，不会拿 chat 接口去探测。
+                        if pricing_out is not None:
+                            pr, cr = extract_pricing(m)
+                            if pr is not None or cr is not None:
+                                pricing_out[model_id] = {"prompt": pr, "completion": cr}
                         # 免费过滤
                         is_paid_model_item = model_pricing_is_paid(m)
                         if free_only and is_paid_model_item:
@@ -825,7 +874,10 @@ def checkable_models(provider) -> list[str]:
     如果从未同步过（免费集合为空），无法区分收费模型，退回探测全部，
     避免把整家服务商的模型都跳过。
     """
-    models = list(dict.fromkeys(provider.models or []))
+    models = [
+        m for m in dict.fromkeys(provider.models or [])
+        if not is_non_chat_model(m)
+    ]
     if getattr(provider, "free_only", True) is False:
         return models
     free = set(getattr(provider, "free_models", None) or [])
@@ -888,6 +940,12 @@ async def run_full_check(on_progress=None) -> dict:
             # 关闭了检测的提供商整体跳过（不探测、不刷日志）
             if getattr(provider, "check_enabled", True) is False:
                 logger.info("  [跳过检测] %s (已关闭检测)", provider.name)
+                continue
+            # 免费额度到顶：今天不再探测这家，避免白撞 429/402 把额度越用越死
+            from services.quota_service import is_exhausted
+            exhausted, why = await is_exhausted(provider.name)
+            if exhausted:
+                logger.info("  [跳过检测] %s (%s)", provider.name, why)
                 continue
             # 只探测已勾选（启用）的模型。未勾选的 disabled_models 不参与路由，
             # 探测它们只会白烧上游额度，因此不再纳入全量检测（2026-11-23 用户要求）。

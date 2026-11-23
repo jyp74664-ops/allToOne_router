@@ -494,11 +494,18 @@
     }
 
     let usageDays = 1;
+    let onlyFailedRequests = false;
     async function loadUsage() {
       try {
-        const r = await apiFetch(`/api/usage?days=${usageDays}`);
-        const data = await r.json();
-        renderUsage(data);
+        const [rUsage, rCost] = await Promise.all([
+          apiFetch(`/api/usage?days=${usageDays}`),
+          apiFetch(`/api/cost?days=${usageDays}`),
+        ]);
+        const data = await rUsage.json();
+        let cost = null;
+        try { cost = await rCost.json(); } catch (e) { cost = null; }
+        renderUsage(data, cost);
+        loadOpsPanels();
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error("Failed to load usage:", e);
       }
@@ -516,7 +523,7 @@
       if (n < 100000000) return (n / 10000).toFixed(1).replace(/\.0$/, '') + ' 万';
       return (n / 100000000).toFixed(2).replace(/\.?0+$/, '') + ' 亿';
     }
-    function renderUsage(data) {
+    function renderUsage(data, cost) {
       const t = data.total || {};
       const cards = [
         { label: '输入 Token', value: t.pt },
@@ -524,10 +531,24 @@
         { label: '合计 Token', value: t.tt },
         { label: '请求数', value: t.requests },
       ];
+      const ct = (cost && cost.total) || null;
+      if (ct) {
+        const rp = cost.reference_prices || {};
+        cards.push({ label: '等价花费', value: fmtUsd(ct.spent), hint: '按上游标价' });
+        cards.push({
+          label: '参照价折算', value: fmtUsd(ct.reference),
+          hint: `$${rp.prompt ?? 0} / $${rp.completion ?? 0} 每 1M`
+        });
+        cards.push({
+          label: '省下', value: fmtUsd(ct.saved),
+          hint: `省 ${ct.savings_pct || 0}%${ct.unpriced_tokens ? ' · 部分模型无报价' : ''}`
+        });
+      }
       document.getElementById('usageOverview').innerHTML = cards.map(c =>
         `<div class="provider-card" style="padding: 14px 16px;">
        <div style="font-size: 12px; color: var(--text-secondary);">${c.label}</div>
-       <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${fmtNum(c.value)}</div>
+       <div style="font-size: 22px; font-weight: 600; color: var(--text-primary); margin-top: 4px;">${typeof c.value === 'number' ? fmtNum(c.value) : (c.value ?? '-')}</div>
+       ${c.hint ? `<div style="font-size: 11px; color: var(--text-secondary); margin-top: 2px;">${esc(c.hint)}</div>` : ''}
      </div>`
       ).join('');
       const rows = data.by_model || [];
@@ -545,6 +566,281 @@
         <td>${fmtNum(r.tt)}</td>
       </tr>`).join('')
         : '<tr><td colspan="5" class="empty">暂无消耗记录</td></tr>';
+    }
+
+    function fmtUsd(n) {
+      const v = Number(n) || 0;
+      if (v === 0) return '$0';
+      if (Math.abs(v) >= 1) return '$' + v.toFixed(2);
+      return '$' + v.toFixed(4);
+    }
+
+    async function loadOpsPanels() {
+      try {
+        const failedQuery = onlyFailedRequests ? '&only_failed=true' : '';
+        const hours = Math.max(24, usageDays * 24);
+        const [q, l] = await Promise.all([
+          apiFetch('/api/quotas').then(r => r.json()),
+          apiFetch(`/api/request-logs?hours=${hours}&limit=100${failedQuery}`).then(r => r.json()),
+        ]);
+        renderQuotas(q);
+        renderRequestLogs(l);
+      } catch (e) {
+        if (e.message !== 'Unauthorized') console.error('loadOpsPanels failed:', e);
+      }
+    }
+
+    function renderQuotas(rows) {
+      const el = document.getElementById('quotaBody');
+      if (!el) return;
+      if (!rows || !rows.length) {
+        el.innerHTML = '<tr><td colspan="7" class="empty">暂无提供商</td></tr>';
+        return;
+      }
+      el.innerHTML = rows.map(q => {
+        const status = q.exhausted
+          ? '<span style="color:#ff6b6b;font-weight:600;">已到顶</span>'
+          : (q.enabled ? '<span style="color:#4ade80;">正常</span>'
+            : '<span style="color:var(--text-secondary);">不限</span>');
+        const reqPct = q.requests_pct == null ? '' : ` <span style="font-size:11px;color:var(--text-secondary);">${q.requests_pct}%</span>`;
+        const tokPct = q.tokens_pct == null ? '' : ` <span style="font-size:11px;color:var(--text-secondary);">${q.tokens_pct}%</span>`;
+        return `<tr data-provider="${esc(q.provider)}" data-enabled="${q.enabled ? 1 : 0}">
+          <td>${esc(q.provider)}</td>
+          <td>${fmtNum(q.used_requests)}${reqPct}</td>
+          <td><input type="number" min="0" value="${q.daily_requests || 0}" style="width:96px;" class="quota-input"></td>
+          <td>${fmtNum(q.used_tokens)}${tokPct}</td>
+          <td><input type="number" min="0" value="${q.daily_tokens || 0}" style="width:116px;" class="quota-input"></td>
+          <td>${status}</td>
+          <td style="white-space:nowrap;">
+            <button class="btn" onclick="saveQuotaRow(this)">保存</button>
+            <button class="btn" onclick="toggleQuotaRow(this)">${q.enabled ? '停限制' : '开限制'}</button>
+          </td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function saveQuotaRow(btn) {
+      const tr = btn.closest('tr');
+      const inputs = tr.querySelectorAll('input.quota-input');
+      const body = {
+        provider: tr.dataset.provider,
+        daily_requests: Number(inputs[0].value) || 0,
+        daily_tokens: Number(inputs[1].value) || 0,
+        enabled: tr.dataset.enabled === '1',
+      };
+      try {
+        await apiFetch('/api/quotas', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        loadOpsPanels();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
+      }
+    }
+
+    async function toggleQuotaRow(btn) {
+      const tr = btn.closest('tr');
+      const inputs = tr.querySelectorAll('input.quota-input');
+      const body = {
+        provider: tr.dataset.provider,
+        daily_requests: Number(inputs[0].value) || 0,
+        daily_tokens: Number(inputs[1].value) || 0,
+        enabled: tr.dataset.enabled !== '1',
+      };
+      try {
+        await apiFetch('/api/quotas', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        loadOpsPanels();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
+      }
+    }
+
+    function renderRequestLogs(data) {
+      const summaryEl = document.getElementById('requestSummary');
+      const bodyEl = document.getElementById('requestBody');
+      if (!bodyEl) return;
+      const s = (data && data.summary) || {};
+      if (summaryEl) {
+        summaryEl.textContent = s.total
+          ? `共 ${s.total} 条 · 失败 ${s.failed} · 成功率 ${s.success_rate}% · 缓存命中 ${s.cached} · 平均 ${s.avg_latency_ms || '-'} ms`
+          : '暂无请求';
+      }
+      const rows = (data && data.items) || [];
+      if (!rows.length) {
+        bodyEl.innerHTML = '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
+        return;
+      }
+      bodyEl.innerHTML = rows.map(r => {
+        const okCell = r.ok
+          ? '<span style="color:#4ade80;">成功</span>'
+          : '<span style="color:#ff6b6b;">失败</span>';
+        const cacheMark = r.cached ? ' 🗄' : '';
+        const streamMark = r.stream ? ' · 流式' : '';
+        const err = r.error || '';
+        return `<tr${r.ok ? '' : ' style="background:rgba(255,80,80,0.07);"'}>
+          <td style="font-size:12px;">${new Date(r.ts).toLocaleString()}</td>
+          <td>
+            <div>${esc(r.provider || '-')} · ${esc(r.upstream_model || r.requested_model || '-')}</div>
+            <div style="font-size:11px;color:var(--text-secondary);">${esc(r.requested_model || '')}</div>
+          </td>
+          <td>${okCell}${cacheMark}</td>
+          <td>${r.latency_ms != null ? r.latency_ms + ' ms' : '-'}</td>
+          <td>${r.attempts || 1}</td>
+          <td>${fmtNum((r.pt || 0) + (r.ct || 0))}</td>
+          <td style="font-size:12px;">${esc(r.api_key_name || '')}${streamMark}</td>
+          <td style="max-width:320px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;" title="${esc(err)}">${esc(err)}</td>
+        </tr>`;
+      }).join('');
+    }
+
+    async function refreshPrices(btn) {
+      const original = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = '同步中...';
+      try {
+        const r = await apiFetch('/api/cost/refresh', { method: 'POST' }, 300000);
+        const d = await r.json();
+        const fail = (d.failed && d.failed.length) ? `，${d.failed.length} 家拉取失败` : '';
+        showToast(`价格同步完成：${d.updated || 0} 条${fail}`, d.failed && d.failed.length ? 'warn' : 'ok', 5000);
+        await loadUsage();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('同步失败: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = original;
+      }
+    }
+
+    function toggleOnlyFailed() {
+      onlyFailedRequests = !onlyFailedRequests;
+      const btn = document.getElementById('reqOnlyFailed');
+      if (btn) btn.classList.toggle('btn-primary', onlyFailedRequests);
+      loadOpsPanels();
+    }
+
+    // ---- 高级设置：缓存 / 路由策略 / 虚拟 Key ----
+    async function openAdvanced() {
+      document.getElementById('advancedModal').classList.add('show');
+      await loadAdvanced();
+    }
+
+    async function loadAdvanced() {
+      try {
+        const [c, s, keys] = await Promise.all([
+          apiFetch('/api/cache-stats').then(r => r.json()),
+          apiFetch('/api/routing-strategy').then(r => r.json()),
+          apiFetch('/api/virtual-keys').then(r => r.json()),
+        ]);
+        document.getElementById('cacheEnabled').checked = !!c.enabled;
+        document.getElementById('cacheTtl').value = c.ttl || 0;
+        document.getElementById('cacheStats').textContent =
+          `命中 ${c.hits || 0} · 条目 ${c.entries || 0} · 命中率 ${c.hit_rate || 0}%`;
+        document.getElementById('routingStrategy').value = s.strategy || 'quality';
+        renderVirtualKeys(Array.isArray(keys) ? keys : []);
+      } catch (e) {
+        if (e.message !== 'Unauthorized') console.error('loadAdvanced failed:', e);
+      }
+    }
+
+    async function saveCacheConfig() {
+      const enabled = document.getElementById('cacheEnabled').checked;
+      const ttl = Number(document.getElementById('cacheTtl').value) || 0;
+      try {
+        await apiFetch('/api/cache-config', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ enabled, ttl }),
+        });
+        await loadAdvanced();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
+      }
+    }
+
+    async function clearCache() {
+      try {
+        const r = await apiFetch('/api/cache-clear', { method: 'POST' });
+        const d = await r.json();
+        await loadAdvanced();
+        alert(`已清空 ${d.cleared || 0} 条缓存`);
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('清空失败: ' + e.message);
+      }
+    }
+
+    async function saveRoutingStrategy() {
+      const strategy = document.getElementById('routingStrategy').value;
+      try {
+        await apiFetch('/api/routing-strategy', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ strategy }),
+        });
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
+      }
+    }
+
+    function renderVirtualKeys(keys) {
+      const el = document.getElementById('vkList');
+      if (!el) return;
+      if (!keys.length) {
+        el.innerHTML = '<div style="color:var(--text-secondary);font-size:12px;">还没有虚拟 Key。生成后可直接给手机/同事用，撤销即时生效。</div>';
+        return;
+      }
+      el.innerHTML = keys.map(k => `<div style="display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid var(--mac-border);">
+        <span style="width:90px;">${esc(k.name)}</span>
+        <code style="flex:1;font-size:11px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;" title="${esc(k.key)}">${esc(k.key)}</code>
+        <span style="font-size:11px;color:var(--text-secondary);">RPM ${k.rpm_limit || '∞'} / TPM ${k.tpm_limit || '∞'}</span>
+        <span style="font-size:11px;color:var(--text-secondary);">${k.requests_60s || 0} 次/分</span>
+        <button class="btn" onclick="toggleVirtualKey(${k.id}, ${!k.enabled})">${k.enabled ? '停用' : '启用'}</button>
+        <button class="btn" onclick="deleteVirtualKey(${k.id})">删除</button>
+      </div>`).join('');
+    }
+
+    async function createVirtualKey() {
+      const name = document.getElementById('vkName').value.trim();
+      const rpm = Number(document.getElementById('vkRpm').value) || 0;
+      const tpm = Number(document.getElementById('vkTpm').value) || 0;
+      if (!name) { alert('填个用途名，方便以后认出是谁在用'); return; }
+      try {
+        await apiFetch('/api/virtual-keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, rpm_limit: rpm, tpm_limit: tpm }),
+        });
+        document.getElementById('vkName').value = '';
+        document.getElementById('vkRpm').value = '';
+        document.getElementById('vkTpm').value = '';
+        await loadAdvanced();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('生成失败: ' + e.message);
+      }
+    }
+
+    async function deleteVirtualKey(id) {
+      if (!confirm('删除后这个 Key 立即失效，确定？')) return;
+      try {
+        await apiFetch(`/api/virtual-keys/${id}`, { method: 'DELETE' });
+        await loadAdvanced();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('删除失败: ' + e.message);
+      }
+    }
+
+    async function toggleVirtualKey(id, enabled) {
+      try {
+        await apiFetch(`/api/virtual-keys/${id}/toggle?enabled=${enabled}`, { method: 'POST' });
+        await loadAdvanced();
+      } catch (e) {
+        if (e.message !== 'Unauthorized') alert('操作失败: ' + e.message);
+      }
     }
 
     let sortCol = null;
@@ -1712,9 +2008,7 @@
       } else if (tab === 'usage') {
         usageBtn.classList.add('active-tab');
         usageView.style.display = 'block';
-        if (document.getElementById('usageOverview').innerHTML === '') {
-          loadUsage(1);
-        }
+        loadUsage();
       } else if (tab === 'provider') {
         providerBtn.classList.add('active-tab');
         providerView.style.display = 'block';

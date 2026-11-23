@@ -24,6 +24,8 @@ def test_readonly_admin_endpoints(local_client):
         "/api/history?hours=1", "/api/rate-limits", "/api/context-limits",
         "/api/auto-validate", "/api/merge-reasoning", "/api/webhooks/configs",
         "/api/client-key", "/api/model-details", "/api/lang-hint", "/api/check-concurrency",
+        "/api/cost?days=1", "/api/quotas", "/api/request-logs?hours=1",
+        "/api/cache-stats", "/api/routing-strategy", "/api/virtual-keys",
     ]
     for ep in eps:
         r = local_client.get(ep)
@@ -1424,3 +1426,349 @@ def test_dashboard_versions_filter_state_js(local_client):
     """filter-state.js 也要带 ?v=，否则单独改它浏览器还用旧缓存（审计 #21）。"""
     html = local_client.get("/").text
     assert "/static/filter-state.js?v=" in html
+
+
+# ============================================================
+# 2.3 产品能力：成本账本 / 额度管家 / 缓存 / 多协议 / 虚拟 Key
+# ============================================================
+
+def test_normalize_price_units():
+    """上游两种报价单位都要归一成 USD / 1M token。"""
+    from services.cost_service import normalize_price
+
+    assert normalize_price(0) == 0.0
+    assert normalize_price(None) is None
+    assert normalize_price(-1) is None          # -1 = 动态定价/未知
+    assert abs(normalize_price(0.00000015) - 0.15) < 1e-9   # 每 token 报价
+    assert normalize_price(0.15) == 0.15                     # 已是每 1M 报价
+
+
+def test_cost_summary_free_model_savings(initialized_db):
+    """免费模型 spent=0，但参照价折算与省下金额要算出来。"""
+    from datetime import datetime
+    from database.models import UsageRecord, ModelPrice
+    from services.cost_service import cost_summary
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(ModelPrice(provider_name="p", model="free-x",
+                             prompt_per_mtok=0.0, completion_per_mtok=0.0))
+            s.add(UsageRecord(timestamp=datetime.now(), provider="p", model="free-x",
+                              upstream_model="free-x", prompt_tokens=1_000_000,
+                              completion_tokens=0, total_tokens=1_000_000))
+            await s.commit()
+    asyncio.run(seed())
+
+    data = asyncio.run(cost_summary(30))
+    total = data["total"]
+    assert total["spent"] == 0.0
+    assert abs(total["reference"] - 0.15) < 1e-9
+    assert abs(total["saved"] - total["reference"]) < 1e-9
+    assert total["unpriced_tokens"] == 0
+    assert data["by_model"][0]["priced"] is True
+
+
+def test_cost_summary_unpriced_kept_separate(initialized_db):
+    """没有报价的模型不能算成 0 花费，要单列 unpriced_tokens。"""
+    from datetime import datetime
+    from database.models import UsageRecord
+    from services.cost_service import cost_summary
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(UsageRecord(timestamp=datetime.now(), provider="p", model="mystery",
+                              upstream_model="mystery", prompt_tokens=500,
+                              completion_tokens=500, total_tokens=1000))
+            await s.commit()
+    asyncio.run(seed())
+
+    total = asyncio.run(cost_summary(30))["total"]
+    assert total["spent"] == 0.0
+    assert total["unpriced_tokens"] == 1000
+
+
+def test_quota_exhausted_after_daily_limit(initialized_db):
+    """今日请求到顶后 is_exhausted 必须为 True，检测会被跳过。"""
+    from datetime import datetime
+    from database.models import UsageRecord
+    from services.quota_service import is_exhausted, save_quota
+
+    db = engine_mod.db
+    asyncio.run(save_quota("p", daily_requests=2))
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            for _ in range(2):
+                s.add(UsageRecord(timestamp=datetime.now(), provider="p", model="m",
+                                  prompt_tokens=10, completion_tokens=5, total_tokens=15))
+            await s.commit()
+    asyncio.run(seed())
+
+    exhausted, why = asyncio.run(is_exhausted("p"))
+    assert exhausted is True
+    assert "请求" in why
+
+    # 没配置配额的家永远不拦
+    assert asyncio.run(is_exhausted("other"))[0] is False
+
+
+def test_cache_only_deterministic_requests():
+    """缓存边界：流式 / 高温 / 带 tools / 未给温度 都不缓存。"""
+    from services import cache_service
+
+    assert cache_service.cacheable({"stream": False, "temperature": 0.0})
+    assert not cache_service.cacheable({"stream": True, "temperature": 0.0})
+    assert not cache_service.cacheable({"stream": False, "temperature": 0.7})
+    assert not cache_service.cacheable({"stream": False, "temperature": 0.0,
+                                        "tools": [{"type": "function"}]})
+    assert not cache_service.cacheable({"stream": False})
+
+    key = cache_service.make_key({"messages": [{"role": "user", "content": "hi"}]}, "m")
+    cache_service.clear()
+    cache_service.put(key, {"choices": [{"message": {"content": "cached"}}]})
+    got = cache_service.get(key, 60)
+    assert got["choices"][0]["message"]["content"] == "cached"
+    got["choices"][0]["message"]["content"] = "mutated"
+    # 返回必须是深拷贝，调用方改了不能污染缓存
+    assert cache_service.get(key, 60)["choices"][0]["message"]["content"] == "cached"
+    assert cache_service.get(key, 0) is None
+    cache_service.clear()
+
+
+def test_anthropic_translation_roundtrip():
+    from api.protocols import _anthropic_to_chat, _chat_to_anthropic
+
+    chat = _anthropic_to_chat({
+        "model": "m", "max_tokens": 64, "system": "be brief",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}],
+        "tool_choice": {"type": "any"},
+    })
+    assert chat["messages"][0] == {"role": "system", "content": "be brief"}
+    assert chat["messages"][1]["content"] == "hi"
+    assert chat["tools"][0]["function"]["name"] == "f"
+    assert chat["tool_choice"] == "required"
+    assert chat["max_tokens"] == 64
+
+    out = _chat_to_anthropic({
+        "choices": [{
+            "message": {"content": "yo", "tool_calls": [
+                {"id": "call_1", "function": {"name": "f", "arguments": "{\"a\": 1}"}}]},
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 4},
+    }, "m")
+    assert out["content"][0] == {"type": "text", "text": "yo"}
+    assert out["content"][1]["type"] == "tool_use"
+    assert out["content"][1]["input"] == {"a": 1}
+    assert out["stop_reason"] == "tool_use"
+
+
+def test_gemini_translation_roundtrip():
+    from api.protocols import _chat_to_gemini, _gemini_to_chat
+
+    chat = _gemini_to_chat({
+        "systemInstruction": {"parts": [{"text": "sys"}]},
+        "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+        "generationConfig": {"maxOutputTokens": 32, "temperature": 0.1},
+    }, "gemini-x")
+    assert chat["model"] == "gemini-x"
+    assert chat["messages"][0]["role"] == "system"
+    assert chat["max_tokens"] == 32
+
+    out = _chat_to_gemini({
+        "choices": [{"message": {"content": "yo"}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 5},
+    }, "gemini-x")
+    assert out["candidates"][0]["content"]["parts"][0]["text"] == "yo"
+    assert out["usageMetadata"]["totalTokenCount"] == 5
+
+
+def test_virtual_key_lifecycle(local_client):
+    """虚拟 Key 可访问、可撤销；撤销后立即 401。"""
+    from services.virtual_key_service import create_key, delete_key, resolve
+
+    k = asyncio.run(create_key("手机", rpm_limit=5, tpm_limit=0))
+    r = local_client.get("/v1/models", headers={"Authorization": "Bearer " + k["key"]})
+    assert r.status_code == 200, r.text
+    assert asyncio.run(resolve(k["key"]))["name"] == "手机"
+
+    asyncio.run(delete_key(k["id"]))
+    assert asyncio.run(resolve(k["key"])) is None
+    r2 = local_client.get("/v1/models", headers={"Authorization": "Bearer " + k["key"]})
+    assert r2.status_code == 401
+
+
+def test_request_log_records_success_and_missing_candidate(initialized_db):
+    """成功与「无候选」都要落 RequestLog——失败以前完全没有记录。"""
+    import httpx
+    from sqlalchemy import select
+    from database.models import RequestLog
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "good", "base_url": "https://good/v1", "api_key": "k", "models": ["m1"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m1", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer " + key})
+        assert r.status_code == 200, r.text
+        r2 = c.post("/v1/chat/completions",
+                    json={"model": "not-a-model", "messages": [{"role": "user", "content": "hi"}]},
+                    headers={"Authorization": "Bearer " + key})
+        assert r2.status_code == 503, r2.text
+    finally:
+        c.__exit__(None, None, None)
+
+    async def read():
+        async with engine_mod.db.SessionLocal() as s:
+            return (await s.execute(select(RequestLog))).scalars().all()
+    rows = asyncio.run(read())
+    assert any(row.ok and row.provider == "good" for row in rows)
+    assert any((not row.ok) and "候选" in (row.error or "") for row in rows)
+
+
+def test_request_cache_hits_do_not_call_upstream(initialized_db):
+    """temperature=0 的重复请求应命中缓存，只打一次上游。"""
+    import httpx
+    from services import cache_service
+
+    cache_service.clear()
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "hit"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p", "base_url": "https://p/v1", "api_key": "k", "models": ["m1"]},
+    ])
+    try:
+        body = {"model": "m1", "temperature": 0,
+                "messages": [{"role": "user", "content": "same question"}]}
+        r1 = c.post("/v1/chat/completions", json=body,
+                    headers={"Authorization": "Bearer " + key})
+        r2 = c.post("/v1/chat/completions", json=body,
+                    headers={"Authorization": "Bearer " + key})
+        assert r1.status_code == 200 and r2.status_code == 200
+        assert r2.json()["choices"][0]["message"]["content"] == "hit"
+        assert calls["n"] == 1, f"上游被打了 {calls['n']} 次，缓存没生效"
+        assert "_fg_meta" not in r2.json()   # 内部标记不能透给客户端
+    finally:
+        c.__exit__(None, None, None)
+        cache_service.clear()
+
+
+def test_context_window_filter_skips_small_model(initialized_db, monkeypatch):
+    """请求明显超过模型上下文时直接跳过该候选，而不是打过去换 400。"""
+    import httpx
+    from services.meta_service import ModelMetaService
+
+    monkeypatch.setattr(ModelMetaService, "context_limits",
+                        property(lambda self: {"m1": 100}))
+
+    def handler(request):
+        return httpx.Response(200, json={"choices": [{"message": {"content": "should not happen"}}]})
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "small", "base_url": "https://s/v1", "api_key": "k", "models": ["m1"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions", json={
+            "model": "m1",
+            "messages": [{"role": "user", "content": "x" * 2000}],
+        }, headers={"Authorization": "Bearer " + key})
+        assert r.status_code == 503, r.text
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_anthropic_endpoint_roundtrip(initialized_db):
+    """POST /v1/messages 端到端：OpenAI 上游 → Anthropic 响应体。"""
+    import httpx
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "hello"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 2, "completion_tokens": 3},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p", "base_url": "https://p/v1", "api_key": "k", "models": ["m1"]},
+    ])
+    try:
+        r = c.post("/v1/messages", json={
+            "model": "m1", "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hi"}],
+        }, headers={"Authorization": "Bearer " + key})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["type"] == "message"
+        assert d["content"][0]["text"] == "hello"
+        assert d["usage"]["output_tokens"] == 3
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_gemini_endpoint_roundtrip(initialized_db):
+    """POST /v1beta/models/{m}:generateContent 端到端。"""
+    import httpx
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"content": "gem"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "g", "base_url": "https://g/v1", "api_key": "k", "models": ["gm1"]},
+    ])
+    try:
+        r = c.post("/v1beta/models/gm1:generateContent", json={
+            "contents": [{"role": "user", "parts": [{"text": "hi"}]}],
+            "generationConfig": {"maxOutputTokens": 16},
+        }, headers={"Authorization": "Bearer " + key})
+        assert r.status_code == 200, r.text
+        d = r.json()
+        assert d["candidates"][0]["content"]["parts"][0]["text"] == "gem"
+        assert d["usageMetadata"]["promptTokenCount"] == 1
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_embeddings_passthrough(initialized_db):
+    """POST /v1/embeddings 按模型找到渠道直接透传。"""
+    import httpx
+
+    def handler(request):
+        assert str(request.url).endswith("/embeddings")
+        return httpx.Response(200, json={
+            "object": "list",
+            "data": [{"object": "embedding", "index": 0, "embedding": [0.1, 0.2]}],
+            "usage": {"prompt_tokens": 4, "total_tokens": 4},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "e", "base_url": "https://e/v1", "api_key": "k", "models": ["text-embedding-3-small"]},
+    ])
+    try:
+        r = c.post("/v1/embeddings", json={
+            "model": "text-embedding-3-small", "input": "hi",
+        }, headers={"Authorization": "Bearer " + key})
+        assert r.status_code == 200, r.text
+        assert r.json()["data"][0]["embedding"] == [0.1, 0.2]
+    finally:
+        c.__exit__(None, None, None)

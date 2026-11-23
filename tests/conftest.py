@@ -21,6 +21,8 @@ def isolated_db(tmp_path, monkeypatch):
         "api.admin", "api.webhooks", "api.metrics", "api.proxy",
         "services.provider_service", "services.router_manager",
         "services.usage_service", "services.meta_service",
+        "services.cost_service", "services.quota_service",
+        "services.virtual_key_service", "services.observability",
     ):
         mod = sys.modules.get(mod_name)
         if mod and hasattr(mod, "db"):

@@ -20,6 +20,15 @@ class AppConfig(BaseModel):
     check_concurrency: int = Field(default=5, ge=1, le=32)
     # 回复语言提示注入策略：auto=按用户语种注入；off=完全不注入（JSON/代码/工具调用场景）
     lang_hint: str = "auto"
+    # 成本账本的参照价（USD / 1M token）。免费渠道实际花费为 0，
+    # 「省下多少」按这组参照价折算，口径写在页面上，避免看起来像虚报。
+    cost_ref_prompt: float = 0.15
+    cost_ref_completion: float = 0.60
+    # 请求缓存：只缓存 temperature <= 0.2 的非流式请求（确定性调用）
+    cache_enabled: bool = True
+    cache_ttl: int = Field(default=300, ge=0, le=86400)
+    # 路由择优策略：quality=质量分/延迟（默认）；cost=优先便宜的模型
+    routing_strategy: str = "quality"
     announcement_url: Optional[str] = None
     # 可信反向代理的 IP 或 CIDR 列表。为空时不信任任何代理头（默认安全）。
     trusted_proxies: list[str] = []
@@ -64,6 +73,11 @@ class Settings:
             ("merge_reasoning", True),
             ("check_concurrency", 5),
             ("lang_hint", "auto"),
+            ("cost_ref_prompt", 0.15),
+            ("cost_ref_completion", 0.60),
+            ("cache_enabled", True),
+            ("cache_ttl", 300),
+            ("routing_strategy", "quality"),
         ):
             if key not in data:
                 data[key] = default
@@ -71,6 +85,9 @@ class Settings:
         # 纠正非法取值（非法 lang_hint 会让注入逻辑按 auto 处理，这里显式收敛）
         if str(data.get("lang_hint", "auto")).lower() not in ("auto", "off"):
             data["lang_hint"] = "auto"
+            changed = True
+        if str(data.get("routing_strategy", "quality")).lower() not in ("quality", "cost"):
+            data["routing_strategy"] = "quality"
             changed = True
         try:
             _conc = int(data.get("check_concurrency", 5))

@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse
 
 from config.settings import settings
 from database.engine import init_db_lifespan
-from api import admin_router, proxy_router, responses_router, webhook_router
+from api import admin_router, proxy_router, responses_router, webhook_router, protocols_router
 from api.metrics import router as metrics_router
 
 # 日志
@@ -137,6 +137,7 @@ app.middleware("http")(log_request_middleware)
 app.include_router(admin_router, prefix="")
 app.include_router(proxy_router, prefix="")
 app.include_router(responses_router, prefix="")
+app.include_router(protocols_router, prefix="")
 app.include_router(webhook_router, prefix="")
 app.include_router(metrics_router, prefix="")
 

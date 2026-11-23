@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Optional
-from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, JSON, ForeignKey, Index
+from sqlalchemy import String, Float, Integer, DateTime, Text, Boolean, JSON, ForeignKey, Index, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from database.engine import Base
@@ -87,6 +87,8 @@ class UsageRecord(Base):
     timestamp: Mapped[datetime] = mapped_column(DateTime, index=True)
     provider: Mapped[str] = mapped_column(String(100))
     model: Mapped[str] = mapped_column(String(200))
+    # 实际发给上游的模型名。model 可能是路由组名/别名，成本必须按真实模型查价
+    upstream_model: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
     prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
     completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
     total_tokens: Mapped[int] = mapped_column(Integer, default=0)
@@ -172,3 +174,84 @@ class SpeedRecord(Base):
     __table_args__ = (
         Index("ix_speed_provider_model_time", "provider_name", "model", "tested_at"),
     )
+
+
+class ModelPrice(Base):
+    """模型价格（统一为 USD / 100 万 token）。
+
+    上游 /models 的 pricing 单位不统一：OpenRouter 系给「每 token 美元」
+    （1.5e-07），也有聚合站直接给「每 1M token 美元」（0.15）。落库时统一
+    折算成 per-MTok，并保留 None 表示上游没报价（未知，不等于免费）。
+    """
+    __tablename__ = "model_prices"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider_name: Mapped[str] = mapped_column(String(100), index=True)
+    model: Mapped[str] = mapped_column(String(200), index=True)
+    prompt_per_mtok: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    completion_per_mtok: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    source: Mapped[str] = mapped_column(String(20), default="upstream")  # upstream / manual
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+    __table_args__ = (
+        UniqueConstraint("provider_name", "model", name="ux_price_provider_model"),
+    )
+
+
+class ProviderQuota(Base):
+    """提供商每日免费额度。0 表示不限；到顶后自动跳过该家的检测。"""
+    __tablename__ = "provider_quotas"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    provider_name: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    daily_requests: Mapped[int] = mapped_column(Integer, default=0)
+    daily_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+
+class RequestLog(Base):
+    """每次真实转发一条（成功与失败都记）。
+
+    以前只有 usage_records 且只记成功，出问题时没有任何现场：不知道请求
+    打到哪家、失败在第几个候选、错误原文是什么。
+    """
+    __tablename__ = "request_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    trace_id: Mapped[str] = mapped_column(String(32), index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    endpoint: Mapped[str] = mapped_column(String(40), default="/v1/chat/completions")
+    requested_model: Mapped[str] = mapped_column(String(200), index=True)
+    provider: Mapped[str] = mapped_column(String(100), nullable=True)
+    upstream_model: Mapped[str] = mapped_column(String(200), nullable=True)
+    stream: Mapped[bool] = mapped_column(Boolean, default=False)
+    ok: Mapped[bool] = mapped_column(Boolean, default=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, nullable=True)
+    prompt_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    completion_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    api_key_name: Mapped[str] = mapped_column(String(100), default="")
+    error: Mapped[str] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_req_time", "timestamp"),
+        Index("ix_req_provider_time", "provider", "timestamp"),
+    )
+
+
+class VirtualKey(Base):
+    """虚拟 Key：给手机/同事用的子 Key，可限 RPM / TPM，用量可归属。"""
+    __tablename__ = "virtual_keys"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    key: Mapped[str] = mapped_column(String(80), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    rpm_limit: Mapped[int] = mapped_column(Integer, default=0)  # 每分钟请求数，0=不限
+    tpm_limit: Mapped[int] = mapped_column(Integer, default=0)  # 每分钟 token 数，0=不限
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)
+    last_used_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

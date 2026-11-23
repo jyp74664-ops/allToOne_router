@@ -6,7 +6,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
-from database.models import UsageRecord, HealthRecord, CheckLog
+from database.models import UsageRecord, HealthRecord, CheckLog, RequestLog
 from database.engine import db
 
 logger = logging.getLogger("flowgate.usage")
@@ -23,13 +23,19 @@ async def append_usage(
     prompt_tokens: int = 0,
     completion_tokens: int = 0,
     total_tokens: int = 0,
+    upstream_model: str | None = None,
 ) -> None:
-    """追加一条用量记录"""
+    """追加一条用量记录。
+
+    model 是客户端请求的名字（可能是路由组名/别名），upstream_model 是实际
+    打到上游的模型名。成本账本必须按后者查价，否则路由组的用量永远匹配不到价格。
+    """
     async with db.SessionLocal() as session:
         record = UsageRecord(
             timestamp=datetime.now(),
             provider=provider,
             model=model,
+            upstream_model=upstream_model,
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             total_tokens=total_tokens,
@@ -181,7 +187,12 @@ async def cleanup_old_records() -> tuple[int, int]:
             UsageRecord.__table__.delete().where(UsageRecord.timestamp < cutoff_usage)
         )
         removed_usage = result.rowcount
-        
+
+        # 请求日志同样按 30 天清理：每天几百条，长期不清会让库慢慢涨
+        await session.execute(
+            RequestLog.__table__.delete().where(RequestLog.timestamp < cutoff_usage)
+        )
+
         await session.commit()
     
     return removed_history, removed_usage

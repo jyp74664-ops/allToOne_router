@@ -527,6 +527,15 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         raise HTTPException(404, "未找到该提供商")
     if getattr(provider, "check_enabled", True) is False:
         raise HTTPException(400, "该提供商已关闭检测，请先打开开关")
+
+    from services.quota_service import is_exhausted
+    exhausted, why = await is_exhausted(name)
+    if exhausted:
+        raise HTTPException(
+            400,
+            f"{name} 今日免费额度已用尽（{why}），今天不再检测。"
+            "如需继续，请在「额度管家」里调高上限或关闭该家的限制",
+        )
     
     # 没有可检测的模型时别静默返回「0 正常 / 0 异常」，否则用户会以为检测坏了
     from services.health_service import checkable_models
@@ -1215,3 +1224,251 @@ async def get_announcement(_=Depends(verify_admin)):
     except Exception as e:
         logger.warning("announcement fetch failed: %s", e)
     return {"ok": True, "content": ""}
+
+
+# ============================================================
+# 成本账本 / 额度管家 / 可观测性 / 缓存 / 虚拟 Key（2.3）
+# ============================================================
+class QuotaIn(BaseModel):
+    provider: str
+    daily_requests: int = 0
+    daily_tokens: int = 0
+    enabled: bool = True
+    note: str = ""
+
+
+class VirtualKeyIn(BaseModel):
+    name: str
+    rpm_limit: int = 0
+    tpm_limit: int = 0
+
+
+class StrategyIn(BaseModel):
+    strategy: str = "quality"
+
+
+@router.get("/cost")
+async def get_cost(days: int = 30, _=Depends(verify_admin)):
+    """成本账本：实际等价花费、参照价折算、省下的金额。"""
+    from services.cost_service import cost_summary
+    return await cost_summary(days)
+
+
+@router.get("/quotas")
+async def get_quotas(_=Depends(verify_admin)):
+    """额度管家：每家今日已用 / 上限 / 剩余。"""
+    from services.quota_service import quota_status
+    return await quota_status()
+
+
+@router.post("/quotas")
+async def set_quota(body: QuotaIn, _=Depends(verify_admin)):
+    from services.quota_service import save_quota
+    return await save_quota(
+        body.provider, body.daily_requests, body.daily_tokens, body.enabled, body.note
+    )
+
+
+@router.delete("/quotas/{name}")
+async def remove_quota(name: str, _=Depends(verify_admin)):
+    from services.quota_service import delete_quota
+    ok = await delete_quota(name)
+    if not ok:
+        raise HTTPException(404, "该提供商没有配置额度")
+    return {"ok": True}
+
+
+@router.get("/request-logs")
+async def get_request_logs(
+    hours: int = 24,
+    limit: int = 200,
+    only_failed: bool = False,
+    _=Depends(verify_admin),
+):
+    """最近的真实转发记录（含失败）。"""
+    from datetime import datetime, timedelta
+    from database.engine import db
+    from database.models import RequestLog
+
+    hours = max(1, min(hours, 24 * 30))
+    limit = max(1, min(limit, 1000))
+    cutoff = datetime.now() - timedelta(hours=hours)
+    async with db.SessionLocal() as session:
+        stmt = (
+            select(RequestLog)
+            .where(RequestLog.timestamp >= cutoff)
+            .order_by(RequestLog.timestamp.desc())
+            .limit(5000)
+        )
+        if only_failed:
+            stmt = (
+                select(RequestLog)
+                .where(RequestLog.timestamp >= cutoff, RequestLog.ok == False)  # noqa: E712
+                .order_by(RequestLog.timestamp.desc())
+                .limit(limit)
+            )
+        records = (await session.execute(stmt)).scalars().all()
+
+    # 汇总基于窗口内全部记录（失败版只统计失败，不混淆成功率）
+    total = len(records)
+    failed = sum(1 for r in records if not r.ok)
+    cached = sum(1 for r in records if r.cached)
+    latencies = [r.latency_ms for r in records if r.latency_ms]
+    by_provider: dict[str, dict] = {}
+    for r in records:
+        name = r.provider or "无"
+        item = by_provider.setdefault(name, {"provider": name, "requests": 0, "failed": 0})
+        item["requests"] += 1
+        if not r.ok:
+            item["failed"] += 1
+
+    items = [
+        {
+            "ts": r.timestamp.isoformat(),
+            "trace_id": r.trace_id,
+            "requested_model": r.requested_model,
+            "provider": r.provider,
+            "upstream_model": r.upstream_model,
+            "endpoint": r.endpoint,
+            "stream": bool(r.stream),
+            "ok": bool(r.ok),
+            "status_code": r.status_code,
+            "attempts": r.attempts,
+            "latency_ms": r.latency_ms,
+            "pt": r.prompt_tokens,
+            "ct": r.completion_tokens,
+            "cached": bool(r.cached),
+            "api_key_name": r.api_key_name,
+            "error": r.error,
+        }
+        for r in records[:limit]
+    ]
+    return {
+        "hours": hours,
+        "summary": {
+            "total": total,
+            "failed": failed,
+            "success_rate": round((total - failed) / total * 100, 1) if total else 0.0,
+            "cached": cached,
+            "avg_latency_ms": round(sum(latencies) / len(latencies)) if latencies else None,
+            "by_provider": sorted(by_provider.values(), key=lambda x: -x["requests"]),
+        },
+        "items": items,
+    }
+
+
+@router.get("/cache-stats")
+async def cache_stats(_=Depends(verify_admin)):
+    from services import cache_service
+    return {"enabled": bool(settings.load().cache_enabled), "ttl": settings.load().cache_ttl, **cache_service.stats()}
+
+
+@router.post("/cache-clear")
+async def cache_clear(_=Depends(verify_admin)):
+    from services import cache_service
+    return {"cleared": cache_service.clear()}
+
+
+@router.get("/routing-strategy")
+async def get_routing_strategy(_=Depends(verify_admin)):
+    return {"strategy": getattr(settings.load(), "routing_strategy", "quality")}
+
+
+@router.post("/routing-strategy")
+async def set_routing_strategy(body: StrategyIn, _=Depends(verify_admin)):
+    value = str(body.strategy or "quality").lower()
+    if value not in ("quality", "cost"):
+        raise HTTPException(400, "strategy 只能是 quality 或 cost")
+    cfg = settings.load()
+    cfg.routing_strategy = value
+    settings.save(cfg)
+    return {"strategy": value}
+
+
+@router.get("/virtual-keys")
+async def list_virtual_keys(_=Depends(verify_admin)):
+    from services.virtual_key_service import list_keys
+    return await list_keys()
+
+
+@router.post("/virtual-keys")
+async def create_virtual_key(body: VirtualKeyIn, _=Depends(verify_admin)):
+    from services.virtual_key_service import create_key
+    return await create_key(body.name, body.rpm_limit, body.tpm_limit)
+
+
+@router.delete("/virtual-keys/{key_id}")
+async def delete_virtual_key(key_id: int, _=Depends(verify_admin)):
+    from services.virtual_key_service import delete_key
+    ok = await delete_key(key_id)
+    if not ok:
+        raise HTTPException(404, "虚拟 Key 不存在")
+    return {"ok": True}
+
+
+@router.post("/virtual-keys/{key_id}/toggle")
+async def toggle_virtual_key(key_id: int, enabled: bool = True, _=Depends(verify_admin)):
+    from services.virtual_key_service import set_enabled
+    ok = await set_enabled(key_id, enabled)
+    if not ok:
+        raise HTTPException(404, "虚拟 Key 不存在")
+    return {"ok": True, "enabled": enabled}
+
+
+class CacheIn(BaseModel):
+    enabled: bool = True
+    ttl: int = 300
+
+
+@router.post("/cache-config")
+async def set_cache_config(body: CacheIn, _=Depends(verify_admin)):
+    cfg = settings.load()
+    cfg.cache_enabled = bool(body.enabled)
+    cfg.cache_ttl = max(0, min(int(body.ttl or 0), 86400))
+    settings.save(cfg)
+    return {"enabled": cfg.cache_enabled, "ttl": cfg.cache_ttl}
+
+
+@router.post("/cost/refresh")
+async def refresh_prices(_=Depends(verify_admin)):
+    """只拉价格、不动模型列表。
+
+    价格是同步模型时顺手存的，但很多人装好后没再点过「同步」，
+    成本账本就会一直空着。这里给一个只读上游 /models、只写价格表的入口。
+    """
+    from database.engine import db
+    from database.models import Provider
+    from services.cost_service import save_prices
+
+    cfg = settings.load()
+    meta = ModelMetaService()
+    async with db.SessionLocal() as session:
+        providers = (await session.execute(select(Provider))).scalars().all()
+
+    sem = asyncio.Semaphore(5)
+    updated = 0
+    failed: list[str] = []
+
+    async with httpx.AsyncClient(timeout=20, verify=cfg.verify_ssl) as client:
+        async def one(p):
+            async with sem:
+                pricing: dict = {}
+                try:
+                    models = await fetch_models(
+                        client, p.base_url, p.api_key, False,
+                        meta.aliases, meta.context_limits, pricing_out=pricing,
+                    )
+                except Exception as exc:
+                    logger.warning("refresh prices failed for %s: %s", p.name, exc)
+                    return p.name, 0, False
+                if models is None:
+                    return p.name, 0, False
+                saved = await save_prices(p.name, pricing)
+                return p.name, saved, True
+
+        for name, saved, ok in await asyncio.gather(*[one(p) for p in providers]):
+            updated += saved
+            if not ok:
+                failed.append(name)
+
+    return {"ok": True, "updated": updated, "failed": failed}

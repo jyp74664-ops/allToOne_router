@@ -3,6 +3,7 @@ import json
 import logging
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -131,8 +132,10 @@ def _request_summary(body: dict) -> tuple[int, int]:
 
 class _BodyRequest:
     """Minimal request facade so the existing proxy handler can be reused directly."""
-    def __init__(self, body: dict):
+    def __init__(self, body: dict, state=None):
         self.body = body
+        # proxy_chat 会读 request.state 上的 Key 归属，缺了会 AttributeError
+        self.state = state if state is not None else SimpleNamespace()
 
     async def json(self) -> dict:
         return self.body
@@ -266,7 +269,7 @@ async def proxy_responses(request: Request):
             body["model"], body["stream"], input_items, input_chars,
             body.get("max_tokens", "default"), body.get("reasoning_effort", "default"),
         )
-        upstream = await proxy_chat(_BodyRequest(body))
+        upstream = await proxy_chat(_BodyRequest(body, request.state))
     except HTTPException as exc:
         logger.warning("Responses request rejected: status=%d error=%s", exc.status_code, exc.detail)
         return _error_response(exc)

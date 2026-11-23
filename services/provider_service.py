@@ -8,6 +8,7 @@ from sqlalchemy import select
 from database.models import Provider, ModelConfig
 from database.engine import get_db
 from services.health_service import check_model, fetch_models as _fetch_models, mask_key
+from services.cost_service import save_prices
 
 logger = logging.getLogger("flowgate.providers")
 
@@ -211,9 +212,10 @@ class ProviderService:
             if not p:
                 raise ValueError(f"提供商 '{name}' 不存在")
             free_out: set[str] = set()
+            pricing_out: dict = {}
             models = await _fetch_models(
                 client, p.base_url, p.api_key, p.free_only, aliases, context_limits,
-                free_out=free_out,
+                free_out=free_out, pricing_out=pricing_out,
             )
             if models is None:
                 raise ValueError(
@@ -228,7 +230,11 @@ class ProviderService:
             p.disabled_models = []
             p.free_models = sorted(free_out)
             await session.commit()
-            return models
+            provider_name = p.name
+        # 价格落库放在 session 之外：save_prices 自己开连接，避免嵌套事务
+        if pricing_out:
+            await save_prices(provider_name, pricing_out)
+        return models
 
     async def sync_free_models(
         self,
@@ -244,9 +250,10 @@ class ProviderService:
             for p in providers.scalars().all():
                 old_models = list(p.models or [])
                 free_out: set[str] = set()
+                pricing_out: dict = {}
                 models = await _fetch_models(
                     client, p.base_url, p.api_key, True, aliases, context_limits,
-                    free_out=free_out,
+                    free_out=free_out, pricing_out=pricing_out,
                 )
                 # 拉取失败：保留原配置，只记失败原因。
                 # （2026-11-23 事故：这里原本直接拿空列表覆盖，上游超时一次就把 7 家
@@ -281,6 +288,8 @@ class ProviderService:
                 p.disabled_models = []
                 p.free_models = sorted(free_out)
                 await session.commit()
+                if pricing_out:
+                    await save_prices(p.name, pricing_out)
                 results.append({
                     "name": p.name,
                     "ok": True,
