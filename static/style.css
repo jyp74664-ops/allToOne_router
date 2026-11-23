@@ -199,16 +199,17 @@
 
     .header-actions {
       display: flex;
-      justify-content: space-between;
-      align-items: center;
+      flex-direction: column;
+      align-items: stretch;
+      gap: 10px;
       margin-bottom: 24px;
-      flex-wrap: wrap;
-      row-gap: 12px;
     }
 
-    /* 右侧按钮多时换行，避免撑宽后压住左侧页签导致点不到 */
-    .ha-right { min-width: 0; }
-    .ha-tools { flex-wrap: wrap; justify-content: flex-end; }
+    /* 两排布局：第一排页签，第二排工具栏。
+       以前工具栏挤在页签右侧，窗口一窄就压住页签导致点不到，改成整排下沉。 */
+    .header-actions .ha-left { min-width: 0; flex-wrap: wrap; }
+    .header-actions .ha-right { min-width: 0; }
+    .ha-tools { flex-wrap: wrap; justify-content: flex-start; }
 
     .header-actions h1 {
       font-size: 24px;

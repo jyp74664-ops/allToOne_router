@@ -28,8 +28,10 @@
 
   <div class="mac-window">
     <div class="mac-content">
-      <div class="header-actions">
-        <div class="ha-left" style="display: flex; align-items: center; gap: 24px; min-width: 0;">
+      <!-- 两排布局：第一排页签，第二排工具栏。窄屏下工具栏自动换行，不再挤在页签右侧 -->
+      <div class="header-actions"
+        style="display: flex; flex-direction: column; align-items: stretch; gap: 10px;">
+        <div class="ha-left" style="display: flex; align-items: center; gap: 24px; min-width: 0; flex-wrap: wrap;">
           <div class="main-tabs"
             style="display: flex; gap: 4px; background: transparent; padding: 0; border-radius: 0; border: none; flex-wrap: wrap; position: relative; z-index: 2;">
             <button id="tab-monitor" class="btn main-tab-btn active-tab" onclick="switchMainTab('monitor')"
@@ -38,10 +40,14 @@
               style="border: none; font-weight: 500; padding: 8px 18px; border-radius: 8px 8px 0 0; background: rgba(0,0,0,0.04); color: var(--text-secondary); box-shadow: none; font-size: 14px;">🔌 上游提供商</button>
             <button id="tab-usage" class="btn main-tab-btn" onclick="switchMainTab('usage')"
               style="border: none; font-weight: 500; padding: 8px 18px; border-radius: 8px 8px 0 0; background: rgba(0,0,0,0.04); color: var(--text-secondary); box-shadow: none; font-size: 14px;">📊 消耗统计</button>
+            <button id="tab-quota" class="btn main-tab-btn" onclick="switchMainTab('quota')"
+              style="border: none; font-weight: 500; padding: 8px 18px; border-radius: 8px 8px 0 0; background: rgba(0,0,0,0.04); color: var(--text-secondary); box-shadow: none; font-size: 14px;">🎚 额度管家</button>
+            <button id="tab-requests" class="btn main-tab-btn" onclick="switchMainTab('requests')"
+              style="border: none; font-weight: 500; padding: 8px 18px; border-radius: 8px 8px 0 0; background: rgba(0,0,0,0.04); color: var(--text-secondary); box-shadow: none; font-size: 14px;">🧾 最近请求</button>
           </div>
         </div>
-        <div class="ha-right" style="display: flex; flex-direction: column; align-items: flex-end; gap: 6px;">
-          <div class="ha-tools" style="display: flex; gap: 12px;">
+        <div class="ha-right" style="display: flex; align-items: center; gap: 10px; min-width: 0;">
+          <div class="ha-tools" style="display: flex; gap: 10px; flex-wrap: wrap; align-items: center;">
             <div style="display: flex; align-items: center; gap: 8px;">
               <label class="switch" title="开启后将推理字段合并到回复内容中">
                 <input type="checkbox" id="mergeReasoningSwitch" checked onchange="toggleMergeReasoning(this.checked)">
@@ -232,11 +238,19 @@
             </tbody>
           </table>
         </div>
-        <div style="display:flex; justify-content:space-between; align-items:center; margin:22px 0 10px;">
-          <h2 style="font-size:16px; font-weight:600;">额度管家</h2>
-          <span style="font-size:12px; color:var(--text-secondary);"
-            title="今日已用 = 真实转发 + 健康探针（探针同样消耗免费额度）。上限填 0 表示不限；到顶后自动跳过这家检测。">
-            今日已用含探针 · 上限 0 = 不限 · 到顶自动停检</span>
+      </div> <!-- end usage-view -->
+
+      <!-- 额度管家：从「消耗统计」里独立出来的页签，只管每日额度上限与今日用量 -->
+      <div id="quota-view" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; margin-top: 8px;">
+          <h2 style="font-size: 16px; font-weight: 600;">额度管家</h2>
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <span style="font-size: 12px; color: var(--text-secondary);"
+              title="今日已用 = 真实转发 + 健康探针（探针同样消耗免费额度）。上限填 0 表示不限；到顶后自动跳过这家检测。">
+              今日已用含探针 · 上限 0 = 不限 · 到顶自动停检</span>
+            <button class="btn" onclick="loadQuotas()"
+              title="重新拉取今日用量与各家上限（只读数据，不发起检测、不消耗上游额度）">↻ 刷新</button>
+          </div>
         </div>
         <div class="table-container">
           <table>
@@ -256,13 +270,30 @@
             </tbody>
           </table>
         </div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-top:14px;line-height:1.8;">
+          今日请求 / Token 含<b>健康探针</b>与<b>真实转发</b>两部分，每次检查都会消耗上游免费额度。上限填 <b>0</b> 表示不限；
+          某家到顶后，自动巡检会跳过它，转发也会优先选其它家。改完上限要点行尾<b>保存</b>，
+          不想启用限制就点<b>停限制</b>（上限值保留，随时可再开）。
+        </div>
+      </div> <!-- end quota-view -->
 
-        <div style="display:flex; justify-content:space-between; align-items:center; margin:22px 0 10px;">
-          <h2 style="font-size:16px; font-weight:600;">最近请求</h2>
-          <div style="display:flex; gap:8px; align-items:center;">
-            <span id="requestSummary" style="font-size:12px; color:var(--text-secondary);"></span>
+      <!-- 最近请求：从「消耗统计」里独立出来的页签，只看网关真实转发的调用记录 -->
+      <div id="request-view" style="display: none;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 14px; margin-top: 8px; gap: 10px; flex-wrap: wrap;">
+          <h2 style="font-size: 16px; font-weight: 600;">最近请求</h2>
+          <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+            <span id="requestSummary" style="font-size: 12px; color: var(--text-secondary);"></span>
+            <button class="btn log-range btn-primary" data-hours="24" onclick="switchLogRange(24)">24 小时</button>
+            <button class="btn log-range" data-hours="168" onclick="switchLogRange(168)">近 7 天</button>
+            <button class="btn log-range" data-hours="720" onclick="switchLogRange(720)">近 30 天</button>
             <button class="btn" id="reqOnlyFailed" onclick="toggleOnlyFailed()">只看失败</button>
+            <button class="btn" onclick="loadRequestLogs()"
+              title="重新拉取请求记录（只读数据，不发起检测、不消耗上游额度）">↻ 刷新</button>
           </div>
+        </div>
+        <div style="font-size:12px;color:var(--text-secondary);margin-bottom:10px;line-height:1.7;">
+          只记<b>经网关转发</b>的调用（成功、失败、缓存命中都在内），健康探针不进这张表。按时间倒序，最多 100 条；
+          失败行的「错误」列带上游原始报错，鼠标悬停看全文。
         </div>
         <div class="table-container">
           <table>
@@ -283,7 +314,7 @@
             </tbody>
           </table>
         </div>
-      </div> <!-- end usage-view -->
+      </div> <!-- end request-view -->
     </div>
   </div>
 

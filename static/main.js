@@ -205,9 +205,12 @@
       try {
         const r = await apiFetch('/api/providers');
         const list = await r.json();
-        // 「上游提供商」列表：可用的排最前，组内按中文正序（拼音）排列。
-        // 不可用口径与卡片的红名一致：上游报错、模型列表为空，或所有模型都被探测为失败。
-        // 从未探测过的一律算可用（不能因为没数据就把整家沉底）。
+        // 「上游提供商」列表排序，三级键：
+        //   ① 可用的排最前。不可用口径与卡片红名一致：上游报错、模型列表为空，
+        //      或所有模型都被探测为失败；从未探测过的一律算可用（没数据不等于不能用）。
+        //   ② 已开启的排在关闭的之前。「已开启」= 卡片左侧那个检测开关没关
+        //      （check_enabled !== false），关闭的家不参与巡检，平时也不看。
+        //   ③ 同档内按中文正序（拼音）排，英文按字母。
         const _badStatus = new Set(['fail', 'error', 'deleted']);
         const _isUsableProvider = p => {
           const models = p.models || [];
@@ -216,9 +219,11 @@
           const probed = models.filter(m => health[m] && health[m].status);
           return probed.length === 0 || probed.some(m => !_badStatus.has(health[m].status));
         };
+        const _isEnabledProvider = p => p.check_enabled !== false;
         const _zhCollator = new Intl.Collator('zh-Hans-CN');
         list.sort((a, b) =>
           (_isUsableProvider(b) ? 1 : 0) - (_isUsableProvider(a) ? 1 : 0)
+          || (_isEnabledProvider(b) ? 1 : 0) - (_isEnabledProvider(a) ? 1 : 0)
           || _zhCollator.compare(a.name || '', b.name || '')
         );
         data = [];
@@ -520,8 +525,7 @@
         const data = await rUsage.json();
         let cost = null;
         try { cost = await rCost.json(); } catch (e) { cost = null; }
-        renderUsage(data, cost);
-        loadOpsPanels();
+        renderUsage(data, cost);   // 请求日志已独立成页签，本页只渲染消耗统计
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error("Failed to load usage:", e);
       }
@@ -591,19 +595,36 @@
       return '$' + v.toFixed(4);
     }
 
-    async function loadOpsPanels() {
+    // 额度管家与「最近请求」原本挤在「消耗统计」页签里，一起拉取。
+    // 拆成独立页签后分成两个 loader，各页签只拉自己那份数据。
+    async function loadQuotas() {
+      try {
+        const q = await apiFetch('/api/quotas').then(r => r.json());
+        renderQuotas(q);
+      } catch (e) {
+        if (e.message !== 'Unauthorized') console.error('loadQuotas failed:', e);
+      }
+    }
+
+    // 请求日志页签有自己的时间窗，不再跟着「消耗统计」的日/7 天/30 天走
+    let logHours = 24;
+
+    async function loadRequestLogs() {
       try {
         const failedQuery = onlyFailedRequests ? '&only_failed=true' : '';
-        const hours = Math.max(24, usageDays * 24);
-        const [q, l] = await Promise.all([
-          apiFetch('/api/quotas').then(r => r.json()),
-          apiFetch(`/api/request-logs?hours=${hours}&limit=100${failedQuery}`).then(r => r.json()),
-        ]);
-        renderQuotas(q);
+        const l = await apiFetch(`/api/request-logs?hours=${logHours}&limit=100${failedQuery}`).then(r => r.json());
         renderRequestLogs(l);
       } catch (e) {
-        if (e.message !== 'Unauthorized') console.error('loadOpsPanels failed:', e);
+        if (e.message !== 'Unauthorized') console.error('loadRequestLogs failed:', e);
       }
+    }
+
+    function switchLogRange(h) {
+      logHours = h;
+      document.querySelectorAll('.log-range').forEach(b => {
+        b.classList.toggle('btn-primary', Number(b.dataset.hours) === h);
+      });
+      loadRequestLogs();
     }
 
     function renderQuotas(rows) {
@@ -614,9 +635,11 @@
         return;
       }
       el.innerHTML = rows.map(q => {
+        // 上限都是 0 ＝ 不限，这时候不该显示「正常」（会让人误以为正在卡额度）
+        const hasLimit = (Number(q.daily_requests) || 0) > 0 || (Number(q.daily_tokens) || 0) > 0;
         const status = q.exhausted
           ? '<span style="color:#ff6b6b;font-weight:600;">已到顶</span>'
-          : (q.enabled ? '<span style="color:#4ade80;">正常</span>'
+          : (q.enabled && hasLimit ? '<span style="color:#4ade80;">正常</span>'
             : '<span style="color:var(--text-secondary);">不限</span>');
         const reqPct = q.requests_pct == null ? '' : ` <span style="font-size:11px;color:var(--text-secondary);">${q.requests_pct}%</span>`;
         const tokPct = q.tokens_pct == null ? '' : ` <span style="font-size:11px;color:var(--text-secondary);">${q.tokens_pct}%</span>`;
@@ -650,7 +673,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        loadOpsPanels();
+        loadQuotas();
       } catch (e) {
         if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
       }
@@ -671,7 +694,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body),
         });
-        loadOpsPanels();
+        loadQuotas();
       } catch (e) {
         if (e.message !== 'Unauthorized') alert('保存失败: ' + e.message);
       }
@@ -737,7 +760,7 @@
       onlyFailedRequests = !onlyFailedRequests;
       const btn = document.getElementById('reqOnlyFailed');
       if (btn) btn.classList.toggle('btn-primary', onlyFailedRequests);
-      loadOpsPanels();
+      loadRequestLogs();
     }
 
     // ---- 高级设置：缓存 / 路由策略 / 虚拟 Key ----
@@ -2000,13 +2023,17 @@
     function switchMainTab(tab) {
       const monitorBtn = document.getElementById('tab-monitor');
       const usageBtn = document.getElementById('tab-usage');
+      const quotaBtn = document.getElementById('tab-quota');
+      const requestsBtn = document.getElementById('tab-requests');
       const providerBtn = document.getElementById('tab-provider');
       const monitorView = document.getElementById('monitor-view');
       const usageView = document.getElementById('usage-view');
+      const quotaView = document.getElementById('quota-view');
+      const requestsView = document.getElementById('request-view');
       const providerView = document.getElementById('provider-view');
 
       // Reset all buttons
-      [monitorBtn, usageBtn, providerBtn].forEach(btn => {
+      [monitorBtn, usageBtn, quotaBtn, requestsBtn, providerBtn].forEach(btn => {
         btn.classList.remove('active-tab');
         btn.style.background = '';
         btn.style.color = '';
@@ -2014,7 +2041,7 @@
       });
 
       // Reset all views
-      [monitorView, usageView, providerView].forEach(view => {
+      [monitorView, usageView, quotaView, requestsView, providerView].forEach(view => {
         view.style.display = 'none';
       });
 
@@ -2025,6 +2052,14 @@
         usageBtn.classList.add('active-tab');
         usageView.style.display = 'block';
         loadUsage();
+      } else if (tab === 'quota') {
+        quotaBtn.classList.add('active-tab');
+        quotaView.style.display = 'block';
+        loadQuotas();
+      } else if (tab === 'requests') {
+        requestsBtn.classList.add('active-tab');
+        requestsView.style.display = 'block';
+        loadRequestLogs();
       } else if (tab === 'provider') {
         providerBtn.classList.add('active-tab');
         providerView.style.display = 'block';
