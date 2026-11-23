@@ -59,8 +59,8 @@
 
         <div class="tool-bar">
           <button class="btn btn-primary" onclick="openRouterManager()">🔀 路由配置</button>
-          <span class="tool-sep"></span>
-          <button class="btn btn-quiet" onclick="syncRateLimits()" id="syncRateBtn"
+          <!-- 配置类按钮靠左独占一端；工具类与动作类整体靠右，用 margin-left:auto 顶开 -->
+          <button class="btn btn-quiet" onclick="syncRateLimits()" id="syncRateBtn" style="margin-left:auto;"
             title="从 GitHub awesome-free-llm-apis 自动同步最新模型速率限制信息，并匹配到本地模型列表中">
             ⏱ 同步速率
           </button>
@@ -73,8 +73,9 @@
             </svg>
           </button>
           <!-- 立即检测会真的跑一轮探测、消耗上游额度，误点代价高：
-               单独用 margin-left:auto 顶到最右端，和左边的按钮拉开距离 -->
-          <button class="btn btn-quiet" onclick="checkAll()" id="checkAllBtn" style="margin-left:auto;"
+               与工具类按钮之间留一道分隔线作视觉缓冲 -->
+          <span class="tool-sep"></span>
+          <button class="btn btn-quiet" onclick="checkAll()" id="checkAllBtn"
             title="只检测各服务商下已勾选（启用）的模型，未勾选的模型不会探测，也不消耗上游额度">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
