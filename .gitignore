@@ -36,3 +36,6 @@ summary_rows.json
 
 # 本地临时备份（不进仓库）
 *.bak-*
+
+# 进站留痕（app.py 的 inbound.log），只是排查用，不进仓库
+logs/

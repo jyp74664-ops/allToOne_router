@@ -1,6 +1,7 @@
 """FlowGate - 高性能 AI 模型网关"""
 import logging
 import time
+from datetime import datetime
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -116,18 +117,50 @@ app = FastAPI(
 # 请求日志中间件：合并 uvicorn access log 与业务成功日志
 access_logger = logging.getLogger("flowgate.access")
 
+# 进站留痕文件：控制台日志只在窗口里，事后翻不了。排查「客户端说调过了、
+# 最近请求里没有」时需要能对照「这个请求到底进没进来、进来后返回什么状态码」。
+_INBOUND_LOG = Path(__file__).parent / "logs" / "inbound.log"
+
+
+def _append_inbound_line(request, status: int, seconds: float, err: str = "") -> None:
+    path = request.url.path
+    if not path.startswith("/v1"):
+        return
+    try:
+        _INBOUND_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if _INBOUND_LOG.exists() and _INBOUND_LOG.stat().st_size > 2 * 1024 * 1024:
+            _INBOUND_LOG.replace(_INBOUND_LOG.with_name("inbound.log.1"))
+        with _INBOUND_LOG.open("a", encoding="utf-8") as f:
+            f.write(
+                f"{datetime.now():%m-%d %H:%M:%S} {request.method} {path} -> {status} "
+                f"{seconds * 1000:.0f}ms len={request.headers.get('content-length', '-')} "
+                f"ua={(request.headers.get('user-agent') or '-')[:26]}{err}\n"
+            )
+    except Exception:  # 留痕失败绝不能影响转发
+        pass
+
+
 async def log_request_middleware(request, call_next):
     start_time = time.time()
-    response = await call_next(request)
-    process_time = time.time() - start_time
-    client_info = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
-    query = request.url.query
-    full_path = f"{request.url.path}?{query}" if query else request.url.path
-    access_logger.info(
-        '%s - "%s %s HTTP/1.1" %d %.3fs',
-        client_info, request.method, full_path, response.status_code, process_time
-    )
-    return response
+    status = 500
+    err = ""
+    try:
+        response = await call_next(request)
+        status = response.status_code
+        return response
+    except Exception as exc:
+        err = f" EXC {type(exc).__name__}: {exc}"[:200]
+        raise
+    finally:
+        process_time = time.time() - start_time
+        client_info = f"{request.client.host}:{request.client.port}" if request.client else "unknown"
+        query = request.url.query
+        full_path = f"{request.url.path}?{query}" if query else request.url.path
+        access_logger.info(
+            '%s - "%s %s HTTP/1.1" %d %.3fs',
+            client_info, request.method, full_path, status, process_time
+        )
+        _append_inbound_line(request, status, process_time, err)
 
 
 # 请求日志中间件（不启用 CORS：管理页与 API 同源，杜绝跨站凭据窃取）

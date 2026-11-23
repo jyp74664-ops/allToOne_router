@@ -2001,3 +2001,44 @@ def test_request_log_survives_client_cancel(initialized_db):
     assert rows[0].ok is False
     assert rows[0].stream is True
     assert "客户端断开" in (rows[0].error or "")
+
+
+def test_pre_forward_exception_is_logged(local_client, initialized_db, monkeypatch):
+    """转发前的处理抛异常（compress_hermes / ensure_lang_reply 这类）也要留痕。
+
+    病灶：这些函数在 forward_chat 之前执行，一旦抛非 HTTPException，
+    FastAPI 直接 500，而记录点全在 forward_chat 内部 —— 结果就是
+    「客户端说调过了、最近请求里一条都没有」，且现场完全丢失。
+    """
+    import asyncio
+    from sqlalchemy import select
+    from api import proxy as proxy_mod
+    from config.settings import settings
+    from database.models import RequestLog
+
+    def boom(_body):
+        raise ValueError("boom-in-preprocess")
+
+    monkeypatch.setattr(proxy_mod, "compress_hermes", boom)
+    key = settings.load().local_api_key
+
+    r = local_client.post(
+        "/v1/chat/completions",
+        json={"model": "某个路由", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer " + key},
+    )
+    assert r.status_code == 500
+
+    async def read_rows():
+        async with initialized_db.SessionLocal() as s:
+            res = await s.execute(
+                select(RequestLog).where(RequestLog.status_code == 500)
+            )
+            return res.scalars().all()
+
+    rows = asyncio.run(read_rows())
+    assert len(rows) == 1, "转发前的异常也必须留一条日志"
+    assert rows[0].ok is False
+    assert rows[0].requested_model == "某个路由"
+    assert "网关内部异常" in (rows[0].error or "")
+

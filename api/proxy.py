@@ -841,28 +841,57 @@ async def forward_chat(
 
 @router.api_route("/chat/completions", methods=["POST"], dependencies=[Depends(verify_client)])
 async def proxy_chat(request: Request, force: bool = False):
-    """代理聊天补全请求（OpenAI 兼容入口）。"""
-    # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
-    cfg = settings.load()
+    """代理聊天补全请求（OpenAI 兼容入口）。
+
+    整个函数体包了一层兜底：以前只有 forward_chat 内部有记录点，一旦
+    compress_hermes / ensure_lang_reply / normalize_router_name 这类前置处理
+    抛异常（客户端发来奇怪的消息结构就可能），FastAPI 直接 500 返回，
+    request_logs 里查不到任何东西——表现就是「客户端说调过了、最近请求里没有」。
+    HTTPException 属于业务分支（400 缺 model 等），按设计不记账，原样抛出。
+    """
+    trace_id = new_trace_id()
+    started = time.time()
+    api_key_name = getattr(request.state, "api_key_name", "")
+    model_hint = ""
     try:
-        body = await request.json()
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise HTTPException(400, "请求体必须是有效的 JSON") from exc
-    if not isinstance(body, dict):
-        raise HTTPException(400, "请求体必须是 JSON 对象")
-    body = compress_hermes(body)
-    body = ensure_lang_reply(body, str(getattr(cfg, "lang_hint", "auto") or "auto"))
-    requested_model = body.get("model")
-    # 规范化路由组名称（支持英文别名，直接从数据库查询）
-    requested_model = await normalize_router_name(requested_model)
-    if not isinstance(requested_model, str) or not requested_model:
-        raise HTTPException(400, "请求缺少 model")
-    return await forward_chat(
-        body, requested_model, bool(cfg.merge_reasoning), force=force,
-        endpoint="/v1/chat/completions",
-        api_key_name=getattr(request.state, "api_key_name", ""),
-        vkey_id=getattr(request.state, "vkey_id", None),
-    )
+        # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
+        cfg = settings.load()
+        try:
+            body = await request.json()
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise HTTPException(400, "请求体必须是有效的 JSON") from exc
+        if not isinstance(body, dict):
+            raise HTTPException(400, "请求体必须是 JSON 对象")
+        if isinstance(body.get("model"), str):
+            model_hint = body["model"]
+        body = compress_hermes(body)
+        body = ensure_lang_reply(body, str(getattr(cfg, "lang_hint", "auto") or "auto"))
+        requested_model = body.get("model")
+        # 规范化路由组名称（支持英文别名，直接从数据库查询）
+        requested_model = await normalize_router_name(requested_model)
+        if not isinstance(requested_model, str) or not requested_model:
+            raise HTTPException(400, "请求缺少 model")
+        model_hint = requested_model
+        return await forward_chat(
+            body, requested_model, bool(cfg.merge_reasoning), force=force,
+            trace_id=trace_id,
+            endpoint="/v1/chat/completions",
+            api_key_name=api_key_name,
+            vkey_id=getattr(request.state, "vkey_id", None),
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception(
+            "\033[91m✗ 网关内部异常（转发前）: %s\033[0m", type(exc).__name__
+        )
+        await _record_safely(
+            trace_id=trace_id, requested_model=model_hint or "(unknown)",
+            endpoint="/v1/chat/completions", stream=False, ok=False, status_code=500,
+            latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
+            error=f"网关内部异常（转发前）：{type(exc).__name__}: {exc}"[:900],
+        )
+        raise HTTPException(500, f"网关内部错误：{type(exc).__name__}") from exc
 
 
 
