@@ -23,7 +23,7 @@ def test_readonly_admin_endpoints(local_client):
         "/api/health-status", "/api/stability?hours=1", "/api/usage?days=1",
         "/api/history?hours=1", "/api/rate-limits", "/api/context-limits",
         "/api/auto-validate", "/api/merge-reasoning", "/api/webhooks/configs",
-        "/api/client-key", "/api/model-details",
+        "/api/client-key", "/api/model-details", "/api/lang-hint", "/api/check-concurrency",
     ]
     for ep in eps:
         r = local_client.get(ep)
@@ -482,8 +482,8 @@ def test_check_provider_rejects_empty_models(local_client, initialized_db):
     assert "模型列表为空" in r.text
 
 
-def test_stability_returns_tokens_per_sec(local_client, initialized_db):
-    """稳定性接口按 completion_token ÷ 耗时给出生成速度。"""
+def test_stability_returns_real_speed_only(initialized_db, local_client):
+    """稳定性接口不再按探针 token 估算速度（该字段与已下线的列一起删掉）。"""
     import asyncio
     from database import engine as engine_mod
     from database.models import HealthRecord
@@ -501,7 +501,9 @@ def test_stability_returns_tokens_per_sec(local_client, initialized_db):
     r = local_client.get("/api/stability?hours=24")
     assert r.status_code == 200, r.text
     row = next(x for x in r.json() if x["provider"] == "p" and x["model"] == "m")
-    assert row["tokens_per_sec"] == 5.0
+    assert "tokens_per_sec" not in row
+    # 真实测速没跑过时，这几个字段必须是 None，不能拿探针数据凑
+    assert row["real_tps"] is None and row["ttft_ms"] is None
 
 
 def test_sync_keeps_models_when_fetch_fails(initialized_db, monkeypatch):
@@ -670,8 +672,9 @@ def test_stability_exposes_real_speed(initialized_db, local_client):
     assert row["real_tps"] == 42.5
     assert row["speed_estimated"] is False
     assert row["speed_tested_at"] is not None
-    # 探针口径的旧字段仍然存在，只是前端不再展示
-    assert row["tokens_per_sec"] == 10.0
+    # 探针口径的 tokens_per_sec 已随列下线一起删除（审计 #19）：
+    # 它用「成功但没返回 usage」的请求做分母，系统性低估，留着只会误导
+    assert "tokens_per_sec" not in row
 
 
 def test_decode_plausible_rejects_buffered_streams():
@@ -926,8 +929,19 @@ def _proxy_test_client(handler, provider_rows):
         HTTPError=httpx.HTTPError, MockTransport=httpx.MockTransport,
     )
     proxy_mod.httpx = shim
+    # 进程级连接池会绕开 MockTransport 去连真实网络，测试期强制走「每次新建」路径
+    import services.upstream_client as upstream_mod
+    upstream_mod.disable_shared_client()
 
     c = TestClient(app.app, client=("127.0.0.1", 50002))
+    real_exit = c.__exit__
+
+    def _exit(*args):
+        upstream_mod.enable_shared_client()
+        proxy_mod.httpx = httpx
+        return real_exit(*args)
+
+    c.__exit__ = _exit
     c.__enter__()
     key = settings.load().local_api_key
     return c, key
@@ -1243,3 +1257,170 @@ def test_acquire_check_takes_over_stale_slot():
         admin_mod._CHECK_STATE.update(running=False, kind="", started=0.0, token="")
 
 
+
+
+# ============================================================
+# 审计修复回归（2026-11-23 第三批 / P2：性能与可维护性）
+# ============================================================
+
+def test_quality_score_uses_sliding_window():
+    """质量分只看最近 QUALITY_WINDOW 次：修好的模型必须能回到 1.0（审计 #16）。"""
+    from services.health_service import HealthState, QUALITY_WINDOW
+
+    hs = HealthState()
+    key = "p||m"
+    # 先连续失败 QUALITY_WINDOW 次：分数应归零
+    for _ in range(QUALITY_WINDOW):
+        hs.update_quality(key, {"status": "fail"})
+    assert hs.get_quality_score(key) == 0.0
+    # 再成功 QUALITY_WINDOW 次：窗口把失败全部挤出，分数必须回到 1.0
+    # （累计口径下这里只能是 0.5，历史失败永久拉低排序）
+    for _ in range(QUALITY_WINDOW):
+        hs.update_quality(key, {"status": "ok", "latency_ms": 100})
+    assert hs.get_quality_score(key) == 1.0
+    assert hs.get_test_count(key) == QUALITY_WINDOW
+
+
+def test_prefix_provider_lookup_does_not_break_early(initialized_db, monkeypatch):
+    """提供商名字互为前缀时，前缀命中但模型不在该家要继续往后找（审计 #17）。
+
+    "p" 与 "p-2"：请求 "p-2-m1" 时先命中 "p-" 前缀，rest="2-m1" 不在 p 的
+    模型里。原来的 break 会在这里跳出，导致 "p-2" 永远匹配不到、请求 503。
+    """
+    import httpx
+    from services.health_service import health_state
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "hit"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p", "base_url": "https://p/v1", "api_key": "k1", "models": ["other"]},
+        {"name": "p-2", "base_url": "https://p2/v1", "api_key": "k2", "models": ["m1"]},
+    ])
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "p-2-m1", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer " + key})
+    finally:
+        c.__exit__(None, None, None)
+
+    assert r.status_code == 200, r.text
+    assert r.json()["choices"][0]["message"]["content"] == "hit"
+    assert r.json()["model"].startswith("p-2"), r.json()["model"]
+
+
+def test_run_full_check_probes_concurrently(initialized_db, monkeypatch):
+    """全量检测必须并发执行，不能一个个串着等（审计 #15）。"""
+    import asyncio
+    from database import engine as engine_mod
+    from services import health_service as hs
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="conc", base_url="https://x/v1", api_key="k",
+                           models=[f"m{i}" for i in range(6)],
+                           disabled_models=[], retired_models=[], free_models=[],
+                           free_only=False, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    state = {"inflight": 0, "peak": 0}
+
+    async def fake_check(client, base_url, api_key, model, aliases, **kw):
+        state["inflight"] += 1
+        state["peak"] = max(state["peak"], state["inflight"])
+        await asyncio.sleep(0.05)
+        state["inflight"] -= 1
+        return {"status": "ok", "code": 200, "latency_ms": 50}
+
+    monkeypatch.setattr(hs, "check_model", fake_check)
+
+    async def no_retire(*a, **kw):
+        return {}
+    monkeypatch.setattr(hs, "retire_models", no_retire)
+
+    results = asyncio.run(hs.run_full_check())
+    assert len(results) == 6, results
+    assert state["peak"] >= 2, f"并发度为 1（peak={state['peak']}），说明还是串行"
+    assert state["peak"] <= 6
+
+
+def test_lang_hint_off_leaves_messages_untouched():
+    """关闭语言提示后不能再往 messages 里塞 system（审计 #23）。"""
+    from api.proxy import ensure_lang_reply
+
+    body = {"messages": [{"role": "user", "content": "把结果输出成 JSON"}]}
+    out = ensure_lang_reply(body, "off")
+    assert len(out["messages"]) == 1
+    assert out["messages"][0]["role"] == "user"
+
+    # auto 模式下照旧注入
+    body2 = {"messages": [{"role": "user", "content": "你好，介绍一下自己"}]}
+    out2 = ensure_lang_reply(body2, "auto")
+    assert out2["messages"][0]["role"] == "system"
+
+
+def test_verify_client_rejects_wrong_key(initialized_db):
+    """客户端鉴权改 hmac.compare_digest 后行为不变：错 Key 一律 401（审计 #24）。"""
+    from fastapi.testclient import TestClient
+    import app
+
+    c = TestClient(app.app, client=("127.0.0.1", 50003))
+    c.__enter__()
+    try:
+        r = c.post("/v1/chat/completions",
+                   json={"model": "m", "messages": [{"role": "user", "content": "hi"}]},
+                   headers={"Authorization": "Bearer sk-wrong"})
+        assert r.status_code == 401, r.text
+        r2 = c.post("/v1/chat/completions",
+                    json={"model": "m", "messages": [{"role": "user", "content": "hi"}]})
+        assert r2.status_code == 401, r2.text
+    finally:
+        c.__exit__(None, None, None)
+
+
+def test_login_throttled_after_repeated_failures(local_client, monkeypatch):
+    """管理登录连续失败会被锁定，不能再无限次爆破（审计 #22）。"""
+    from api import admin as admin_mod
+
+    monkeypatch.setattr(admin_mod, "LOGIN_MAX_FAILS", 2)
+    monkeypatch.setattr(admin_mod, "_LOGIN_FAILS", {})
+    monkeypatch.setattr(admin_mod, "_LOGIN_LOCKED", {})
+    try:
+        assert local_client.post("/api/admin/login", json={"password": "bad1"}).status_code == 401
+        assert local_client.post("/api/admin/login", json={"password": "bad2"}).status_code == 401
+        r = local_client.post("/api/admin/login", json={"password": "bad3"})
+        assert r.status_code == 429, r.text
+        assert "Retry-After" in r.headers
+    finally:
+        admin_mod._LOGIN_FAILS.clear()
+        admin_mod._LOGIN_LOCKED.clear()
+
+
+def test_describe_fetch_error_separates_layers():
+    """拉模型列表失败的提示要能区分 DNS / 连接 / 鉴权 / 超时（审计 #20）。"""
+    import httpx
+    from services.health_service import describe_fetch_error
+
+    dns = describe_fetch_error(httpx.ConnectError(
+        "[Errno -2] Name or service not known"))
+    assert "DNS" in dns, dns
+    assert "Key" not in dns
+
+    refused = describe_fetch_error(httpx.ConnectError("Connection refused"))
+    assert "拒绝" in refused, refused
+
+    assert "鉴权" in describe_fetch_error(None, 401)
+    assert "限流" in describe_fetch_error(None, 429)
+    assert "超时" in describe_fetch_error(httpx.ReadTimeout("timed out"))
+
+
+def test_dashboard_versions_filter_state_js(local_client):
+    """filter-state.js 也要带 ?v=，否则单独改它浏览器还用旧缓存（审计 #21）。"""
+    html = local_client.get("/").text
+    assert "/static/filter-state.js?v=" in html

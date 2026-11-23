@@ -37,6 +37,9 @@ logger = logging.getLogger("flowgate")
 async def lifespan(app: FastAPI):
     """应用生命周期管理"""
     await init_db_lifespan()
+    # 进程级上游连接池：转发请求复用它的 keep-alive 连接，不再每次重做 TLS 握手
+    from services.upstream_client import open_shared_client, close_shared_client
+    await open_shared_client(settings.load().verify_ssl)
     # 启动时异步同步速率限制
     import asyncio
     from services.rate_limit_service import sync_rate_limits as _sync_rl
@@ -64,6 +67,7 @@ async def lifespan(app: FastAPI):
     yield
     for task in getattr(app.state, "bg_tasks", []):
         task.cancel()
+    await close_shared_client()
     logger.info("FlowGate shutdown")
 
 
@@ -172,7 +176,8 @@ def render_dashboard() -> str:
     # 静态资源带上文件 mtime 版本号：CSS/JS 一改 URL 就变，
     # 浏览器不可能再用旧缓存（历史问题：改了样式却看到旧效果，误判"没修好"）
     static_dir = Path(__file__).parent / "static"
-    for asset in ("style.css", "main.js"):
+    # filter-state.js 也要带版本号：单独改这个文件时浏览器会一直用旧缓存
+    for asset in ("style.css", "main.js", "filter-state.js"):
         try:
             ver = int((static_dir / asset).stat().st_mtime)
         except OSError:

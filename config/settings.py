@@ -16,6 +16,10 @@ class AppConfig(BaseModel):
     auto_validate_interval: int = Field(default=1800, ge=30)
     merge_reasoning: bool = True
     verify_ssl: bool = True
+    # 全量健康检测的并发度：越大越快，但免费额度提供商对 RPM 敏感
+    check_concurrency: int = Field(default=5, ge=1, le=32)
+    # 回复语言提示注入策略：auto=按用户语种注入；off=完全不注入（JSON/代码/工具调用场景）
+    lang_hint: str = "auto"
     announcement_url: Optional[str] = None
     # 可信反向代理的 IP 或 CIDR 列表。为空时不信任任何代理头（默认安全）。
     trusted_proxies: list[str] = []
@@ -58,10 +62,24 @@ class Settings:
             ("auto_validate", False),
             ("auto_validate_interval", 1800),
             ("merge_reasoning", True),
+            ("check_concurrency", 5),
+            ("lang_hint", "auto"),
         ):
             if key not in data:
                 data[key] = default
                 changed = True
+        # 纠正非法取值（非法 lang_hint 会让注入逻辑按 auto 处理，这里显式收敛）
+        if str(data.get("lang_hint", "auto")).lower() not in ("auto", "off"):
+            data["lang_hint"] = "auto"
+            changed = True
+        try:
+            _conc = int(data.get("check_concurrency", 5))
+            if _conc < 1 or _conc > 32:
+                data["check_concurrency"] = 5
+                changed = True
+        except (TypeError, ValueError):
+            data["check_concurrency"] = 5
+            changed = True
         # 纠正非法区间（负数会形成忙循环）
         try:
             if int(data.get("auto_validate_interval", 1800)) < 30:

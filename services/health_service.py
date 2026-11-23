@@ -25,6 +25,10 @@ UPSTREAM_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 # 权限变化都会回 404，一次就永久退役会误删正常模型，等一分钟再确认一次。
 RETIRE_RECONFIRM_DELAY = 60
 RETIRE_RECONFIRM_CONCURRENCY = 5
+# 全量检测的并发度（默认值，可在 config.json 用 check_concurrency 覆盖）。
+# 原来完全串行：1000 个模型 × 平均 1 秒 ≈ 17 分钟，并发 5 可压到 3 分钟左右。
+# 不敢开太大：免费额度提供商对 RPM 很敏感，并发过高会集体 429。
+DEFAULT_CHECK_CONCURRENCY = 5
 
 
 class HealthState:
@@ -45,14 +49,20 @@ class HealthState:
         self.model_rate_limited_until: dict = {}  # key -> timestamp (429 冷却时间)
     
     def get_quality_score(self, key: str) -> float:
-        """获取质量分 0~1"""
+        """获取质量分 0~1（只统计最近 QUALITY_WINDOW 次探测）
+
+        以前用的是累计计数 ok/(ok+fail+error)：一次历史故障会永久拉低分数，
+        修好的模型也永远排在新模型后面，路由长期偏向刚上架的（默认 1.0）模型。
+        改成滑动窗口后，连续成功 QUALITY_WINDOW 次就能回到满分。
+        """
         q = self.model_quality.get(key)
         if not q:
             return 1.0
-        total = q["ok"] + q["fail"] + q["error"]
-        if total == 0:
+        outcomes = q.get("outcomes")
+        if not outcomes:
             return 1.0
-        return q["ok"] / total
+        ok = sum(1 for item in outcomes if item == "ok")
+        return ok / len(outcomes)
     
     def get_avg_latency(self, key: str) -> Optional[float]:
         """获取平均延迟"""
@@ -116,11 +126,11 @@ class HealthState:
         return count
     
     def get_test_count(self, key: str) -> int:
-        """获取测试总次数"""
+        """获取测试总次数（滑动窗口内的次数）"""
         q = self.model_quality.get(key)
         if not q:
             return 0
-        return q["ok"] + q["fail"] + q["error"]
+        return len(q.get("outcomes") or ())
     
     def get_priority_score(self, key: str) -> tuple:
         """获取路由优先级分数（测试次数降序，失败次数升序）"""
@@ -173,21 +183,23 @@ class HealthState:
             _schedule_notify("model.recovered", {"key": key})
     
     def update_quality(self, key: str, info: dict) -> None:
-        """更新模型质量滑动窗口"""
+        """更新模型质量滑动窗口（只保留最近 QUALITY_WINDOW 次结果）"""
         q = self.model_quality.get(key)
-        if q is None:
-            q = {"ok": 0, "fail": 0, "error": 0, "latencies": deque(maxlen=QUALITY_WINDOW)}
+        if q is None or "outcomes" not in q:
+            q = {
+                "outcomes": deque(maxlen=QUALITY_WINDOW),
+                "latencies": deque(maxlen=QUALITY_WINDOW),
+            }
             self.model_quality[key] = q
         st = info.get("status", "unknown")
+        # 只有这三类算「一次探测结论」；deleted / eol / rate_limited 属于
+        # 下架与限流，不参与质量分（和原口径一致）
+        if st in ("ok", "fail", "error"):
+            q["outcomes"].append(st)
         if st == "ok":
-            q["ok"] += 1
             lat = info.get("latency_ms")
             if lat:
                 q["latencies"].append(lat)
-        elif st == "fail":
-            q["fail"] += 1
-        elif st == "error":
-            q["error"] += 1
     
     def get_provider_status(self, provider_name: str) -> Optional[str]:
         """获取提供商状态 ok/error"""
@@ -354,7 +366,12 @@ async def check_model(
     aliases: dict,
     max_retries: int = 2,
 ) -> dict:
-    """探测单个模型的健康状态"""
+    """探测单个模型的健康状态。
+
+    重试只对「异常」（连接失败 / 超时）生效；429、410、404、5xx 等有明确
+    状态码的响应直接返回结论——不要再对这些状态码做重试，否则一次 429
+    会被放大成三次请求，越限越狠。
+    """
     actual_model = normalize_model_name(aliases.get(model, model))
     url = base_url.rstrip("/") + "/chat/completions"
     payload = {
@@ -368,14 +385,12 @@ async def check_model(
         "Content-Type": "application/json",
     }
     last_error = None
-    last_response = None
     
     for attempt in range(1, max_retries + 1):
         start = time.time()
         try:
             resp = await client.post(url, json=payload, headers=headers, timeout=UPSTREAM_TIMEOUT)
             latency = round((time.time() - start) * 1000)
-            last_response = resp
             
             if resp.status_code == 200:
                 # 200 不等于成功：部分上游（网关/中转）用 200 包一个 error 体，
@@ -444,21 +459,9 @@ async def check_model(
                 logger.debug("检测模型 %s 失败 (尝试 %d/%d): %s", model, attempt, max_retries, last_error)
                 await asyncio.sleep(1)
     
-    # 所有重试都失败
-    if last_response and last_response.status_code == 429:
-        retry_after = last_response.headers.get("retry-after")
-        try:
-            retry_after = float(retry_after) if retry_after else None
-        except (ValueError, TypeError):
-            retry_after = None
-        return {
-            "status": "rate_limited",
-            "code": last_response.status_code,
-            "latency_ms": latency,
-            "detail": last_response.text[:200],
-            "retry_after": retry_after,
-            "attempt": max_retries,
-        }
+    # 所有重试都失败：只有「异常」会走到这里（带状态码的响应在循环内已直接返回）。
+    # 原来这里还有一段 `if last_response.status_code == 429` 的分支，但 429 在
+    # 上面就已经 return 了，永远进不来，是纯死代码，已删除。
     return {"status": "error", "latency_ms": latency, "detail": last_error}
 
 
@@ -504,6 +507,49 @@ def model_pricing_is_paid(item: dict) -> bool:
     return all(_pricing_is_paid(pr) for pr in pricings)
 
 
+def describe_fetch_error(exc=None, status: int | None = None) -> str:
+    """把「拉模型列表失败」翻译成能定位问题的分层结论。
+
+    以前所有失败都被压成一句「网络/超时/Key 无效」，实测 OpenAI 直连和
+    走本地代理都回 000（不可达）时，页面上看到的还是同一句话，分不清
+    是 DNS 解析失败、代理端口没开、TLS 证书问题，还是 Key 被拒。
+
+    返回中文描述，尽量指出「卡在哪一层」。
+    """
+    if status is not None:
+        if status in (401, 403):
+            return f"HTTP {status}：鉴权被拒，Key 无效、过期或该 Key 无此模型权限"
+        if status == 404:
+            return "HTTP 404：路径不存在，Base URL 应指向 /v1 这类前缀（不要带 /models）"
+        if status == 429:
+            return "HTTP 429：被上游限流，稍后再试"
+        if status >= 500:
+            return f"HTTP {status}：上游服务异常（对方故障，不是本地配置问题）"
+        return f"HTTP {status}：上游拒绝了这次请求"
+
+    text = "" if exc is None else str(exc)
+    low = text.lower()
+    if isinstance(exc, httpx.TimeoutException) or "timed out" in low or "timeout" in low:
+        return "超时：15 秒内没等到响应（网络慢，或上游卡住不回数据）"
+    if isinstance(exc, httpx.ProxyError) or "proxy" in low:
+        return "代理错误：本地代理端口没开或拒绝连接（检查代理软件与端口）"
+    if any(k in low for k in ("name or service not known", "nodename nor servname",
+                             "getaddrinfo", "name resolution", "temporary failure in name")):
+        return "DNS 解析失败：域名写错，或本机无法解析该域名（被墙域名未开代理）"
+    if any(k in low for k in ("certificate", "ssl", "tls")):
+        return "TLS 握手失败：证书校验不通过，可尝试关闭「校验 SSL 证书」"
+    if any(k in low for k in ("connection refused", "connect call failed",
+                             "all connection attempts failed", "connection reset")):
+        return "连接被拒绝：域名/端口不对，或上游没在这个地址提供服务"
+    if isinstance(exc, httpx.ConnectError):
+        return "连接失败：无法建立 TCP 连接（DNS / 端口 / 代理三者之一）"
+    if isinstance(exc, httpx.HTTPError):
+        return f"HTTP 客户端错误：{type(exc).__name__}"
+    if not text:
+        return "未知原因（上游没有返回任何可用信息）"
+    return f"{type(exc).__name__}: {text[:160]}"
+
+
 async def fetch_models(
     client: httpx.AsyncClient,
     base_url: str,
@@ -512,11 +558,15 @@ async def fetch_models(
     aliases: dict,
     context_limits: dict,
     free_out: set | None = None,
+    diag_out: dict | None = None,
 ) -> list[str] | None:
     """拉取模型列表。
 
     free_out: 传入一个 set 时，会把上游 pricing 判定为免费的模型名收集进去，
     供调用方持久化（检测时据此跳过收费模型）。
+
+    diag_out: 传入 dict 时写入失败现场（status: HTTP 码，error: 异常文本），
+    供调用方用 describe_fetch_error() 翻译成可定位问题的提示。
 
     返回值：
     - list[str]：请求成功（可能为空列表，表示上游确实没有可用模型）
@@ -602,9 +652,16 @@ async def fetch_models(
                         break
                     return result
                 last_error = f"HTTP {resp.status_code} ({auth_type})"
+                if diag_out is not None:
+                    # 最后一次尝试的现场留给调用方翻译（越靠后越接近真实原因）
+                    diag_out["status"] = resp.status_code
+                    diag_out["error"] = ""
                 logger.warning("fetch_models attempt %d/%d failed for %s: %s", attempt, max_retries, base_url, last_error)
             except Exception as e:
                 last_error = str(e)
+                if diag_out is not None:
+                    diag_out["status"] = None
+                    diag_out["error"] = f"{type(e).__name__}: {e}"
                 logger.warning("fetch_models attempt %d/%d error for %s: %s", attempt, max_retries, base_url, e)
             if attempt < max_retries:
                 await asyncio.sleep(retry_delay)
@@ -822,10 +879,11 @@ async def run_full_check(on_progress=None) -> dict:
     logger.info("\033[93m▶ 开始全量健康检测，共 %d 个服务商，%d 个模型\033[0m", len(providers), total)
     
     async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
-        # 记录本次检测中已确认删除的模型，避免重复探测
-        already_deleted: set[str] = set()
         retire_by_provider: dict[str, list[str]] = {}  # EOL(410) 确认永久下线，立即移除
         pending_404: dict[str, list[str]] = {}         # 404 待复测确认，不是立即退役
+        # 第一遍：只做本地筛选，把真正要探测的模型收集成任务列表
+        # （冷却中的模型直接跳过并计入进度，不占并发名额）
+        jobs: list[tuple] = []
         for provider in providers:
             # 关闭了检测的提供商整体跳过（不探测、不刷日志）
             if getattr(provider, "check_enabled", True) is False:
@@ -848,10 +906,10 @@ async def run_full_check(on_progress=None) -> dict:
                 len(models_to_check),
                 f"，跳过 {skipped_paid} 个收费模型" if skipped_paid > 0 else "",
             )
-            
+
             for model in models_to_check:
                 key = f"{provider.name}||{model}"
-                
+
                 # 检查是否在冷却期内（429 限速后跳过）
                 if health_state.is_model_rate_limited(key):
                     remaining = health_state.get_model_cooldown_remaining(key)
@@ -860,61 +918,65 @@ async def run_full_check(on_progress=None) -> dict:
                         on_progress(provider.name, model, "cooldown", current + 1, total)
                     current += 1
                     continue
-                
-                # 跳过本次检测中已确认删除的模型（避免重复探测 404）
-                if key in already_deleted:
-                    logger.info("  [跳过] %s | %s (已标记 deleted)", provider.name, model)
-                    if on_progress:
-                        on_progress(provider.name, model, "deleted", current + 1, total)
-                    current += 1
-                    continue
-                
+
                 # 上一轮是 deleted 也照常探测：退役必须由本轮 + 复测两次 404 共同确认。
                 # （原来这里直接退役，等于「一次 404 永久删除」，还会把瞬时抖动放大）
                 prev_status = health_state.health_status.get(key, {}).get("status")
-                
+                jobs.append((provider, model, key, prev_status))
+
+        # 第二遍：并发探测（上限 check_concurrency）。
+        # 全量检测原本完全串行，1000 个模型要 17 分钟；并发后压到 3 分钟量级。
+        # 用信号量而不是分片：单个模型慢不会拖住整组，也不会瞬间打出几十个请求。
+        concurrency = getattr(settings.load(), "check_concurrency", DEFAULT_CHECK_CONCURRENCY)
+        try:
+            concurrency = max(1, min(32, int(concurrency)))
+        except (TypeError, ValueError):
+            concurrency = DEFAULT_CHECK_CONCURRENCY
+        logger.info("\033[93m  并发度 %d（可在 config.json 调整 check_concurrency）\033[0m", concurrency)
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _probe(provider, model, key, prev_status):
+            nonlocal current
+            async with sem:
                 result = await check_model(
                     client, provider.base_url, provider.api_key, model, meta.aliases
                 )
-                results[key] = result
-                health_state.health_status[key] = result
-                health_state.update_quality(key, result)
-                
-                status = result.get("status", "unknown")
-                
-                # EOL(410)：上游明确说「永久下线」，直接退役。
-                # 404：只算候选，等 RETIRE_RECONFIRM_DELAY 秒复测，仍 404 才退役。
-                if status == "eol":
-                    retire_by_provider.setdefault(provider.name, []).append(model)
-                elif status == "deleted":
-                    pending_404.setdefault(provider.name, []).append(model)
-                
-                # 如果是 429 限速，记录冷却时间
-                if status == "rate_limited":
-                    retry_after = result.get("retry_after")
-                    health_state.record_model_rate_limit(key, retry_after)
-                
-                # 如果是 404 deleted，记录到跳过集合，避免重复探测
-                if status == "deleted":
-                    already_deleted.add(key)
-                
-                if status == "ok":
-                    # 模型恢复，清除 deleted 标记
-                    if prev_status == "deleted":
-                        already_deleted.discard(key)
-                        logger.info("  [恢复] %s | %s -> ok (取消 deleted 标记)", provider.name, model)
-                    health_state.record_success(key)
-                elif status in ("deleted", "rate_limited"):
-                    # 404 下架 / 429 限速不是稳定性失败：不计入熔断，
-                    # 避免每轮全量检测把熔断器打爆（下架模型本来就不会被路由选中）
-                    logger.info("  [跳过计数] %s | %s -> %s", provider.name, model, status)
-                else:
-                    health_state.record_fail(key)
-                
-                current += 1
-                if on_progress:
-                    on_progress(provider.name, model, status, current, total)
-                logger.info("  [%d/%d] %s | %s -> %s", current, total, provider.name, model, status)
+            results[key] = result
+            health_state.health_status[key] = result
+            health_state.update_quality(key, result)
+
+            status = result.get("status", "unknown")
+
+            # EOL(410)：上游明确说「永久下线」，直接退役。
+            # 404：只算候选，等 RETIRE_RECONFIRM_DELAY 秒复测，仍 404 才退役。
+            if status == "eol":
+                retire_by_provider.setdefault(provider.name, []).append(model)
+            elif status == "deleted":
+                pending_404.setdefault(provider.name, []).append(model)
+
+            # 如果是 429 限速，记录冷却时间
+            if status == "rate_limited":
+                health_state.record_model_rate_limit(key, result.get("retry_after"))
+
+            if status == "ok":
+                # 模型恢复：记一条日志便于排查「昨天还不行今天好了」
+                if prev_status == "deleted":
+                    logger.info("  [恢复] %s | %s -> ok (取消 deleted 标记)", provider.name, model)
+                health_state.record_success(key)
+            elif status in ("deleted", "rate_limited"):
+                # 404 下架 / 429 限速不是稳定性失败：不计入熔断，
+                # 避免每轮全量检测把熔断器打爆（下架模型本来就不会被路由选中）
+                logger.info("  [跳过计数] %s | %s -> %s", provider.name, model, status)
+            else:
+                health_state.record_fail(key)
+
+            current += 1
+            if on_progress:
+                on_progress(provider.name, model, status, current, total)
+            logger.info("  [%d/%d] %s | %s -> %s", current, total, provider.name, model, status)
+
+        if jobs:
+            await asyncio.gather(*[_probe(*job) for job in jobs])
 
         # 404 候选复测（复用同一个 client）：等 RETIRE_RECONFIRM_DELAY 秒后并发重测，
         # 仍 404 的才并入 retire_by_provider；恢复的按新结果记状态，保留在配置里。

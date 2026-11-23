@@ -1,7 +1,9 @@
 """代理接口路由（OpenAI 兼容）"""
+import hmac
 import json
 import time
 import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import APIRouter, Request, HTTPException, Depends
@@ -13,9 +15,12 @@ import httpx
 from config.settings import settings
 from services.health_service import health_state, RATE_LIMIT_STATUS_CODES
 from services.usage_service import append_usage
+from services.upstream_client import get_shared_client
 
 logger = logging.getLogger("flowgate.proxy")
 UPSTREAM_TIMEOUT = httpx.Timeout(120.0, connect=15.0)
+# 流式请求：推理模型思考阶段可能长时间无字节输出，read 超时放宽到 600 秒避免断流
+STREAM_TIMEOUT = httpx.Timeout(600.0, connect=15.0)
 
 
 def note_rate_limit(provider_name: str, status_code: int, headers=None) -> None:
@@ -37,8 +42,14 @@ router = APIRouter(prefix="/v1")
 
 
 def verify_client(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """客户端鉴权"""
-    if not credentials or credentials.credentials != settings.load().local_api_key:
+    """客户端鉴权。
+
+    用 compare_digest 而不是 != ：字符串比较是短路的，逐字符比到不同就返回，
+    理论上可以用响应时间差一点点猜出 Key（时序侧信道）。
+    """
+    expected = settings.load().local_api_key or ""
+    provided = credentials.credentials if credentials else ""
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
         raise HTTPException(status_code=401, detail="Invalid or missing API Key")
     return credentials.credentials
 
@@ -124,8 +135,16 @@ def detect_user_lang(msgs: list) -> str:
     return "zh"
 
 
-def ensure_lang_reply(body: dict) -> dict:
-    """注入回复语言提示"""
+def ensure_lang_reply(body: dict, mode: str = "auto") -> dict:
+    """注入回复语言提示。
+
+    mode:
+      - "auto"（默认）：按用户消息语种注入中文/英文提示
+      - "off"：完全不注入。JSON 输出、代码生成、工具调用这类任务里，
+        额外塞一段「请始终用简体中文回答」是纯干扰，需要时可在设置里关掉。
+    """
+    if str(mode or "auto").lower() == "off":
+        return body
     msgs = body.get("messages")
     if not isinstance(msgs, list) or not msgs:
         return body
@@ -140,6 +159,24 @@ def ensure_lang_reply(body: dict) -> dict:
     sys_text = ("请使用简体中文回答。" + hint) if lang == "zh" else ("Please respond in English. " + hint)
     msgs.insert(0, {"role": "system", "content": sys_text})
     return body
+
+
+@asynccontextmanager
+async def _upstream_client(verify_ssl: bool):
+    """给出一个上游 client：优先复用进程级连接池，没有则临时新建。
+
+    产出 (client, shared)：shared=True 表示这是共享池，调用方**不要关**它
+    （流式响应在请求函数返回后还要继续读，关早了会断流）。
+    """
+    shared = get_shared_client(verify_ssl)
+    if shared is not None:
+        yield shared, True
+        return
+    client = httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=verify_ssl)
+    try:
+        yield client, False
+    finally:
+        await client.aclose()
 
 
 async def normalize_router_name(name: str) -> str:
@@ -186,7 +223,9 @@ async def get_router_aliases():
 async def proxy_chat(request: Request, force: bool = False):
     """代理聊天补全请求"""
     # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
-    merge_reasoning_enabled = bool(settings.load().merge_reasoning)
+    cfg = settings.load()
+    merge_reasoning_enabled = bool(cfg.merge_reasoning)
+    lang_hint_mode = str(getattr(cfg, "lang_hint", "auto") or "auto")
     try:
         body = await request.json()
     except (ValueError, UnicodeDecodeError) as exc:
@@ -194,7 +233,7 @@ async def proxy_chat(request: Request, force: bool = False):
     if not isinstance(body, dict):
         raise HTTPException(400, "请求体必须是 JSON 对象")
     body = compress_hermes(body)
-    body = ensure_lang_reply(body)
+    body = ensure_lang_reply(body, lang_hint_mode)
     requested_model = body.get("model")
     # 规范化路由组名称（支持英文别名，直接从数据库查询）
     requested_model = await normalize_router_name(requested_model)
@@ -225,7 +264,11 @@ async def proxy_chat(request: Request, force: bool = False):
                 if rest in (provider.models or []):
                     wanted_models = [rest]
                     providers = [provider]
-                break
+                    break
+                # 命中前缀但模型不属于这家：继续看后面的 provider。
+                # 以前 break 写在 if 内、不属于前缀命中就跳出，一旦提供商名字互为前缀
+                # （如 "ab" 与 "ab-2"）就会直接放弃后续所有 provider，导致 503。
+                continue
 
     candidates = []
     for wanted in wanted_models:
@@ -274,7 +317,10 @@ async def proxy_chat(request: Request, force: bool = False):
     logger.info("\033[93m▶ 路由请求: %s (%d 个候选)\033[0m", requested_model, len(candidates))
 
     last_error = "上游无响应"
-    async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
+    verify_ssl = bool(cfg.verify_ssl)
+    # 复用进程级连接池：同一家上游的第二个请求可以直接走已有 TLS 连接，
+    # TTFT 少 100~300ms（原先每个请求都新建 client，握手开销全算在首字延迟里）
+    async with _upstream_client(verify_ssl) as (client, shared_conn):
         for provider, actual_model, requested in candidates:
             upstream_body = dict(body)
             upstream_body["model"] = normalize_model_name(actual_model)
@@ -289,16 +335,22 @@ async def proxy_chat(request: Request, force: bool = False):
             }
             try:
                 if upstream_body.get("stream"):
-                    # 流式响应不能依赖外层 AsyncClient 上下文，响应返回后外层会立即关闭。
-                    # 推理模型思考阶段可能长时间无字节输出，read 超时放宽到 600s 避免断流
-                    stream_client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=15.0), verify=settings.load().verify_ssl)
+                    # 流式响应在请求函数返回后还要继续读字节，不能依赖请求级 client 的
+                    # async with（会在返回 StreamingResponse 后立刻关闭）。
+                    # 有共享池就用它；没有（测试环境 / 刚改过 verify_ssl）才临时建一个。
+                    stream_client = None if shared_conn else httpx.AsyncClient(
+                        timeout=STREAM_TIMEOUT, verify=verify_ssl
+                    )
+                    sender = client if shared_conn else stream_client
                     try:
-                        upstream_request = client.build_request(
-                            "POST", url, json=upstream_body, headers=headers
+                        upstream_request = sender.build_request(
+                            "POST", url, json=upstream_body, headers=headers,
+                            timeout=STREAM_TIMEOUT,
                         )
-                        upstream = await stream_client.send(upstream_request, stream=True)
+                        upstream = await sender.send(upstream_request, stream=True)
                     except BaseException:
-                        await stream_client.aclose()
+                        if stream_client is not None:
+                            await stream_client.aclose()
                         raise
                     if upstream.status_code >= 400:
                         last_error = f"{provider.name}: HTTP {upstream.status_code}"
@@ -318,7 +370,8 @@ async def proxy_chat(request: Request, force: bool = False):
                         except Exception:
                             detail = ""
                         await upstream.aclose()
-                        await stream_client.aclose()
+                        if stream_client is not None:
+                            await stream_client.aclose()
                         # 记录错误详情供日志使用，然后尝试下一候选
                         logger.warning("\033[91m✗ 上游错误: %s · %s · %s\033[0m", provider.name, actual_model, detail[:200])
                         continue
@@ -419,7 +472,8 @@ async def proxy_chat(request: Request, force: bool = False):
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
                             await upstream.aclose()
-                            await stream_client.aclose()
+                            if stream_client is not None:
+                                await stream_client.aclose()
                             if _stream_ok:
                                 health_state.record_success(f"{provider.name}||{requested}")
                                 logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)

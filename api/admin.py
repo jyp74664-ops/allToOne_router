@@ -1,4 +1,5 @@
 """管理接口路由"""
+import asyncio
 import threading
 import time
 import uuid
@@ -17,7 +18,7 @@ from api.auth import (
     verify_admin, verify_admin_password, issue_session_token, security,
     is_local_request, credential_is_valid,
 )
-from services.health_service import check_model, fetch_models, health_state
+from services.health_service import check_model, fetch_models, health_state, describe_fetch_error
 from services.provider_service import ProviderService
 from services.router_manager import RouterService
 from services.usage_service import (
@@ -82,6 +83,14 @@ class AdminLoginIn(BaseModel):
     password: str
 
 
+# 登录防爆破：60 秒内失败 5 次锁定 1 分钟（按来源 IP 计）
+LOGIN_MAX_FAILS = 5
+LOGIN_WINDOW = 60
+_LOGIN_GUARD = threading.Lock()
+_LOGIN_FAILS: dict[str, list[float]] = {}   # ip -> 失败时间戳列表
+_LOGIN_LOCKED: dict[str, float] = {}        # ip -> 解锁时间戳
+
+
 @router.get("/admin/auth-status")
 async def admin_auth_status(request: Request):
     """公开的探测端点：告诉前端本机免登录、局域网是否已登录。"""
@@ -95,13 +104,46 @@ async def admin_auth_status(request: Request):
 
 
 @router.post("/admin/login")
-async def admin_login(body: AdminLoginIn):
+async def admin_login(body: AdminLoginIn, request: Request):
     """管理端登录：校验独立管理密码，签发短期会话 token。
 
     本机访问无需登录；此端点主要供局域网使用。
+
+    防爆破：同一 IP 60 秒内失败 5 次即锁定 1 分钟，且每次失败有递增延迟
+    （0.4s / 0.8s / 1.2s …）。管理密码是 32 位随机串，正常不可能连错，
+    出现连续失败基本就是脚本在试。
     """
+    from api.auth import get_client_ip
+
+    ip = get_client_ip(request) or "unknown"
+    now = time.time()
+    with _LOGIN_GUARD:
+        locked_until = _LOGIN_LOCKED.get(ip, 0)
+        if locked_until > now:
+            wait = int(locked_until - now) + 1
+            raise HTTPException(
+                429,
+                f"登录失败次数过多，请 {wait} 秒后再试",
+                headers={"Retry-After": str(wait)},
+            )
+        fails = [t for t in _LOGIN_FAILS.get(ip, []) if now - t < LOGIN_WINDOW]
+        _LOGIN_FAILS[ip] = fails
+
     if not verify_admin_password(body.password):
+        with _LOGIN_GUARD:
+            fails = _LOGIN_FAILS.setdefault(ip, [])
+            fails.append(time.time())
+            count = len(fails)
+            if count >= LOGIN_MAX_FAILS:
+                _LOGIN_LOCKED[ip] = time.time() + LOGIN_WINDOW
+                logger.warning("管理登录连续失败 %d 次，锁定 IP %s %d 秒", count, ip, LOGIN_WINDOW)
+        # 递增延迟：把爆破成本从「每秒几百次」压到「每分钟个位数」
+        await asyncio.sleep(min(0.4 * count, 2.0))
         raise HTTPException(status_code=401, detail="管理密码错误")
+
+    with _LOGIN_GUARD:
+        _LOGIN_FAILS.pop(ip, None)
+        _LOGIN_LOCKED.pop(ip, None)
     token = issue_session_token()
     return {"token": token, "token_type": "bearer"}
 
@@ -292,14 +334,29 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
     meta = ModelMetaService()
     try:
         free_out: set[str] = set()
+        diag: dict = {}
         async with httpx.AsyncClient(timeout=15, verify=settings.load().verify_ssl) as client:
             models = await fetch_models(
                 client, p.base_url, p.api_key, free_only=False,
                 aliases=meta.aliases, context_limits=meta.context_limits,
-                free_out=free_out,
+                free_out=free_out, diag_out=diag,
             )
         if models is None:
-            return {"ok": False, "models": [], "detail": "上游模型列表拉取失败（网络/超时/Key 无效），本地已勾选的模型不受影响。"}
+            # 失败原因分层：DNS / 连接 / TLS / 代理 / HTTP 状态码各有各的处理办法，
+            # 全部压成「网络/超时/Key 无效」等于什么都没说（实测 OpenAI 直连与
+            # 走本地代理都不可达时，用户无法判断该改哪里）。
+            reason = describe_fetch_error(diag.get("error") or None, diag.get("status"))
+            return {
+                "ok": False,
+                "models": [],
+                "detail": f"上游模型列表拉取失败：{reason}。本地已勾选的模型不受影响。",
+                "diagnosis": {
+                    "stage": reason,
+                    "http_status": diag.get("status"),
+                    "error": diag.get("error") or "",
+                    "base_url": p.base_url,
+                },
+            }
         if not models:
             return {"ok": False, "models": [], "detail": "上游没有返回任何可用模型。"}
         # 上游判定结果有变化才写库，避免每次开弹窗都写一次
@@ -314,7 +371,12 @@ async def get_available_models(name: str, _=Depends(verify_admin)):
         return {"ok": True, "models": models}
     except Exception as e:
         logger.warning("available-models fetch failed for %s: %s", name, e)
-        return {"ok": False, "models": [], "detail": str(e)}
+        return {
+            "ok": False,
+            "models": [],
+            "detail": f"上游模型列表拉取失败：{describe_fetch_error(e)}。本地已勾选的模型不受影响。",
+            "diagnosis": {"stage": describe_fetch_error(e), "error": f"{type(e).__name__}: {e}"},
+        }
 
 
 @router.post("/providers/{name}/fetch-models")
@@ -696,6 +758,61 @@ async def set_merge_reasoning(body: AutoValidateIn, _=Depends(verify_admin)):
     return {"enabled": cfg.merge_reasoning}
 
 
+class LangHintIn(BaseModel):
+    mode: str  # auto / off
+
+
+@router.get("/lang-hint")
+async def get_lang_hint(_=Depends(verify_admin)):
+    """获取回复语言提示注入策略（auto / off）"""
+    mode = str(getattr(settings.load(), "lang_hint", "auto") or "auto").lower()
+    return {"mode": mode if mode in ("auto", "off") else "auto"}
+
+
+@router.post("/lang-hint")
+async def set_lang_hint(body: LangHintIn, _=Depends(verify_admin)):
+    """设置回复语言提示注入策略。
+
+    auto：按用户消息语种注入「请用中文/英文回答」；off：完全不注入。
+    JSON 输出、代码生成、工具调用这类任务不需要语言提示，反而是干扰。
+    """
+    mode = str(body.mode or "").lower()
+    if mode not in ("auto", "off"):
+        raise HTTPException(400, "mode 只能是 auto 或 off")
+    cfg = settings.load()
+    cfg.lang_hint = mode
+    settings.save(cfg)
+    logger.info("lang_hint set to %s", mode)
+    return {"mode": mode}
+
+
+@router.get("/check-concurrency")
+async def get_check_concurrency(_=Depends(verify_admin)):
+    """获取全量检测并发度"""
+    cfg = settings.load()
+    return {"concurrency": int(getattr(cfg, "check_concurrency", 5) or 5)}
+
+
+@router.post("/check-concurrency")
+async def set_check_concurrency(body: dict, _=Depends(verify_admin)):
+    """设置全量检测并发度（1~32）。
+
+    并发越高检测越快，但免费额度提供商对 RPM 敏感：16 家 × 每家几十个模型
+    同时打过去很容易集体 429，默认 5 是折中值。
+    """
+    try:
+        value = int((body or {}).get("concurrency"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "concurrency 必须是整数")
+    if value < 1 or value > 32:
+        raise HTTPException(400, "concurrency 必须在 1~32 之间")
+    cfg = settings.load()
+    cfg.check_concurrency = value
+    settings.save(cfg)
+    logger.info("check_concurrency set to %d", value)
+    return {"concurrency": value}
+
+
 # ============================================================
 # 用量统计接口
 # ============================================================
@@ -777,7 +894,6 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             if key not in model_stats:
                 model_stats[key] = {
                     "ok": 0, "fail": 0, "error": 0, "total": 0, "latencies": [],
-                    "completion_tokens": 0, "ok_total_ms": 0,  # 用于估算生成速度
                 }
             model_stats[key]["total"] += 1
             st = info.get("status", "unknown")
@@ -785,8 +901,6 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
                 model_stats[key]["ok"] += 1
                 if info.get("latency_ms"):
                     model_stats[key]["latencies"].append(info["latency_ms"])
-                    model_stats[key]["ok_total_ms"] += info["latency_ms"]
-                model_stats[key]["completion_tokens"] += info.get("completion_tokens") or 0
             elif st == "fail":
                 model_stats[key]["fail"] += 1
             elif st == "error":
@@ -796,11 +910,9 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
     for key, s in model_stats.items():
         name, model = key.split("||", 1)
         avg_lat = sum(s["latencies"]) / len(s["latencies"]) if s["latencies"] else None
-        # 生成速度：探测请求实际产出的 completion token ÷ 这些请求的总耗时。
-        # 注意探测只生成 5 个 token 且含网络往返，数值偏保守，只适合横向比较。
-        tps = None
-        if s["completion_tokens"] > 0 and s["ok_total_ms"] > 0:
-            tps = round(s["completion_tokens"] / (s["ok_total_ms"] / 1000), 2)
+        # 生成速度（tokens_per_sec）已下线：探针只生成 5 个 token、还夹着网络往返，
+        # 算出来比实测慢 2~5 倍，早就不在表格里展示了。这个字段留着会让维护者
+        # 以为它是可信的，所以连计算一起删掉——真实速度看下面的 speed_records。
         sp = speed_map.get(key)
         speed_ok = sp is not None and sp.status == "ok"
         # 解码速率要过物理校准：上游整包返回时 decode 窗口只有几毫秒，
@@ -828,7 +940,6 @@ async def get_stability(hours: int = 24, _=Depends(verify_admin)):
             "avg_latency_ms": round(avg_lat) if avg_lat else None,
             "min_latency_ms": min(s["latencies"]) if s["latencies"] else None,
             "max_latency_ms": max(s["latencies"]) if s["latencies"] else None,
-            "tokens_per_sec": tps,
             # 真实测速结果（流式 128 token，手动触发才更新；未测过为 None）
             "ttft_ms": sp.ttft_ms if speed_ok else None,
             "real_tps": sp.decode_tps if decode_trusted else None,

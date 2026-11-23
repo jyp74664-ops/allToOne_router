@@ -741,11 +741,6 @@
             case 'avg_latency_ms':
               va = a.avg_latency_ms ?? Infinity; vb = b.avg_latency_ms ?? Infinity;
               return asc ? va - vb : vb - va;
-            case 'tokens_per_sec':
-              // 旧口径（探针估算），列已下线，保留 case 以防旧数据触发
-              va = Number.isFinite(Number(a.tokens_per_sec)) ? Number(a.tokens_per_sec) : -1;
-              vb = Number.isFinite(Number(b.tokens_per_sec)) ? Number(b.tokens_per_sec) : -1;
-              return asc ? va - vb : vb - va;
             case 'ttft_ms': {
               // 没测过的排到最后
               va = Number.isFinite(Number(a.ttft_ms)) ? Number(a.ttft_ms) : Infinity;
@@ -1653,6 +1648,25 @@
       }
     }
 
+    async function toggleLangHint(checked) {
+      const sw = document.getElementById('langHintSwitch');
+      try {
+        const r = await apiFetch('/api/lang-hint', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: checked ? 'auto' : 'off' }),
+        });
+        if (!r.ok) throw new Error('Failed to save lang hint setting');
+        const data = await r.json();
+        if (sw) sw.checked = data.mode !== 'off';
+        showToast(data.mode === 'off' ? '不再注入语言提示' : '按提问语种自动提示', 'ok');
+      } catch (e) {
+        if (sw) sw.checked = !checked;
+        if (e.message !== 'Unauthorized') console.error('toggleLangHint failed:', e);
+        showToast('语言提示设置失败', 'warn');
+      }
+    }
+
     function stopPolling() {
       if (loadTimer) { clearInterval(loadTimer); loadTimer = null; }
       if (detailTimer) { clearInterval(detailTimer); detailTimer = null; }
@@ -2293,6 +2307,7 @@
       loadFilterState();
       restoreAutoValidate();
       restoreMergeReasoning();
+      restoreLangHint();
       loadClientKey();
       loadModelDetails();
       await load();
@@ -2349,6 +2364,16 @@
         if (sw) sw.checked = !!data.enabled;
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error('restoreMergeReasoning failed:', e);
+      }
+    }
+    async function restoreLangHint() {
+      try {
+        const r = await apiFetch('/api/lang-hint');
+        const data = await r.json();
+        const sw = document.getElementById('langHintSwitch');
+        if (sw) sw.checked = data.mode !== 'off';
+      } catch (e) {
+        if (e.message !== 'Unauthorized') console.error('restoreLangHint failed:', e);
       }
     }
     startApp();
