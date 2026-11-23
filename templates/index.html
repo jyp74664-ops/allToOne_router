@@ -283,6 +283,11 @@
           <h2 style="font-size: 16px; font-weight: 600;">最近请求</h2>
           <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
             <span id="requestSummary" style="font-size: 12px; color: var(--text-secondary);"></span>
+            <select id="reqRouterFilter" onchange="switchReqRouter(this.value)"
+              title="按路由组过滤：请求里填的模型名就是路由组名。默认停在你最后一次在「路由配置」里保存的那条路由上"
+              style="padding: 6px 10px; border-radius: 6px; border: 1px solid var(--mac-border); background: transparent; color: var(--text-primary); font-size: 13px; max-width: 190px;">
+              <option value="">全部路由</option>
+            </select>
             <button class="btn log-range btn-primary" data-hours="24" onclick="switchLogRange(24)">24 小时</button>
             <button class="btn log-range" data-hours="168" onclick="switchLogRange(168)">近 7 天</button>
             <button class="btn log-range" data-hours="720" onclick="switchLogRange(720)">近 30 天</button>

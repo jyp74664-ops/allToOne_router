@@ -1904,3 +1904,54 @@ def test_no_candidate_reason_is_not_always_token_count(initialized_db):
     assert r.status_code == 503, r.text
     assert "熔断" in r.text, r.text
     assert "超出全部" not in r.text, r.text
+
+
+def test_request_logs_filter_by_route(local_client, initialized_db):
+    """「最近请求」按路由过滤：model 参数精确匹配 requested_model。
+
+    请求里填的模型名就是路由组名，所以「只看某条路由」等价于按
+    requested_model 精确过滤；doTest 这类测试路由不该混进真实调用里。
+    """
+    from datetime import datetime
+    from database import engine as engine_mod
+    from database.models import RequestLog
+
+    async def seed():
+        async with engine_mod.db.SessionLocal() as s:
+            s.add(RequestLog(trace_id="t-real", timestamp=datetime.now(), requested_model="编码",
+                             ok=False, status_code=503, latency_ms=10, attempts=0))
+            s.add(RequestLog(trace_id="t-test", timestamp=datetime.now(), requested_model="doTest",
+                             ok=True, status_code=200, latency_ms=20, attempts=1))
+            await s.commit()
+    asyncio.run(seed())
+
+    all_rows = local_client.get("/api/request-logs?hours=24").json()["items"]
+    assert {r["requested_model"] for r in all_rows} == {"编码", "doTest"}
+
+    only = local_client.get("/api/request-logs?hours=24&model=编码").json()["items"]
+    assert [r["trace_id"] for r in only] == ["t-real"]
+    assert only[0]["requested_model"] == "编码"
+
+    # 不存在的路由名应返回空，而不是退回全量
+    assert local_client.get("/api/request-logs?hours=24&model=不存在").json()["items"] == []
+
+
+def test_last_router_roundtrip(local_client, monkeypatch):
+    """最后一次保存的路由组名要能读能写，供「最近请求」和路由弹窗做默认值。"""
+    from config.settings import settings as settings_obj
+
+    # 不落盘：这个接口真实实现会写 config.json，测试里只验证内存往返
+    monkeypatch.setattr(settings_obj, "save", lambda cfg: None)
+    monkeypatch.setattr(settings_obj.load(), "last_router", "")
+
+    assert local_client.get("/api/last-router").json()["name"] == ""
+
+    r = local_client.post("/api/last-router", json={"name": "中文长文本"})
+    assert r.status_code == 200, r.text
+    assert local_client.get("/api/last-router").json()["name"] == "中文长文本"
+
+    # 清空（删除路由组时前端会这么调）
+    local_client.post("/api/last-router", json={"name": ""})
+    assert local_client.get("/api/last-router").json()["name"] == ""
+
+    assert local_client.post("/api/last-router", json={"name": "x" * 200}).status_code == 400

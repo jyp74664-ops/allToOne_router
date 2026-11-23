@@ -448,6 +448,29 @@ async def delete_router(name: str, _=Depends(verify_admin)):
     return {"ok": True}
 
 
+@router.get("/last-router")
+async def get_last_router(_=Depends(verify_admin)):
+    """最后一次在「路由配置」里保存的路由组名。
+
+    用来让「最近请求」和路由弹窗默认停在用户真正在用的那条路由上，
+    而不是每次都落到列表最后一个（往往是 doTest 这种测试路由）。
+    """
+    return {"name": str(getattr(settings.load(), "last_router", "") or "")}
+
+
+@router.post("/last-router")
+async def set_last_router(body: dict, _=Depends(verify_admin)):
+    """记录最后一次保存的路由组名（空字符串表示清除）"""
+    name = str((body or {}).get("name") or "").strip()
+    if len(name) > 100:
+        raise HTTPException(400, "路由名过长")
+    cfg = settings.load()
+    cfg.last_router = name
+    settings.save(cfg)
+    logger.info("last_router set to %r", name)
+    return {"name": name}
+
+
 # ============================================================
 # 健康探测接口
 # ============================================================
@@ -1283,9 +1306,14 @@ async def get_request_logs(
     hours: int = 24,
     limit: int = 200,
     only_failed: bool = False,
+    model: str = "",
     _=Depends(verify_admin),
 ):
-    """最近的真实转发记录（含失败）。"""
+    """最近的真实转发记录（含失败）。
+
+    `model` 按请求里的模型名（也就是路由组名，如「编码」「doTest」）精确过滤，
+    供「最近请求」页签只看某一条路由；留空则不过滤。
+    """
     from datetime import datetime, timedelta
     from database.engine import db
     from database.models import RequestLog
@@ -1293,19 +1321,25 @@ async def get_request_logs(
     hours = max(1, min(hours, 24 * 30))
     limit = max(1, min(limit, 1000))
     cutoff = datetime.now() - timedelta(hours=hours)
+    wanted_model = (model or "").strip()
+    conds = [RequestLog.timestamp >= cutoff]
+    if wanted_model:
+        conds.append(RequestLog.requested_model == wanted_model)
     async with db.SessionLocal() as session:
-        stmt = (
-            select(RequestLog)
-            .where(RequestLog.timestamp >= cutoff)
-            .order_by(RequestLog.timestamp.desc())
-            .limit(5000)
-        )
         if only_failed:
+            conds.append(RequestLog.ok == False)  # noqa: E712
             stmt = (
                 select(RequestLog)
-                .where(RequestLog.timestamp >= cutoff, RequestLog.ok == False)  # noqa: E712
+                .where(*conds)
                 .order_by(RequestLog.timestamp.desc())
                 .limit(limit)
+            )
+        else:
+            stmt = (
+                select(RequestLog)
+                .where(*conds)
+                .order_by(RequestLog.timestamp.desc())
+                .limit(5000)
             )
         records = (await session.execute(stmt)).scalars().all()
 

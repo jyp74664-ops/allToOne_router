@@ -29,6 +29,9 @@ class AppConfig(BaseModel):
     cache_ttl: int = Field(default=300, ge=0, le=86400)
     # 路由择优策略：quality=质量分/延迟（默认）；cost=优先便宜的模型
     routing_strategy: str = "quality"
+    # 最后一次在「路由配置」里保存的路由组名。前端用它把「最近请求」的筛选
+    # 和路由弹窗的默认选中停在这条路由上，避免总是落到列表末尾的 doTest
+    last_router: str = ""
     announcement_url: Optional[str] = None
     # 可信反向代理的 IP 或 CIDR 列表。为空时不信任任何代理头（默认安全）。
     trusted_proxies: list[str] = []

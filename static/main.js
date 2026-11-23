@@ -609,10 +609,61 @@
     // 请求日志页签有自己的时间窗，不再跟着「消耗统计」的日/7 天/30 天走
     let logHours = 24;
 
+    // 「最近请求」的路由筛选。默认停在这个浏览器上次选的路由；
+    // 没选过就取「路由配置」里最后一次保存的那条（/api/last-router），
+    // 都不行才显示全部——这样不会被最后一条 doTest 探测刷在最上面。
+    let reqRouter = '';
+    let reqRouterOptionsLoaded = false;
+    const REQ_ROUTER_KEY = 'gateway_req_router';
+
+    function getSavedReqRouter() {
+      try { return localStorage.getItem(REQ_ROUTER_KEY) || ''; } catch (e) { return ''; }
+    }
+    function setSavedReqRouter(name) {
+      try { localStorage.setItem(REQ_ROUTER_KEY, name || ''); } catch (e) {}
+    }
+
+    async function ensureReqRouterOptions() {
+      const sel = document.getElementById('reqRouterFilter');
+      if (reqRouterOptionsLoaded) return;
+      reqRouterOptionsLoaded = true;
+      let names = [];
+      let lastSaved = '';
+      try {
+        const [rRouters, rLast] = await Promise.all([
+          apiFetch('/api/routers').then(r => r.json()),
+          apiFetch('/api/last-router').then(r => r.json()).catch(() => ({})),
+        ]);
+        names = Object.keys((rRouters && rRouters.data) || {});
+        lastSaved = (rLast && rLast.name) || '';
+        lastSavedRouter = lastSaved;
+      } catch (e) {
+        if (e.message !== 'Unauthorized') console.error('load reqRouter options failed:', e);
+      }
+      // 手动选过的优先；没选过就跟最后一次保存的路由走
+      const remembered = getSavedReqRouter() || lastSaved;
+      reqRouter = remembered && names.includes(remembered) ? remembered : '';
+      if (sel) {
+        sel.innerHTML = '<option value="">全部路由</option>' +
+          names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+        sel.value = reqRouter;
+      }
+    }
+
+    function switchReqRouter(name) {
+      reqRouter = name || '';
+      setSavedReqRouter(reqRouter);
+      const sel = document.getElementById('reqRouterFilter');
+      if (sel && sel.value !== reqRouter) sel.value = reqRouter;
+      loadRequestLogs();
+    }
+
     async function loadRequestLogs() {
       try {
+        await ensureReqRouterOptions();
         const failedQuery = onlyFailedRequests ? '&only_failed=true' : '';
-        const l = await apiFetch(`/api/request-logs?hours=${logHours}&limit=100${failedQuery}`).then(r => r.json());
+        const modelQuery = reqRouter ? `&model=${encodeURIComponent(reqRouter)}` : '';
+        const l = await apiFetch(`/api/request-logs?hours=${logHours}&limit=100${failedQuery}${modelQuery}`).then(r => r.json());
         renderRequestLogs(l);
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error('loadRequestLogs failed:', e);
@@ -706,13 +757,20 @@
       if (!bodyEl) return;
       const s = (data && data.summary) || {};
       if (summaryEl) {
+        const scope = reqRouter ? `「${reqRouter}」 · ` : '';
         summaryEl.textContent = s.total
-          ? `共 ${s.total} 条 · 失败 ${s.failed} · 成功率 ${s.success_rate}% · 缓存命中 ${s.cached} · 平均 ${s.avg_latency_ms || '-'} ms`
-          : '暂无请求';
+          ? `${scope}共 ${s.total} 条 · 失败 ${s.failed} · 成功率 ${s.success_rate}% · 缓存命中 ${s.cached} · 平均 ${s.avg_latency_ms || '-'} ms`
+          : (reqRouter ? `${scope}该路由最近 ${logHours} 小时无记录` : '暂无请求');
       }
       const rows = (data && data.items) || [];
       if (!rows.length) {
-        bodyEl.innerHTML = '<tr><td colspan="8" class="empty">暂无请求记录</td></tr>';
+        const msg = reqRouter
+          ? `路由「${esc(reqRouter)}」在最近 ${logHours} 小时内没有转发记录`
+          : '暂无请求记录';
+        const tip = reqRouter
+          ? '<div style="font-size:11px;margin-top:4px;">调用时填的 model 名要和路由组名完全一致；换成「全部路由」可以看所有调用</div>'
+          : '';
+        bodyEl.innerHTML = `<tr><td colspan="8" class="empty">${msg}${tip}</td></tr>`;
         return;
       }
       bodyEl.innerHTML = rows.map(r => {
@@ -2073,6 +2131,7 @@
     /* ============ 路由配置 ============ */
     let routersData = {};
     let selectedRouter = '';
+    let lastSavedRouter = '';   // 最后一次在「路由配置」里保存的路由组名（服务端 last_router 的本地副本）
     let routerPending = new Set();   // 实时勾选集合：切换筛选时保留勾选状态，保存时提交
     let routerSortCol = '';
     let routerSortAsc = true;
@@ -2123,11 +2182,17 @@
       document.getElementById('routerModal').classList.add('show');
       document.getElementById('newRouterName').value = '';
       selectedRouter = '';
-      // 1. 拉取已保存的路由
+      // 1. 拉取已保存的路由 + 最后一次保存的是哪条
+      let lastSaved = '';
       try {
-        const r = await apiFetch('/api/routers');
+        const [r, rLast] = await Promise.all([
+          apiFetch('/api/routers'),
+          apiFetch('/api/last-router').then(x => x.json()).catch(() => ({})),
+        ]);
         const d = await r.json();
         routersData = d.data || {};
+        lastSaved = (rLast && rLast.name) || '';
+        lastSavedRouter = lastSaved;
       } catch (e) { if (e.message !== 'Unauthorized') console.error(e); routersData = {}; }
       // 2. 拉取电路断路器状态
       try {
@@ -2143,12 +2208,12 @@
       pf.innerHTML = '<option value="all">全部提供商</option>' + providers.map(p => `<option value="${p}">${p}</option>`).join('');
       // 4. 渲染路由选择器（不自动选中）
       renderRouterList();
-      // 5. 默认选中最后一个路由组
+      // 5. 默认选中最后一次保存的那条路由；没有记录才退回列表最后一个
       const names = Object.keys(routersData);
       if (names.length > 0) {
-        const lastName = names[names.length - 1];
-        document.getElementById('routerSelect').value = lastName;
-        selectedRouter = lastName;
+        const pick = (lastSaved && names.includes(lastSaved)) ? lastSaved : names[names.length - 1];
+        document.getElementById('routerSelect').value = pick;
+        selectedRouter = pick;
         initRouterPending();
       } else {
         routerPending = new Set();
@@ -2193,8 +2258,18 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(routersData)
         });
-        if (r.ok) showToast(`已删除路由组「${removed}」`, 'ok');
-        else showToast('删除失败', 'error');
+        if (r.ok) {
+          showToast(`已删除路由组「${removed}」`, 'ok');
+          // 删掉的正好是记住的那条，把记录也清掉，别让下次默认选中一个不存在的名字
+          if (lastSavedRouter === removed) {
+            lastSavedRouter = '';
+            apiFetch('/api/last-router', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name: '' }),
+            }).catch(() => {});
+          }
+        } else showToast('删除失败', 'error');
       } catch (e) {
         if (e.message !== 'Unauthorized') { console.error(e); showToast('删除请求错误', 'error'); }
       }
@@ -2202,6 +2277,7 @@
 
     async function renameRouter() {
       if (!selectedRouter) { showToast('请先选择要修改的路由组', 'warn'); return; }
+      const oldName = selectedRouter;
       const newName = prompt('请输入新的路由名称：', selectedRouter);
       if (!newName) return;
       const name = newName.trim();
@@ -2226,8 +2302,18 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(routersData)
         });
-        if (r.ok) showToast(`已重命名为「${name}」`, 'ok');
-        else showToast('重命名失败', 'error');
+        if (r.ok) {
+          showToast(`已重命名为「${name}」`, 'ok');
+          // 改名的那条如果正是记住的路由，记录跟着改，否则下次会指向旧名字
+          if (lastSavedRouter === oldName) {
+            lastSavedRouter = name;
+            apiFetch('/api/last-router', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ name }),
+            }).catch(() => {});
+          }
+        } else showToast('重命名失败', 'error');
       } catch (e) {
         if (e.message !== 'Unauthorized') { console.error(e); showToast('重命名请求错误', 'error'); }
       }
@@ -2512,6 +2598,18 @@
         if (r.ok) {
           showToast(`已保存「${selectedRouter}」：${finalModels.length} 个模型`, 'ok');
           renderRouterModelTable();
+          // 记住这条：下次开弹窗、「最近请求」页签都默认停在这里
+          apiFetch('/api/last-router', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: selectedRouter }),
+          }).then(() => {
+            // 用户没手动选过筛选时，让「最近请求」跟着换成刚保存的这条
+            if (!getSavedReqRouter()) {
+              reqRouterOptionsLoaded = false;
+              reqRouter = selectedRouter;
+            }
+          }).catch(() => {});
         } else {
           showToast('保存失败', 'error');
         }
