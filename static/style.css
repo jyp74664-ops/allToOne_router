@@ -374,28 +374,30 @@
       background: rgba(255, 255, 255, 0.14);
     }
 
-    /* 次要动作：默认透明，hover 才浮出底色，避免和主按钮抢 */
-    .btn-quiet {
+    /* 次要动作：默认透明，hover 才浮出底色，避免和主按钮抢。
+       必须写成 .btn.btn-quiet：.btn 在下面 410 行定义，同优先级会把它覆盖成白底边框，
+       之前三个按钮长得一模一样、挤成一排就是这个原因。 */
+    .btn.btn-quiet {
       background: transparent;
       border-color: transparent;
       box-shadow: none;
       color: var(--text-secondary);
     }
 
-    .btn-quiet:hover {
+    .btn.btn-quiet:hover {
       background: rgba(255, 255, 255, 0.85);
       border-color: var(--mac-border);
       color: var(--text-primary);
       box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
     }
 
-    [data-theme="dark"] .btn-quiet {
+    [data-theme="dark"] .btn.btn-quiet {
       background: transparent;
       border-color: transparent;
       color: var(--text-secondary);
     }
 
-    [data-theme="dark"] .btn-quiet:hover {
+    [data-theme="dark"] .btn.btn-quiet:hover {
       background: rgba(255, 255, 255, 0.12);
       border-color: rgba(255, 255, 255, 0.14);
       color: var(--text-primary);

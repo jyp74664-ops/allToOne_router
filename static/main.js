@@ -860,10 +860,17 @@
         const cacheMark = r.cached ? ' 🗄' : '';
         const streamMark = r.stream ? ' · 流式' : '';
         const err = r.error || '';
+        // 上游模型名本身常带渠道前缀（如 nvidia/nemotron-...），再拼一次 provider
+        // 就成了 nvidia · nvidia/nemotron-...，看着像两条不同的信息。
+        const provLabel = r.provider || '';
+        const upLabel = r.upstream_model || r.requested_model || '-';
+        const channel = provLabel && !upLabel.startsWith(provLabel + '/')
+          ? `${provLabel} · ${upLabel}`
+          : upLabel;
         return `<tr${r.ok ? '' : ' style="background:rgba(255,80,80,0.07);"'}>
           <td style="font-size:12px;">${new Date(r.ts).toLocaleString()}</td>
           <td>
-            <div>${esc(r.provider || '-')} · ${esc(r.upstream_model || r.requested_model || '-')}</div>
+            <div>${esc(channel)}</div>
             <div style="font-size:11px;color:var(--text-secondary);">${esc(r.requested_model || '')}</div>
           </td>
           <td>${okCell}${cacheMark}</td>

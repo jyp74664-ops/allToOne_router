@@ -73,9 +73,9 @@
             </svg>
           </button>
           <!-- 立即检测会真的跑一轮探测、消耗上游额度，误点代价高：
-               与工具类按钮之间留一道分隔线作视觉缓冲 -->
+               两个工具类按钮做成透明文字样式，只有它保留按钮底色，形成「工具 → 动作」层次 -->
           <span class="tool-sep"></span>
-          <button class="btn btn-quiet" onclick="checkAll()" id="checkAllBtn"
+          <button class="btn" onclick="checkAll()" id="checkAllBtn"
             title="只检测各服务商下已勾选（启用）的模型，未勾选的模型不会探测，也不消耗上游额度">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
               stroke-linecap="round" stroke-linejoin="round">
