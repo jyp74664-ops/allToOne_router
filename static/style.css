@@ -197,19 +197,209 @@
       padding: 30px;
     }
 
+    /* ===== 头部：页签（分段控件） + 工具条 ===== */
     .header-actions {
       display: flex;
       flex-direction: column;
       align-items: stretch;
-      gap: 10px;
-      margin-bottom: 24px;
+      gap: 12px;
+      /* 结束到内容区留出呼吸空间，头部不再贴着第一张卡 */
+      margin-bottom: 26px;
+      padding-bottom: 18px;
+      position: relative;
     }
 
-    /* 两排布局：第一排页签，第二排工具栏。
-       以前工具栏挤在页签右侧，窗口一窄就压住页签导致点不到，改成整排下沉。 */
-    .header-actions .ha-left { min-width: 0; flex-wrap: wrap; }
-    .header-actions .ha-right { min-width: 0; }
-    .ha-tools { flex-wrap: wrap; justify-content: flex-start; }
+    /* 底部分隔：向右淡出的发丝线，比整条硬边框轻 */
+    .header-actions::after {
+      content: "";
+      position: absolute;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      height: 1px;
+      background: linear-gradient(90deg,
+          rgba(0, 0, 0, 0.10) 0%,
+          rgba(0, 0, 0, 0.06) 42%,
+          rgba(0, 0, 0, 0) 100%);
+    }
+
+    [data-theme="dark"] .header-actions::after {
+      background: linear-gradient(90deg,
+          rgba(255, 255, 255, 0.14) 0%,
+          rgba(255, 255, 255, 0.07) 42%,
+          rgba(255, 255, 255, 0) 100%);
+    }
+
+    /* 第一排：页签靠左、开关胶囊靠右，两头对齐把空白吃掉 */
+    .ha-toprow {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px 18px;
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    /* 页签做成 iOS 分段控件：凹槽底 + 激活块浮起 */
+    .main-tabs {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      padding: 4px;
+      border-radius: 12px;
+      background: rgba(0, 0, 0, 0.045);
+      border: 1px solid rgba(0, 0, 0, 0.05);
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.04);
+      flex-wrap: wrap;
+      min-width: 0;
+    }
+
+    [data-theme="dark"] .main-tabs {
+      background: rgba(255, 255, 255, 0.06);
+      border-color: rgba(255, 255, 255, 0.07);
+      box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.25);
+    }
+
+    /* 三个开关改成胶囊：比「开关 + 文字」占位小，成组靠右不抢视线 */
+    .switch-pills {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-left: auto;
+    }
+
+    .pill-toggle {
+      position: relative;
+      display: inline-flex;
+      cursor: pointer;
+    }
+
+    .pill-toggle input {
+      position: absolute;
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .pill-body {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      font-size: 12.5px;
+      line-height: 1;
+      color: var(--text-secondary);
+      background: rgba(0, 0, 0, 0.035);
+      border: 1px solid transparent;
+      transition: background .18s ease, color .18s ease, border-color .18s ease;
+      white-space: nowrap;
+      user-select: none;
+    }
+
+    [data-theme="dark"] .pill-body {
+      background: rgba(255, 255, 255, 0.06);
+    }
+
+    .pill-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--unknown);
+      transition: background .18s ease, box-shadow .18s ease;
+      flex-shrink: 0;
+    }
+
+    .pill-toggle:hover .pill-body {
+      background: rgba(0, 0, 0, 0.06);
+      color: var(--text-primary);
+    }
+
+    [data-theme="dark"] .pill-toggle:hover .pill-body {
+      background: rgba(255, 255, 255, 0.1);
+    }
+
+    .pill-toggle input:checked + .pill-body {
+      background: rgba(0, 122, 255, 0.10);
+      border-color: rgba(0, 122, 255, 0.22);
+      color: var(--accent-primary);
+      font-weight: 500;
+    }
+
+    .pill-toggle input:checked + .pill-body .pill-dot {
+      background: var(--accent-primary);
+      box-shadow: 0 0 0 3px rgba(0, 122, 255, 0.16);
+    }
+
+    .pill-toggle input:focus-visible + .pill-body {
+      outline: 2px solid var(--accent-primary);
+      outline-offset: 2px;
+    }
+
+    /* 第二排：动作按钮。整条铺一层极淡的主题色渐变，和下面的白卡片分层 */
+    .tool-bar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      padding: 8px 10px;
+      border-radius: 12px;
+      background: linear-gradient(96deg,
+          rgba(0, 122, 255, 0.065) 0%,
+          rgba(0, 122, 255, 0.022) 38%,
+          rgba(0, 122, 255, 0.004) 72%,
+          rgba(0, 122, 255, 0) 100%);
+      border: 1px solid rgba(0, 122, 255, 0.09);
+    }
+
+    [data-theme="dark"] .tool-bar {
+      background: linear-gradient(96deg,
+          rgba(10, 132, 255, 0.16) 0%,
+          rgba(10, 132, 255, 0.06) 38%,
+          rgba(10, 132, 255, 0.012) 72%,
+          rgba(10, 132, 255, 0) 100%);
+      border-color: rgba(10, 132, 255, 0.16);
+    }
+
+    .tool-sep {
+      width: 1px;
+      height: 18px;
+      background: rgba(0, 0, 0, 0.10);
+      margin: 0 3px;
+      flex-shrink: 0;
+    }
+
+    [data-theme="dark"] .tool-sep {
+      background: rgba(255, 255, 255, 0.14);
+    }
+
+    /* 次要动作：默认透明，hover 才浮出底色，避免和主按钮抢 */
+    .btn-quiet {
+      background: transparent;
+      border-color: transparent;
+      box-shadow: none;
+      color: var(--text-secondary);
+    }
+
+    .btn-quiet:hover {
+      background: rgba(255, 255, 255, 0.85);
+      border-color: var(--mac-border);
+      color: var(--text-primary);
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
+    }
+
+    [data-theme="dark"] .btn-quiet {
+      background: transparent;
+      border-color: transparent;
+      color: var(--text-secondary);
+    }
+
+    [data-theme="dark"] .btn-quiet:hover {
+      background: rgba(255, 255, 255, 0.12);
+      border-color: rgba(255, 255, 255, 0.14);
+      color: var(--text-primary);
+    }
 
     .header-actions h1 {
       font-size: 24px;
@@ -269,31 +459,56 @@
       display: block;
     }
 
+    /* 主按钮统一走渐变，比纯色更有厚度；全局生效（弹窗里的保存也同样） */
     .btn-primary {
-      background: var(--accent-primary);
-      border-color: rgba(0, 0, 0, 0.05);
+      background: linear-gradient(135deg, #2F88FF 0%, #007AFF 55%, #0064D2 100%);
+      border-color: rgba(0, 0, 0, 0.06);
       color: white;
+      box-shadow: 0 1px 2px rgba(0, 122, 255, 0.28), inset 0 1px 0 rgba(255, 255, 255, 0.18);
     }
 
     .btn-primary:hover {
-      background: var(--accent-primary-hover);
+      background: linear-gradient(135deg, #4A96FF 0%, #1A86FF 55%, #0070E0 100%);
     }
 
     [data-theme="dark"] .btn-primary {
+      background: linear-gradient(135deg, #3D97FF 0%, #0A84FF 55%, #006BD6 100%);
       border-color: rgba(0, 0, 0, 0.1);
     }
 
+    [data-theme="dark"] .btn-primary:hover {
+      background: linear-gradient(135deg, #56A3FF 0%, #2490FF 55%, #0078E8 100%);
+    }
+
+    /* 页签本体：透明底，靠 .main-tabs 的凹槽托住；
+       激活态用紫蓝渐变浮起，形成「分段控件」该有的层次 */
     .main-tab-btn {
-      transition: all 0.2s ease;
+      border: none !important;
+      background: transparent;
+      box-shadow: none;
+      padding: 7px 16px;
+      border-radius: 9px;
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      transition: background 0.18s ease, color 0.18s ease, box-shadow 0.18s ease;
     }
+
     .main-tab-btn:hover:not(.active-tab) {
-      background: rgba(107, 92, 230, 0.12) !important;
-      color: #6B5CE6 !important;
+      background: rgba(255, 255, 255, 0.62) !important;
+      color: var(--text-primary) !important;
+      border-color: transparent !important;
     }
+
+    [data-theme="dark"] .main-tab-btn:hover:not(.active-tab) {
+      background: rgba(255, 255, 255, 0.10) !important;
+    }
+
     .main-tab-btn.active-tab {
-      background: #6B5CE6 !important;
+      background: linear-gradient(135deg, #7C6BF7 0%, #5B8DEF 100%) !important;
       color: #fff !important;
       font-weight: 600 !important;
+      box-shadow: 0 2px 8px -2px rgba(91, 141, 239, 0.55), inset 0 1px 0 rgba(255, 255, 255, 0.22) !important;
     }
 
     .poll-bar {

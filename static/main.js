@@ -2092,15 +2092,15 @@
         const intervalMin = Math.round((data.interval || 1800) / 60);
         showToast(
           data.enabled
-            ? `自动验证链接已开启（每 ${intervalMin} 分钟）`
-            : '自动验证链接已关闭',
+            ? `自动巡检已开启（每 ${intervalMin} 分钟）`
+            : '自动巡检已关闭',
           'ok'
         );
       } catch (e) {
         if (e.message !== 'Unauthorized') console.error("toggleAutoValidate failed:", e);
         const sw = document.getElementById('autoValidateSwitch');
         if (sw) sw.checked = !checked;  // 失败回滚，避免状态与实际不符
-        showToast('自动验证链接设置失败', 'warn');
+        showToast('自动巡检设置失败', 'warn');
       }
     }
 
