@@ -2218,6 +2218,10 @@
     }
 
     /* ============ 路由配置 ============ */
+    // 孤儿键前缀：已存进路由组、但当前供应商列表里已经不存在的模型。
+    // 长度必须用常量取，别再手写 slice(10)——少切一位会让键多带一个「|」，
+    // 于是取消勾选时 delete 的键和 Set 里的键对不上，勾了取消不掉。
+    const ORPHAN_PREFIX = '__orphan__||';
     let routersData = {};
     let selectedRouter = '';
     let lastSavedRouter = '';   // 最后一次在「路由配置」里保存的路由组名（服务端 last_router 的本地副本）
@@ -2454,7 +2458,7 @@
       // 供应商列表中找不到的裸名 → 孤儿键（取消勾选即可移除）
       const matched = new Set([...routerPending].map(k => k.split('||')[1]));
       savedNames.forEach(sn => {
-        if (!matched.has(sn)) routerPending.add('__orphan__||' + sn);
+        if (!matched.has(sn)) routerPending.add(ORPHAN_PREFIX + sn);
       });
     }
 
@@ -2478,6 +2482,18 @@
       // 直接同步渲染，避免等待 health-status 请求导致的延迟
       _doRenderRouterTable();
       updateRouterSelectedCount();
+    }
+
+    /* 孤儿行（模型已不在供应商列表）改用什么方式都删得掉：
+       勾掉复选框、点行尾「✕ 移除」，效果一样——从待保存集合里去掉。 */
+    function removeOrphanModel(name) {
+      if (!selectedRouter) return;
+      const key = ORPHAN_PREFIX + name;
+      if (!routerPending.has(key)) { _doRenderRouterTable(); return; }
+      routerPending.delete(key);
+      _doRenderRouterTable();
+      updateRouterSelectedCount();
+      showToast(`已移除「${name}」，点「保存路由」后生效`, 'ok');
     }
 
     function updateRouterSelectedCount() {
@@ -2559,7 +2575,7 @@
       // 孤儿键（__orphan__||裸名）：供应商列表中已不存在 → 灰色提示行（便于取消勾选删除）
       const orphans = [];
       currentModels.forEach(key => {
-        if (key.startsWith('__orphan__')) orphans.push(key.slice(10));
+        if (key.startsWith(ORPHAN_PREFIX)) orphans.push(key.slice(ORPHAN_PREFIX.length));
       });
 
       let list = [...rowMap.values()];
@@ -2652,8 +2668,8 @@
       // 追加孤儿行：已保存但不在当前供应商列表中
       orphans.forEach(m => {
         html += `<tr style="opacity:0.6;">
-      <td style="padding:4px 8px;text-align:center;"><input type="checkbox" class="router-model-cb" value="__orphan__||${esc(m)}" checked onchange="onRouterModelToggle(this)" title="该模型不在当前供应商列表中，取消勾选并保存可移除"></td>
-      <td colspan="8" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${esc(m)} <span style="font-size:11px;">（不在当前供应商列表中）</span></td>
+      <td style="padding:4px 8px;text-align:center;"><input type="checkbox" class="router-model-cb" value="${esc(ORPHAN_PREFIX + m)}" checked onchange="onRouterModelToggle(this)" title="该模型不在当前供应商列表中，取消勾选并保存可移除"></td>
+      <td colspan="8" style="padding:4px 8px;font-size:13px;color:var(--text-secondary);">⚠️ ${esc(m)} <span style="font-size:11px;">（不在当前供应商列表中）</span><button class="btn btn-quiet" style="float:right;padding:2px 10px;font-size:12px;" data-orphan="${esc(m)}" onclick="removeOrphanModel(this.dataset.orphan)">✕ 移除</button></td>
     </tr>`;
       });
 
