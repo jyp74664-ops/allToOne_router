@@ -1955,3 +1955,49 @@ def test_last_router_roundtrip(local_client, monkeypatch):
     assert local_client.get("/api/last-router").json()["name"] == ""
 
     assert local_client.post("/api/last-router", json={"name": "x" * 200}).status_code == 400
+
+
+def test_request_log_survives_client_cancel(initialized_db):
+    """客户端中途断开时请求日志不能丢。
+
+    病灶：取消状态下任何 await 都会立刻再抛 CancelledError，以前流式
+    finally 里直接 `await record_request(...)` 根本跑不完，表现成
+    「明明调用了接口，最近请求里什么都没有」。
+    """
+    from sqlalchemy import select
+    from api import proxy as proxy_mod
+    from database.models import RequestLog
+
+    db = initialized_db
+
+    async def scenario():
+        async def worker():
+            asyncio.current_task().cancel()  # 模拟请求被客户端中断
+            await proxy_mod._record_safely(
+                trace_id="cancel-trace", requested_model="取消中的请求",
+                stream=True, ok=False, error="流未正常结束（客户端断开或上游截断）",
+            )
+
+        task = asyncio.ensure_future(worker())
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        # 等后台写库任务收尾
+        for _ in range(300):
+            if not proxy_mod._bg_tasks:
+                break
+            await asyncio.sleep(0.01)
+
+    asyncio.run(scenario())
+
+    async def read_rows():
+        async with db.SessionLocal() as s:
+            res = await s.execute(select(RequestLog).where(RequestLog.trace_id == "cancel-trace"))
+            return res.scalars().all()
+
+    rows = asyncio.run(read_rows())
+    assert len(rows) == 1, "被取消的请求也必须留下一条日志"
+    assert rows[0].ok is False
+    assert rows[0].stream is True
+    assert "客户端断开" in (rows[0].error or "")

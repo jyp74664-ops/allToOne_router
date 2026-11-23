@@ -1,4 +1,5 @@
 """代理接口路由（OpenAI 兼容）"""
+import asyncio
 import hmac
 import json
 import time
@@ -42,6 +43,54 @@ def note_rate_limit(provider_name: str, status_code: int, headers=None) -> None:
 
 security = HTTPBearer(auto_error=False)
 router = APIRouter(prefix="/v1")
+
+# 后台写日志任务的强引用池：不然 task 可能被 GC 掉，日志就丢了
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro):
+    """把协程丢给事件循环独立跑，不受当前请求的取消影响。"""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    try:
+        task = loop.create_task(coro)
+    except RuntimeError:  # 事件循环正在关闭
+        return None
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+    return task
+
+
+async def _record_safely(**kwargs) -> None:
+    """写一条请求日志，且保证「客户端中途断开」时也不会丢。
+
+    病灶：请求被取消（客户端关页面、DSH 重连、点停止）时，整个协程带着
+    CancelledError 往 finally 里走，这时任何 await 都会立刻再抛取消异常，
+    `await record_request(...)` 根本没执行完——表现就是「明明调用了接口，
+    最近请求里什么也没有」。日志最后还停在几小时前那次正常请求上。
+
+    对策：先 ensure_future 起独立 task，再用 shield 等它。外层被取消时
+    shield 只让 await 抛取消，task 继续在后台把行写完。
+    """
+    task = asyncio.current_task()
+    cancelling = task is not None and getattr(task, "cancelling", lambda: 0)() > 0
+    if cancelling:
+        # 已经在取消流程里，await 一定是白费的，直接扔后台
+        _spawn_bg(record_request(**kwargs))
+        return
+    fut = asyncio.ensure_future(record_request(**kwargs))
+    _bg_tasks.add(fut)
+    fut.add_done_callback(_bg_tasks.discard)
+    try:
+        await asyncio.shield(fut)
+    except asyncio.CancelledError:
+        raise
+    except RuntimeError:
+        # async generator 被 aclose() 时（GeneratorExit 上下文）不能再挂起，
+        # 但 fut 已被 shield 保护，日志照样会写完
+        pass
 
 
 async def verify_client(
@@ -343,7 +392,7 @@ async def forward_chat(
             meta_info = payload.pop("_fg_meta", {}) or {}
             logger.info("\033[36m✓ 缓存命中: %s\033[0m", requested_model)
             usage = payload.get("usage") or {}
-            await record_request(
+            await _record_safely(
                 trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
                 provider=meta_info.get("provider"), upstream_model=meta_info.get("model"),
                 stream=False, ok=True, status_code=200, attempts=0,
@@ -446,7 +495,7 @@ async def forward_chat(
                 parts.append(f"{len(skip_ctx)} 个上下文不足")
             reason = "全部候选被跳过（%s，请求约 %d tokens）" % ("、".join(parts), est_tokens)
         logger.error("\033[91m✗ 无可用的模型候选: %s｜%s\033[0m", requested_model, reason)
-        await record_request(
+        await _record_safely(
             trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
             stream=bool(body.get("stream")), ok=False, status_code=503, attempts=0,
             latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
@@ -639,9 +688,11 @@ async def forward_chat(
                                     logger.warning("\033[93m⚠ 流式事件处理异常: %s\033[0m", e)
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
-                            await upstream.aclose()
-                            if stream_client is not None:
-                                await stream_client.aclose()
+                            # 顺序有讲究：**先记账、最后关连接**。
+                            # 客户端断开时整个协程带着 CancelledError 进 finally，
+                            # 这时第一个 await 就会立刻再抛取消异常，把日志代码
+                            # 全跳过——以前 aclose() 放在最前面，于是「调用了接口
+                            # 却没有任何记录」，日志永远停在几个小时前那条。
                             usage_obj = usage_obj or {}
                             if _stream_ok:
                                 health_state.record_success(f"{provider.name}||{requested}")
@@ -664,7 +715,7 @@ async def forward_chat(
                                 logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
                             pt = usage_obj.get("prompt_tokens", 0) or 0
                             ct = usage_obj.get("completion_tokens", 0) or 0
-                            await record_request(
+                            await _record_safely(
                                 trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
                                 provider=provider.name, upstream_model=actual_model, stream=True,
                                 ok=_stream_ok, status_code=200 if _stream_ok else None,
@@ -674,7 +725,19 @@ async def forward_chat(
                                 error=None if _stream_ok else "流未正常结束（客户端断开或上游截断）",
                             )
                             if vkey_id:
-                                add_tokens(vkey_id, pt + ct)
+                                try:
+                                    add_tokens(vkey_id, pt + ct)
+                                except asyncio.CancelledError:
+                                    pass
+                            for _conn in (upstream, stream_client):
+                                if _conn is None:
+                                    continue
+                                try:
+                                    await _conn.aclose()
+                                except (asyncio.CancelledError, RuntimeError):
+                                    # 已在取消流程里：连接由 httpx 自己回收，别让它把
+                                    # 日志/用量这些副作用一起打断
+                                    pass
 
                     return StreamingResponse(
                         stream_response(),
@@ -740,7 +803,7 @@ async def forward_chat(
                         cached_value = dict(result)
                         cached_value["_fg_meta"] = {"provider": provider.name, "model": actual_model}
                         cache_service.put(cache_key, cached_value)
-                    await record_request(
+                    await _record_safely(
                         trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
                         provider=provider.name, upstream_model=actual_model, stream=False,
                         ok=True, status_code=response.status_code, attempts=attempts,
@@ -767,7 +830,7 @@ async def forward_chat(
                 logger.warning("\033[91m✗ 失败: %s · %s (%s)\033[0m", provider.name, actual_model, exc)
                 health_state.record_fail(f"{provider.name}||{requested}")
 
-    await record_request(
+    await _record_safely(
         trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
         stream=bool(body.get("stream")), ok=False, status_code=503, attempts=attempts,
         latency_ms=int((time.time() - started) * 1000), api_key_name=api_key_name,
