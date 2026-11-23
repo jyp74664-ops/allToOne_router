@@ -119,6 +119,22 @@ class Database:
                 ))
             except Exception:
                 pass  # 列已存在则忽略
+            # 路由别名唯一：先把历史重复（保留 id 最小的那个）置空，再建部分唯一索引兜底。
+            # 没有这条约束时，两个组用同一别名会让 model 解析出现歧义。
+            try:
+                await conn.execute(text(
+                    "UPDATE router_groups SET alias = NULL "
+                    "WHERE alias IS NOT NULL AND alias != '' AND id NOT IN ("
+                    "  SELECT MIN(id) FROM router_groups "
+                    "  WHERE alias IS NOT NULL AND alias != '' GROUP BY alias"
+                    ")"
+                ))
+                await conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ux_router_groups_alias "
+                    "ON router_groups(alias) WHERE alias IS NOT NULL AND alias != ''"
+                ))
+            except Exception as exc:
+                logger.warning("建立路由别名唯一索引失败（不影响使用）: %s", exc)
         # 迁移历史 JSONL 数据（如果存在）
         await self._migrate_legacy_data()
     

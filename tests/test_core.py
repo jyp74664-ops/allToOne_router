@@ -991,3 +991,255 @@ def test_proxy_stream_429_puts_provider_in_cooldown(initialized_db):
     assert r.status_code == 503, r.text
     assert health_state.check_rate_limit("p-429") is True, "429 后该 provider 应进冷却"
 
+
+# ============================================================
+# 审计修复回归（2026-11-23 第二批：404 复测 / 测速任务引用 / 别名 / 检测互斥）
+# ============================================================
+
+def test_reconfirm_404_candidate_recovers_on_second_probe():
+    """第一次 404 只算候选；复测恢复成 200 就不退役（审计 #8）。"""
+    import httpx
+    from services.health_service import reconfirm_retire_candidates, health_state
+
+    def handler(request):
+        return httpx.Response(200, json={
+            "choices": [{"message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 1},
+        })
+
+    class P:
+        name = "p-recover"
+        base_url = "https://ok/v1"
+        api_key = "k"
+
+    key = "p-recover||m"
+    results = {key: {"status": "deleted", "code": 404}}
+    try:
+        confirmed = asyncio.run(reconfirm_retire_candidates(
+            _mock_http(handler), {}, {"p-recover": ["m"]}, results,
+            {"p-recover": P()}, delay=0,
+        ))
+        assert confirmed == {}, confirmed
+        assert results[key]["status"] == "ok", "复测结果要写回 results"
+    finally:
+        health_state.health_status.pop(key, None)
+
+
+def test_reconfirm_404_twice_confirms_retire():
+    """两次都 404 才确认退役。"""
+    import httpx
+    from services.health_service import reconfirm_retire_candidates, health_state
+
+    def handler(request):
+        return httpx.Response(404, json={"error": {"message": "model not found"}})
+
+    class P:
+        name = "p-gone"
+        base_url = "https://gone/v1"
+        api_key = "k"
+
+    key = "p-gone||m"
+    try:
+        confirmed = asyncio.run(reconfirm_retire_candidates(
+            _mock_http(handler), {}, {"p-gone": ["m"]}, {},
+            {"p-gone": P()}, delay=0,
+        ))
+        assert confirmed == {"p-gone": ["m"]}, confirmed
+    finally:
+        health_state.health_status.pop(key, None)
+
+
+def test_full_check_keeps_model_when_first_404_then_recovers(initialized_db, monkeypatch):
+    """全量检测：单次 404 不再直接退役，复测恢复即保留（审计 #8）。"""
+    from sqlalchemy import select
+    from database import engine as engine_mod
+    from database.models import Provider
+    from services import health_service
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="p-flaky", base_url="https://flaky/v1", api_key="k",
+                           models=["m1"], disabled_models=[], retired_models=[],
+                           free_models=[], free_only=False, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    calls = []
+
+    async def fake_check(client, base_url, api_key, model, aliases, max_retries=2):
+        calls.append(model)
+        if len(calls) == 1:
+            return {"status": "deleted", "code": 404, "latency_ms": 20}
+        return {"status": "ok", "code": 200, "latency_ms": 20}
+
+    monkeypatch.setattr(health_service, "check_model", fake_check)
+    monkeypatch.setattr(health_service, "RETIRE_RECONFIRM_DELAY", 0)
+
+    asyncio.run(health_service.run_full_check())
+    assert len(calls) == 2, f"应探测 + 复测各一次，实际 {calls}"
+
+    async def read():
+        async with db.SessionLocal() as s:
+            return (await s.execute(select(Provider).where(Provider.name == "p-flaky"))).scalar_one()
+    p = asyncio.run(read())
+    assert p.models == ["m1"], "复测恢复的模型不能被退役删除"
+    assert list(p.retired_models or []) == []
+
+
+def test_full_check_retires_only_after_second_404(initialized_db, monkeypatch):
+    """连续两次 404 才真正退役：从 models 摘掉并写进 retired_models。"""
+    from sqlalchemy import select
+    from database import engine as engine_mod
+    from database.models import Provider
+    from services import health_service
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            s.add(Provider(name="p-dead", base_url="https://dead/v1", api_key="k",
+                           models=["gone-model"], disabled_models=[], retired_models=[],
+                           free_models=[], free_only=False, check_enabled=True))
+            await s.commit()
+    asyncio.run(seed())
+
+    async def fake_check(client, base_url, api_key, model, aliases, max_retries=2):
+        return {"status": "deleted", "code": 404, "latency_ms": 20}
+
+    monkeypatch.setattr(health_service, "check_model", fake_check)
+    monkeypatch.setattr(health_service, "RETIRE_RECONFIRM_DELAY", 0)
+
+    asyncio.run(health_service.run_full_check())
+
+    async def read():
+        async with db.SessionLocal() as s:
+            return (await s.execute(select(Provider).where(Provider.name == "p-dead"))).scalar_one()
+    p = asyncio.run(read())
+    assert p.models == [], "两次 404 后应从 models 移除"
+    assert "gone-model" in (p.retired_models or [])
+
+
+def test_speed_create_run_keeps_task_reference(monkeypatch):
+    """测速任务必须被强引用持有，否则可能被 GC 回收导致进度卡死（审计 #11）。"""
+    from services import speed_service
+
+    async def scenario():
+        async def fake_run(run_id, items, max_tokens):
+            await asyncio.sleep(0.02)
+
+        monkeypatch.setattr(speed_service, "run_speed_test", fake_run)
+        rid = speed_service.create_run([("p", "m")], 128)
+        try:
+            assert rid in speed_service._RUN_TASKS, "create_run 后必须持有 Task 引用"
+            await asyncio.sleep(0.15)
+            assert rid not in speed_service._RUN_TASKS, "任务完成后应清理引用"
+        finally:
+            speed_service._RUNS.pop(rid, None)
+
+    asyncio.run(scenario())
+
+
+def test_save_routers_rejects_duplicate_alias(initialized_db):
+    """两个路由组用同一别名：明确报错，而不是写进一条会让请求 500 的数据（审计 #12）。"""
+    import pytest
+    from services.router_manager import RouterService
+
+    async def scenario():
+        await RouterService().save_all({
+            "a": {"models": [], "alias": "shared"},
+            "b": {"models": [], "alias": "shared"},
+        })
+
+    with pytest.raises(ValueError) as exc:
+        asyncio.run(scenario())
+    assert "shared" in str(exc.value)
+
+
+def test_save_routers_rejects_alias_equal_to_other_group_name(initialized_db):
+    """别名撞上另一个组的组名同样拒绝。"""
+    import pytest
+    from services.router_manager import RouterService
+
+    async def scenario():
+        await RouterService().save_all({
+            "a": {"models": [], "alias": "b"},
+            "b": {"models": [], "alias": None},
+        })
+
+    with pytest.raises(ValueError):
+        asyncio.run(scenario())
+
+
+def test_normalize_router_name_prefers_group_name(initialized_db):
+    """组名与别人的别名相同时：不抛异常，且组名优先（审计 #12）。"""
+    from database import engine as engine_mod
+    from database.models import RouterGroup
+    from api.proxy import normalize_router_name
+
+    db = engine_mod.db
+
+    async def seed():
+        async with db.SessionLocal() as s:
+            # 历史数据里存在的形状：a 的别名撞上了 b 的组名
+            s.add(RouterGroup(name="a", alias="b", models=[]))
+            s.add(RouterGroup(name="b", alias=None, models=[]))
+            await s.commit()
+    asyncio.run(seed())
+
+    assert asyncio.run(normalize_router_name("b")) == "b"
+    assert asyncio.run(normalize_router_name("a")) == "a"
+    assert asyncio.run(normalize_router_name("not-exist")) == "not-exist"
+
+
+def test_check_all_returns_409_when_busy(local_client):
+    """已有一轮检测在跑时，第二次请求直接 409（审计 #13）。"""
+    from api import admin as admin_mod
+
+    token = admin_mod._acquire_check("全量检测")
+    assert token
+    try:
+        r = local_client.post("/api/check/all")
+        assert r.status_code == 409, r.text
+        assert "进行中" in r.text
+    finally:
+        admin_mod._release_check(token)
+
+
+def test_check_all_releases_slot_after_run(local_client, monkeypatch):
+    """检测跑完后必须释放检测位，否则后续再也点不动。"""
+    from api import admin as admin_mod
+    from services import health_service
+
+    async def fake_full_check(on_progress=None):
+        return {}
+
+    monkeypatch.setattr(health_service, "run_full_check", fake_full_check)
+    try:
+        r = local_client.post("/api/check/all")
+        assert r.status_code == 200, r.text
+        assert admin_mod._CHECK_STATE["running"] is False, "任务结束应释放检测位"
+    finally:
+        admin_mod._CHECK_STATE.update(running=False, kind="", started=0.0, token="")
+
+
+def test_acquire_check_takes_over_stale_slot():
+    """上一轮异常退出留下的标记超时后可以被接管，不会永久卡住。"""
+    import time as _time
+    from api import admin as admin_mod
+
+    admin_mod._CHECK_STATE.update(
+        running=True, kind="旧任务",
+        started=_time.time() - admin_mod.CHECK_STALE_SECONDS - 10, token="old",
+    )
+    token = ""
+    try:
+        token = admin_mod._acquire_check("新任务")
+        assert token, "过期标记应被强制释放"
+        assert admin_mod._CHECK_STATE["kind"] == "新任务"
+    finally:
+        admin_mod._release_check(token)
+        admin_mod._CHECK_STATE.update(running=False, kind="", started=0.0, token="")
+
+

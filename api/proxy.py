@@ -143,19 +143,30 @@ def ensure_lang_reply(body: dict) -> dict:
 
 
 async def normalize_router_name(name: str) -> str:
-    """规范化路由组名称，支持英文别名（直接从数据库查询）"""
+    """规范化路由组名称，支持英文别名（直接从数据库查询）
+
+    两级匹配顺序有意义：先按组名，再按别名。原来一条 SQL 用 OR 把两种匹配
+    混在一起、还用了 scalar_one_or_none()，只要别名重复（或别名撞上别的组名）
+    就抛 MultipleResultsFound，导致这个模型名的所有请求 500。
+    """
     if not isinstance(name, str) or not name.strip():
         return name
     from database.engine import db
     from database.models import RouterGroup
     async with db.SessionLocal() as session:
-        result = await session.execute(
-            select(RouterGroup).where(
-                (RouterGroup.name == name) |
-                (RouterGroup.alias == name)
-            )
+        # 组名有唯一约束，优先精确命中，避免别名撞名时取错组
+        exact = await session.execute(
+            select(RouterGroup).where(RouterGroup.name == name)
         )
-        row = result.scalar_one_or_none()
+        row = exact.scalars().first()
+        if row is None:
+            # 别名没有唯一约束（老数据可能重复），first() 兜底不抛异常
+            alias_hit = await session.execute(
+                select(RouterGroup)
+                .where(RouterGroup.alias == name)
+                .order_by(RouterGroup.id)
+            )
+            row = alias_hit.scalars().first()
     return row.name if row else name
 
 

@@ -21,6 +21,10 @@ QUALITY_WINDOW = 20
 RATE_LIMIT_STATUS_CODES = {429, 503, 403}
 FAILED_MODEL_TTL = 120
 UPSTREAM_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+# 404 退役前必须隔多久复测一次（秒）。上游瞬时 404 / 网关回源失败 / Key 分组
+# 权限变化都会回 404，一次就永久退役会误删正常模型，等一分钟再确认一次。
+RETIRE_RECONFIRM_DELAY = 60
+RETIRE_RECONFIRM_CONCURRENCY = 5
 
 
 class HealthState:
@@ -672,6 +676,90 @@ async def retire_models(provider_name: str, model_names: list[str]) -> list[str]
         logger.info("\033[91m♻ 已永久移除不可用模型 %s: %s\033[0m", provider_name, ", ".join(removed))
     return removed
 
+async def reconfirm_retire_candidates(
+    client: httpx.AsyncClient,
+    aliases: dict,
+    candidates: dict[str, list[str]],
+    results: dict,
+    providers_map: dict,
+    on_progress=None,
+    delay: Optional[float] = None,
+) -> dict[str, list[str]]:
+    """404 候选模型：隔一段时间复测一次，仍 404 的才允许退役。
+
+    为什么需要这一步：一次 404 并不等于模型下线。上游网关回源失败、滚动发布、
+    中转站对未授权模型回 404、base_url 配错，都会返回 404。原来的逻辑是「一次
+    404 → 立刻 retire_models」，模型被从 models/disabled_models 里摘掉、写进
+    retired_models，之后同步也不会加回来，界面上彻底消失且没有恢复入口。
+
+    现在的口径（参数 delay 默认 RETIRE_RECONFIRM_DELAY = 60 秒）：
+    本轮 404 只算「候选」，等待 delay 秒后并发复测，仍 404 才算真退役。
+
+    Args:
+        candidates: {provider_name: [model, ...]} 本轮返回 404 的模型
+        results: 本轮检测结果 dict，复测结果会写回（供日志与统计使用）
+        providers_map: {provider_name: Provider} 复测需要 base_url / api_key
+        on_progress: 进度回调，会收到 (provider, model, "reconfirm_wait"/"reconfirm", ...)
+
+    Returns:
+        {provider_name: [确认退役的 model, ...]}
+    """
+    todo = [
+        (pname, model)
+        for pname, models in candidates.items()
+        if pname in providers_map
+        for model in models
+    ]
+    if not todo:
+        return {}
+
+    wait = RETIRE_RECONFIRM_DELAY if delay is None else delay
+    logger.warning(
+        "\033[93m⏳ %d 个模型返回 404，%d 秒后统一复测再决定是否退役\033[0m",
+        len(todo), int(wait),
+    )
+    if on_progress:
+        first_provider = todo[0][0]
+        on_progress(first_provider, f"{len(todo)} 个 404 模型", "reconfirm_wait", len(todo), len(todo))
+    if wait > 0:
+        await asyncio.sleep(wait)
+
+    confirmed: dict[str, list[str]] = {}
+    sem = asyncio.Semaphore(RETIRE_RECONFIRM_CONCURRENCY)
+
+    async def _one(pname: str, model: str) -> None:
+        provider = providers_map[pname]
+        key = f"{pname}||{model}"
+        async with sem:
+            try:
+                res = await check_model(
+                    client, provider.base_url, provider.api_key, model, aliases
+                )
+            except Exception as exc:  # 复测本身失败：当作「没确认下线」，不退役
+                res = {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
+        results[key] = res
+        health_state.health_status[key] = res
+        if res.get("status") == "deleted":
+            confirmed.setdefault(pname, []).append(model)
+            logger.info("  [复测仍 404] %s | %s -> 确认退役", pname, model)
+        else:
+            health_state.update_quality(key, res)
+            if res.get("status") == "ok":
+                health_state.record_success(key)
+            logger.info("  [复测未确认] %s | %s -> %s（保留，不退役）", pname, model, res.get("status"))
+        if on_progress:
+            on_progress(pname, model, "reconfirm", 0, 0)
+
+    await asyncio.gather(*[_one(p, m) for p, m in todo])
+    if confirmed:
+        total_confirmed = sum(len(v) for v in confirmed.values())
+        logger.warning(
+            "\033[91m♻ 复测仍 404，确认退役 %d 个（另有 %d 个已恢复）\033[0m",
+            total_confirmed, len(todo) - total_confirmed,
+        )
+    return confirmed
+
+
 def checkable_models(provider) -> list[str]:
     """本次检测应该探测的模型（去重后的 provider.models）。
 
@@ -736,7 +824,8 @@ async def run_full_check(on_progress=None) -> dict:
     async with httpx.AsyncClient(timeout=UPSTREAM_TIMEOUT, verify=settings.load().verify_ssl) as client:
         # 记录本次检测中已确认删除的模型，避免重复探测
         already_deleted: set[str] = set()
-        retire_by_provider: dict[str, list[str]] = {}  # EOL/404 待永久移除
+        retire_by_provider: dict[str, list[str]] = {}  # EOL(410) 确认永久下线，立即移除
+        pending_404: dict[str, list[str]] = {}         # 404 待复测确认，不是立即退役
         for provider in providers:
             # 关闭了检测的提供商整体跳过（不探测、不刷日志）
             if getattr(provider, "check_enabled", True) is False:
@@ -780,16 +869,9 @@ async def run_full_check(on_progress=None) -> dict:
                     current += 1
                     continue
                 
-                # 跳过上次检测已确认删除的模型（内存中持久保留，直到同步清除）
+                # 上一轮是 deleted 也照常探测：退役必须由本轮 + 复测两次 404 共同确认。
+                # （原来这里直接退役，等于「一次 404 永久删除」，还会把瞬时抖动放大）
                 prev_status = health_state.health_status.get(key, {}).get("status")
-                if prev_status == "deleted":
-                    # 上一轮已确认不可用：直接退役，不再每轮跳过占位
-                    retire_by_provider.setdefault(provider.name, []).append(model)
-                    logger.info("  [退役] %s | %s (上一轮已 deleted)", provider.name, model)
-                    if on_progress:
-                        on_progress(provider.name, model, "deleted", current + 1, total)
-                    current += 1
-                    continue
                 
                 result = await check_model(
                     client, provider.base_url, provider.api_key, model, meta.aliases
@@ -800,9 +882,12 @@ async def run_full_check(on_progress=None) -> dict:
                 
                 status = result.get("status", "unknown")
                 
-                # EOL(410)/404 永久不可用：收集后从配置移除，不再占位
-                if status in ("eol", "deleted"):
+                # EOL(410)：上游明确说「永久下线」，直接退役。
+                # 404：只算候选，等 RETIRE_RECONFIRM_DELAY 秒复测，仍 404 才退役。
+                if status == "eol":
                     retire_by_provider.setdefault(provider.name, []).append(model)
+                elif status == "deleted":
+                    pending_404.setdefault(provider.name, []).append(model)
                 
                 # 如果是 429 限速，记录冷却时间
                 if status == "rate_limited":
@@ -830,8 +915,17 @@ async def run_full_check(on_progress=None) -> dict:
                 if on_progress:
                     on_progress(provider.name, model, status, current, total)
                 logger.info("  [%d/%d] %s | %s -> %s", current, total, provider.name, model, status)
-    
-    # 统一移除已确认 EOL/404 的模型（持久化，重启和同步都不会加回）
+
+        # 404 候选复测（复用同一个 client）：等 RETIRE_RECONFIRM_DELAY 秒后并发重测，
+        # 仍 404 的才并入 retire_by_provider；恢复的按新结果记状态，保留在配置里。
+        confirmed_404 = await reconfirm_retire_candidates(
+            client, meta.aliases, pending_404, results,
+            {p.name: p for p in providers}, on_progress=on_progress,
+        )
+        for prov, models in confirmed_404.items():
+            retire_by_provider.setdefault(prov, []).extend(models)
+
+    # 统一移除已确认下线（410）与复测仍 404 的模型（持久化，重启和同步都不会加回）
     for prov, models in retire_by_provider.items():
         await retire_models(prov, models)
     

@@ -987,9 +987,15 @@
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
                 showCheckLogBubble(`单服务商 ${providerName} 检测完成：${ok} 正常 / ${fail} 异常`, fail > 0);
               } else if (event.provider === providerName) {
-                const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
-                const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
-                btn.innerHTML = `<span style="color:${color}">${icon}</span> ${esc(event.model)}`;
+                if (event.status === 'reconfirm_wait') {
+                  btn.innerHTML = `⏳ ${esc(event.model)}返回 404，等 60 秒复测…`;
+                } else if (event.status === 'reconfirm') {
+                  btn.innerHTML = `🔁 复测 ${esc(event.model)}`;
+                } else {
+                  const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
+                  const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
+                  btn.innerHTML = `<span style="color:${color}">${icon}</span> ${esc(event.model)}`;
+                }
               }
             } catch (e) {
               // skip malformed events
@@ -1030,7 +1036,13 @@
         });
         
         if (!response.ok) {
-          throw new Error(`HTTP ${response.status}`);
+          // 409 = 已有一轮检测在跑；后端会在 detail 里说明是谁、跑了多久
+          let detail = '';
+          try {
+            const errBody = await response.json();
+            detail = errBody && errBody.detail ? String(errBody.detail) : '';
+          } catch (e) { /* 非 JSON 响应，退回状态码 */ }
+          throw new Error(detail || `HTTP ${response.status}`);
         }
         
         const reader = response.body.getReader();
@@ -1059,14 +1071,21 @@
                 showToast(`检测完成：${ok} 正常 / ${fail} 异常`, fail > 0 ? 'warn' : 'ok');
                 showCheckLogBubble(`全量检测完成：${ok} 正常 / ${fail} 异常`, fail > 0);
               } else if (event.provider && event.model) {
-                total = event.total;
-                current = event.current;
-                if (event.status === 'cooldown') {
-                  statusEl.innerHTML = `⏳ 跳过限速模型 ${current}/${total} | ${esc(event.provider)} · ${esc(event.model)}`;
+                if (event.status === 'reconfirm_wait') {
+                  // 404 候选在等 60 秒复测：不覆盖 total/current，避免进度条归零
+                  statusEl.innerHTML = `⏳ ${esc(event.model)}返回 404，等待 60 秒复测…`;
+                } else if (event.status === 'reconfirm') {
+                  statusEl.innerHTML = `🔁 复测中 | ${esc(event.provider)} · ${esc(event.model)}`;
                 } else {
-                  const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
-                  const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
-                  statusEl.innerHTML = `🔄 检测中 ${current}/${total} | ${esc(event.provider)} · ${esc(event.model)} <span style="color:${color};font-weight:600">${icon}</span>`;
+                  total = event.total;
+                  current = event.current;
+                  if (event.status === 'cooldown') {
+                    statusEl.innerHTML = `⏳ 跳过限速模型 ${current}/${total} | ${esc(event.provider)} · ${esc(event.model)}`;
+                  } else {
+                    const icon = event.status === 'ok' ? '✓' : event.status === 'error' ? '✗' : '?';
+                    const color = event.status === 'ok' ? 'var(--success)' : event.status === 'error' ? 'var(--danger)' : 'var(--unknown)';
+                    statusEl.innerHTML = `🔄 检测中 ${current}/${total} | ${esc(event.provider)} · ${esc(event.model)} <span style="color:${color};font-weight:600">${icon}</span>`;
+                  }
                 }
               }
             } catch (e) {
@@ -1077,7 +1096,7 @@
       } catch (e) {
         if (e.name !== 'AbortError' && e.message !== 'Unauthorized') {
           console.error("Check failed", e);
-          showToast("检测请求失败", "error");
+          showToast(e.message && e.message !== 'Unauthorized' ? e.message : "检测请求失败", "error", 6000);
         }
       } finally {
         btn.innerHTML = originalHtml;

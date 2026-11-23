@@ -45,6 +45,9 @@ KEEP_RUNS = 3           # 内存里只保留最近几次任务，避免无限增
 
 # run_id -> {started_at, finished, total, done, results[], skipped, max_tokens}
 _RUNS: dict[str, dict] = {}
+# run_id -> Task。asyncio 只对 task 持弱引用，不保存的话任务可能中途被 GC 回收，
+# 表现为进度永远停在 3/12、results 不再增长（2026-11-23 审计 #11）。
+_RUN_TASKS: dict[str, "asyncio.Task"] = {}
 
 
 def _delta_text(delta: dict) -> str:
@@ -292,12 +295,19 @@ async def measure_stream_speed(
 
 
 def _prune_runs() -> None:
-    """只保留最近 KEEP_RUNS 个任务。"""
+    """只保留最近 KEEP_RUNS 个任务（还在跑的不删，否则前端查进度会 404）。"""
     if len(_RUNS) <= KEEP_RUNS:
         return
     ordered = sorted(_RUNS.items(), key=lambda kv: kv[1].get("started_at", 0))
-    for run_id, _ in ordered[: len(_RUNS) - KEEP_RUNS]:
+    removed = 0
+    for run_id, _ in ordered:
+        if removed >= len(_RUNS) - KEEP_RUNS:
+            break
+        task = _RUN_TASKS.get(run_id)
+        if task is not None and not task.done():
+            continue
         _RUNS.pop(run_id, None)
+        removed += 1
 
 
 def get_run(run_id: str) -> Optional[dict]:
@@ -421,5 +431,8 @@ def create_run(items: list[tuple[str, str]], max_tokens: int, skipped: int = 0) 
         "error": "",
     }
     _prune_runs()
-    asyncio.create_task(run_speed_test(run_id, items, max_tokens))
+    task = asyncio.create_task(run_speed_test(run_id, items, max_tokens))
+    # 必须持有强引用，否则任务可能在跑完前被垃圾回收（进度卡死不动）
+    _RUN_TASKS[run_id] = task
+    task.add_done_callback(lambda _t, rid=run_id: _RUN_TASKS.pop(rid, None))
     return run_id

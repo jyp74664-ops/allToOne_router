@@ -1,5 +1,7 @@
 """管理接口路由"""
+import threading
 import time
+import uuid
 import logging
 from typing import Optional
 
@@ -30,6 +32,50 @@ from services.rate_limit_service import sync_rate_limits
 logger = logging.getLogger("flowgate.api")
 
 router = APIRouter(prefix="/api")
+
+
+# ============================================================
+# 检测互斥
+# ============================================================
+# 全量检测和单服务商检测共用一个「检测位」：连点两次会起两轮并发检测，
+# 双倍消耗上游额度，而且两边都在写 health_records / check_logs，结果互相覆盖。
+# 用时间戳标志而不是 asyncio.Lock：Lock 会绑定事件循环，测试里多个 TestClient
+# 各自的事件循环复用同一个 Lock 会抛「bound to a different event loop」。
+_CHECK_GUARD = threading.Lock()
+_CHECK_STATE = {"running": False, "kind": "", "started": 0.0, "token": ""}
+CHECK_STALE_SECONDS = 3 * 3600  # 超过 3 小时视为上一轮异常退出、标记失效
+
+
+def _busy_message() -> str:
+    kind = _CHECK_STATE.get("kind") or "检测"
+    started = _CHECK_STATE.get("started") or 0
+    if started:
+        mins = max(0, int((time.time() - started) / 60))
+        return f"已有一轮检测在进行中（{kind}，已运行 {mins} 分钟），请等它结束后再点"
+    return f"已有一轮检测在进行中（{kind}），请等它结束后再点"
+
+
+def _acquire_check(kind: str) -> str:
+    """占用检测位，返回 token；已被占用返回空串。"""
+    now = time.time()
+    with _CHECK_GUARD:
+        if _CHECK_STATE["running"]:
+            if now - _CHECK_STATE["started"] < CHECK_STALE_SECONDS:
+                return ""
+            logger.warning(
+                "检测互斥标记已过期（已运行 %.0f 分钟），强制释放",
+                (now - _CHECK_STATE["started"]) / 60,
+            )
+        token = f"{kind}-{uuid.uuid4().hex[:6]}"
+        _CHECK_STATE.update(running=True, kind=kind, started=now, token=token)
+        return token
+
+
+def _release_check(token: str) -> None:
+    """释放检测位（只释放自己持有的那个 token）。"""
+    with _CHECK_GUARD:
+        if _CHECK_STATE["running"] and _CHECK_STATE["token"] == token:
+            _CHECK_STATE.update(running=False, kind="", started=0.0, token="")
 
 
 class AdminLoginIn(BaseModel):
@@ -315,7 +361,11 @@ async def save_routers(request: Request, _=Depends(verify_admin)):
     """保存路由组"""
     body = await request.json()
     svc = RouterService()
-    await svc.save_all(body)
+    try:
+        await svc.save_all(body)
+    except ValueError as exc:
+        # 别名重复等问题：明确 400 告知，不要静默写进一条会让请求 500 的数据
+        raise HTTPException(400, str(exc))
     return {"ok": True}
 
 
@@ -357,9 +407,23 @@ async def check_all(_=Depends(verify_admin)):
             "total": total
         })
     
-    # 启动后台检测任务
+    # 启动后台检测任务（先占检测位，避免连点两次并发跑两轮）
     import asyncio
-    results_task = asyncio.create_task(run_full_check(on_progress=on_progress))
+    token = _acquire_check("全量检测")
+    if not token:
+        raise HTTPException(409, _busy_message())
+
+    async def _run_full():
+        try:
+            return await run_full_check(on_progress=on_progress)
+        finally:
+            _release_check(token)
+
+    try:
+        results_task = asyncio.create_task(_run_full())
+    except Exception:
+        _release_check(token)
+        raise
     
     async def generate_progress():
         """流式输出进度"""
@@ -427,7 +491,8 @@ async def check_provider(name: str, _=Depends(verify_admin)):
         
         meta = ModelMetaService()
         results = {}
-        retire_list: list[str] = []  # EOL/404 待永久移除
+        retire_list: list[str] = []   # EOL(410) 确认下线，立即移除
+        pending_404: list[str] = []   # 404 待复测确认
         # 与全量检测口径一致：只探测已勾选的模型；勾了「仅拉取免费模型」的
         # 提供商还要再滤掉收费模型，避免探测收费接口产生费用。
         models_to_check = checkable_models(provider)
@@ -446,15 +511,9 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                     current += 1
                     continue
                 
-                # 检查是否已标记为 deleted
+                # 上一轮是 deleted 也照常探测：退役要由「本轮 404 + 60 秒后复测仍 404」
+                # 共同确认，避免一次抖动就把模型永久删掉（与全量检测口径一致）
                 prev_status = health_state.health_status.get(key, {}).get("status")
-                if prev_status == "deleted":
-                    # 上一轮已确认不可用：直接退役
-                    retire_list.append(model)
-                    if on_progress:
-                        on_progress(provider.name, model, "deleted", current + 1, total)
-                    current += 1
-                    continue
                 
                 result = await check_model(
                     client, provider.base_url, provider.api_key, model, meta.aliases
@@ -465,9 +524,11 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 
                 status = result.get("status", "unknown")
                 
-                # EOL(410)/404 永久不可用：收集后从配置移除
-                if status in ("eol", "deleted"):
+                # EOL(410) 立即退役；404 只记候选，等 60 秒复测确认
+                if status == "eol":
                     retire_list.append(model)
+                elif status == "deleted":
+                    pending_404.append(model)
                 
                 if status == "rate_limited":
                     retry_after = result.get("retry_after")
@@ -491,8 +552,18 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 current += 1
                 if on_progress:
                     on_progress(provider.name, model, status, current, total)
-        
-        # 统一移除已确认 EOL/404 的模型
+
+            # 404 候选复测：等 60 秒后重测，仍 404 的才并入退役名单（与全量检测一致）
+            if pending_404:
+                from services.health_service import reconfirm_retire_candidates
+                confirmed = await reconfirm_retire_candidates(
+                    client, meta.aliases,
+                    {provider.name: pending_404}, results,
+                    {provider.name: provider}, on_progress=on_progress,
+                )
+                retire_list.extend(confirmed.get(provider.name, []))
+
+        # 统一移除已确认下线（410）与复测仍 404 的模型
         from services.health_service import retire_models
         if retire_list:
             await retire_models(name, retire_list)
@@ -515,8 +586,22 @@ async def check_provider(name: str, _=Depends(verify_admin)):
                 "total": total
             })
     
-    # 运行检查
-    results_task = asyncio.create_task(check_single_provider())
+    # 运行检查（与全量检测共用检测位，同一时间只允许一轮）
+    token = _acquire_check(f"单服务商 {name}")
+    if not token:
+        raise HTTPException(409, _busy_message())
+
+    async def _run_single():
+        try:
+            return await check_single_provider()
+        finally:
+            _release_check(token)
+
+    try:
+        results_task = asyncio.create_task(_run_single())
+    except Exception:
+        _release_check(token)
+        raise
     
     async def generate_progress():
         """流式输出进度"""

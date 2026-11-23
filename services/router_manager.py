@@ -47,6 +47,13 @@ class RouterService:
             )
             if existing.scalar_one_or_none():
                 raise ValueError(f"路由组 '{name}' 已存在")
+
+            if alias:
+                alias_used = await session.execute(
+                    select(RouterGroup).where(RouterGroup.alias == alias)
+                )
+                if alias_used.scalars().first():
+                    raise ValueError(f"别名 '{alias}' 已被其它路由组使用")
             
             r = RouterGroup(name=name, models=models, alias=alias)
             session.add(r)
@@ -88,6 +95,24 @@ class RouterService:
                     "models": value.get("models", []),
                     "alias": value.get("alias"),
                 }
+
+        # 别名必须全局唯一，否则 /v1/chat/completions 的 model 解析会出现歧义
+        # （历史实现用 OR 一次查组名或别名，重复别名直接 MultipleResultsFound → 500）。
+        # 这里保存前就拒绝，让用户在界面上改掉，而不是留下一条会炸的数据。
+        seen_alias: dict[str, str] = {}
+        for name, info in parsed.items():
+            alias = (info.get("alias") or "").strip()
+            if not alias:
+                info["alias"] = None
+                continue
+            if alias != name and alias in parsed:
+                raise ValueError(f"别名「{alias}」（来自「{name}」）与另一个路由组的名称重复")
+            if alias in seen_alias:
+                raise ValueError(
+                    f"别名「{alias}」被「{seen_alias[alias]}」和「{name}」重复使用，请改成不同别名"
+                )
+            seen_alias[alias] = name
+            info["alias"] = alias
         
         async with db.SessionLocal() as session:
             await session.execute(RouterGroup.__table__.delete())
