@@ -1662,7 +1662,6 @@
         const pData = pList.find(p => p.name === provider);
         currentModels = new Set(pData ? (pData.models || []) : []);
         disabledModels = new Set(pData ? (pData.disabled_models || []) : []);
-        const freeOnly = pData ? pData.free_only !== false : true;
 
         // 大提供商（Kilo Code 这类 470 个模型 / 600KB+ 响应）拉取需要更久，
         // 原来写死 10 秒会无视真实原因，一律报"请求超时"
@@ -1704,11 +1703,12 @@
 
         // 合并已保存的模型
         currentModels.forEach(m => { if (!allModels.includes(m)) allModels.push(m); });
-        
-        // 若未开启"仅免费模型"，则把新获取到的收费模型也默认加入监控列表
-        if (!freeOnly) {
-          allModels.forEach(m => { if (!currentModels.has(m)) currentModels.add(m); });
-        }
+
+        // 这里原来有一句「未开启仅免费模型时，把上游新拉到的收费模型也默认勾上」。
+        // 后果是：用户只是打开弹窗看一眼、点「保存更改」，模型列表就被悄悄从 7 个
+        // 扩成十几个，紧接着还会触发一轮全量检测——保存变成了"改配置 + 检测"。
+        // 现在默认勾选只反映已保存的配置；想批量启用请用「全选」按钮，改了什么
+        // 就该由用户自己决定，保存只负责把当前勾选写进去。
         allModels.sort();
 
         // 显示状态信息
@@ -1924,10 +1924,20 @@
     }
 
     async function saveModelSelection() {
-      const checkedModels = [];
-      document.querySelectorAll('.modal-model-checkbox').forEach(cb => {
-        if (cb.checked) checkedModels.push(cb.value);
-      });
+      const providerName = currentManagingProvider;   // closeModelManager 会置空，先留住
+      const boxes = [...document.querySelectorAll('.modal-model-checkbox')];
+      // 列表还在从上游拉取（或拉取失败）时，页面上一个复选框都没有。此时保存会提交
+      // 空列表，等于把这个提供商的模型全清掉——实测踩过一次，必须拦住。
+      if (boxes.length === 0) {
+        showToast('模型列表还没加载出来（或加载失败），暂不能保存；等列表出现或重新打开本窗口', 'error', 5000);
+        return;
+      }
+      const checkedModels = boxes.filter(cb => cb.checked).map(cb => cb.value);
+
+      // 清空全部已启用模型也要二次确认，避免误点
+      if (checkedModels.length === 0 && currentModelsForModal.size > 0) {
+        if (!confirm(`「${providerName}」当前启用的 ${currentModelsForModal.size} 个模型将被全部取消，确定吗？`)) return;
+      }
 
       // 计算限额型模型：之前启用但现在取消勾选的
       const disabledList = [];
@@ -1952,7 +1962,9 @@
         if (res.ok) {
           closeModelManager();
           load();
-          checkAll();
+          // 保存只做保存。检测要花上游额度，必须由用户显式点「立即检测」触发；
+          // 「立即检测」本身只会探测已勾选的模型，正好覆盖「只测刚勾的那几个」。
+          showToast(`已保存「${providerName}」的模型选择（检测需另点「立即检测」）`, 'ok');
         } else {
           alert("保存失败");
         }
@@ -2057,11 +2069,11 @@
           });
         }
         if (res.ok) {
-          const wasAdd = providerEditMode === 'add';
           closeProviderEditor();
-          showToast(wasAdd ? '提供商已添加，模型列表已自动拉取' : '提供商信息已更新', 'ok');
+          showToast(providerEditMode === 'add' ? '提供商已添加，模型列表已自动拉取' : '提供商信息已更新', 'ok');
           await load();
-          if (wasAdd) checkAll();
+          // 这里原来会顺手跑一轮全量检测。新增提供商时模型多、额度消耗大，
+          // 而且用户没点过任何「检测」——改成只保存，要检测由用户自己点「立即检测」。
         } else {
           let detail = '';
           try { detail = (await res.json()).detail || ''; } catch (_) { }
