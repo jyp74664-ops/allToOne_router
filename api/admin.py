@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 import httpx
 
 from config.settings import settings
@@ -1325,7 +1325,17 @@ async def get_request_logs(
     conds = [RequestLog.timestamp >= cutoff]
     if wanted_model:
         conds.append(RequestLog.requested_model == wanted_model)
+    other_total = 0
     async with db.SessionLocal() as session:
+        if wanted_model:
+            # 页面默认会停在「最后一次保存的路由」上，别的路由（比如「立即检测」写的
+            # doTest）的新记录会被过滤掉。把条数告诉前端，免得看着像没刷新。
+            stmt_other = (
+                select(func.count())
+                .select_from(RequestLog)
+                .where(RequestLog.timestamp >= cutoff, RequestLog.requested_model != wanted_model)
+            )
+            other_total = int((await session.execute(stmt_other)).scalar() or 0)
         if only_failed:
             conds.append(RequestLog.ok == False)  # noqa: E712
             stmt = (
@@ -1379,6 +1389,7 @@ async def get_request_logs(
     ]
     return {
         "hours": hours,
+        "other_total": other_total,
         "summary": {
             "total": total,
             "failed": failed,

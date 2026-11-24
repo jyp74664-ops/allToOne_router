@@ -12,6 +12,9 @@
 
     /* ============ 鉴权与 fetch 封装 ============ */
     const TOKEN_KEY = 'gateway_admin_token';
+    // 是否已通过门禁（本机免登录时也允许）。切回前台要判断这个，不能只看 token：
+    // 免登录模式 localStorage 里根本没有 token，用 getToken() 判断会让轮询永久停摆。
+    let gateReady = false;
     function getToken() { try { return localStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; } }
     function setToken(t) { try { localStorage.setItem(TOKEN_KEY, t); } catch (e) {} }
     function clearToken() { try { localStorage.removeItem(TOKEN_KEY); } catch (e) {} }
@@ -50,6 +53,7 @@
         setToken(d.token);
         if (input) input.value = '';
         hideGate();
+        gateReady = true;
         showToast('登录成功', 'ok');
         await loadAll(true);
       } catch (e) {
@@ -631,14 +635,18 @@
       let lastSaved = '';
       try {
         const [rRouters, rLast] = await Promise.all([
-          apiFetch('/api/routers').then(r => r.json()),
-          apiFetch('/api/last-router').then(r => r.json()).catch(() => ({})),
+          apiFetch('/api/routers', {}, 10000).then(r => r.json()),
+          apiFetch('/api/last-router', {}, 10000).then(r => r.json()).catch(() => ({})),
         ]);
         names = Object.keys((rRouters && rRouters.data) || {});
         lastSaved = (rLast && rLast.name) || '';
         lastSavedRouter = lastSaved;
       } catch (e) {
+        // 拉不到就保持原样（默认「全部路由」），下次轮询再试。
+        // 别继续往下走——names 是空的，会把用户已经选好的筛选清回「全部」。
+        reqRouterOptionsLoaded = false;
         if (e.message !== 'Unauthorized') console.error('load reqRouter options failed:', e);
+        return;
       }
       // 手动选过的优先；没选过就跟最后一次保存的路由走
       const remembered = getSavedReqRouter() || lastSaved;
@@ -662,39 +670,58 @@
     // 请求日志只读，可以放心轮询；停在页签里时每 5 秒自己拉一次，
     // 不用手动点刷新，也不用切走再切回来。
     const REQ_AUTO_MS = 5000;
+    // 单次拉取的最长等待。不给超时的话，只要有一次请求排不上队（浏览器同域
+    // 连接被长请求/检测占满时会发生），reqLoading 就永远复位不了，自动刷新
+    // 会静默停死——界面还显示「自动刷新：开」，只有「更新于」不再跳。
+    const REQ_FETCH_TIMEOUT_MS = 12000;
     let reqAutoOn = (() => {
       try { return localStorage.getItem('gateway_req_auto') !== '0'; } catch (e) { return true; }
     })();
     let reqAutoTimer = null;
     let reqLoading = false;
+    let reqLoadingSince = 0;    // 上一次请求开始的时刻，用来判断是不是卡死了
     let reqLastSig = '';        // 上次渲染的数据指纹：内容没变就不重绘，避免表格闪、滚动条跳
 
     async function loadRequestLogs(opts) {
       const silent = !!(opts && opts.silent);
-      // 自动刷新撞上正在进行的请求就直接跳过，避免堆积；手动刷新照常执行
-      if (silent && reqLoading) return;
+      // 自动刷新撞上正在进行的请求就直接跳过，避免堆积；手动刷新照常执行。
+      // 但上一次要是卡死超过两个周期，就强制放弃它，否则自动刷新永久停摆。
+      if (silent && reqLoading) {
+        if (!reqLoadingSince || Date.now() - reqLoadingSince < REQ_FETCH_TIMEOUT_MS * 2) return;
+        reqLoading = false;
+      }
       reqLoading = true;
+      reqLoadingSince = Date.now();
       try {
         await ensureReqRouterOptions();
         const failedQuery = onlyFailedRequests ? '&only_failed=true' : '';
         const modelQuery = reqRouter ? `&model=${encodeURIComponent(reqRouter)}` : '';
-        const l = await apiFetch(`/api/request-logs?hours=${logHours}&limit=100${failedQuery}${modelQuery}`).then(r => r.json());
+        const l = await apiFetch(
+          `/api/request-logs?hours=${logHours}&limit=100${failedQuery}${modelQuery}`, {}, REQ_FETCH_TIMEOUT_MS
+        ).then(r => r.json());
         const sig = JSON.stringify(l);
         if (sig !== reqLastSig) {
           reqLastSig = sig;
           renderRequestLogs(l);
         }
-        markReqUpdated();
+        markReqUpdated(true);
       } catch (e) {
-        if (e.message !== 'Unauthorized') console.error('loadRequestLogs failed:', e);
+        if (e.message !== 'Unauthorized') {
+          console.error('loadRequestLogs failed:', e);
+          markReqUpdated(false, e.name === 'AbortError' ? '超时' : '失败');
+        }
       } finally {
         reqLoading = false;
       }
     }
 
-    function markReqUpdated() {
+    function markReqUpdated(ok, why) {
       const el = document.getElementById('requestUpdatedAt');
-      if (el) el.textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      if (!el) return;
+      const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+      // 失败也要写一行，否则「更新于」停住而页面毫无提示，分不清是没新数据还是刷新挂了
+      el.textContent = ok === false ? `更新失败（${why || '错误'}）${t}，下一轮自动重试` : '更新于 ' + t;
+      el.style.color = ok === false ? '#ff6b6b' : '';
     }
 
     function syncReqAutoBtn() {
@@ -719,8 +746,19 @@
       if (!view || view.style.display === 'none') return;   // 不在这个页签上也不拉
       reqAutoTimer = setTimeout(async () => {
         reqAutoTimer = null;
-        await loadRequestLogs({ silent: true });
-        scheduleReqAuto();
+        // 这里必须用 race 兜一刀：下一轮是靠本轮 await 结束后才排的，只要本轮
+        // 有一次永远不返回（连接被长请求占满、请求排队排到天荒地老），调度链就
+        // 断在这里，界面还显示「自动刷新：开」，但再也不会动。
+        try {
+          await Promise.race([
+            loadRequestLogs({ silent: true }),
+            new Promise(resolve => setTimeout(resolve, REQ_FETCH_TIMEOUT_MS + 3000)),
+          ]);
+        } finally {
+          reqLoading = false;      // 卡死的那次别再拦着后面
+          reqLoadingSince = 0;
+          scheduleReqAuto();
+        }
       }, REQ_AUTO_MS);
     }
 
@@ -836,11 +874,15 @@
       const bodyEl = document.getElementById('requestBody');
       if (!bodyEl) return;
       const s = (data && data.summary) || {};
+      const other = Number((data && data.other_total) || 0);
+      // 筛选生效时，别的路由（包括「立即检测」写的 doTest）的记录是被过滤掉的。
+      // 不提示的话，新请求进来了这张表却不动，很容易被当成「自动刷新坏了」。
+      const otherHint = other ? ` · 另有 ${other} 条其他路由未显示` : '';
       if (summaryEl) {
         const scope = reqRouter ? `「${reqRouter}」 · ` : '';
         summaryEl.textContent = s.total
-          ? `${scope}共 ${s.total} 条 · 失败 ${s.failed} · 成功率 ${s.success_rate}% · 缓存命中 ${s.cached} · 平均 ${s.avg_latency_ms || '-'} ms`
-          : (reqRouter ? `${scope}该路由最近 ${logHours} 小时无记录` : '暂无请求');
+          ? `${scope}共 ${s.total} 条 · 失败 ${s.failed} · 成功率 ${s.success_rate}% · 缓存命中 ${s.cached} · 平均 ${s.avg_latency_ms || '-'} ms${otherHint}`
+          : (reqRouter ? `${scope}该路由最近 ${logHours} 小时无记录${otherHint}` : '暂无请求');
       }
       const rows = (data && data.items) || [];
       if (!rows.length) {
@@ -848,7 +890,8 @@
           ? `路由「${esc(reqRouter)}」在最近 ${logHours} 小时内没有转发记录`
           : '暂无请求记录';
         const tip = reqRouter
-          ? '<div style="font-size:11px;margin-top:4px;">调用时填的 model 名要和路由组名完全一致；换成「全部路由」可以看所有调用</div>'
+          ? `<div style="font-size:11px;margin-top:4px;">调用时填的 model 名要和路由组名完全一致；换成「全部路由」可以看所有调用${
+              other ? `（另有 ${other} 条其他路由的记录）` : ''}</div>`
           : '';
         bodyEl.innerHTML = `<tr><td colspan="8" class="empty">${msg}${tip}</td></tr>`;
         return;
@@ -2160,7 +2203,9 @@
       if (document.hidden) {
         stopPolling();
         stopReqAuto();
-      } else if (getToken()) {
+      } else if (gateReady) {
+        // 注意别用 getToken() 判断：本机免登录时没有 token，会让切回前台后
+        // 所有轮询和「最近请求」自动刷新永久停住（看着像「有时候不刷新」）。
         load();
         startPolling();
         // 立即刷新统计数据，避免切回后看到旧数据
@@ -2900,6 +2945,7 @@
         showGate('局域网访问，请输入管理密码以继续');
         return;
       }
+      gateReady = true;
       loadAll(true);
     }
     async function restoreAutoValidate() {

@@ -1928,12 +1928,20 @@ def test_request_logs_filter_by_route(local_client, initialized_db):
     all_rows = local_client.get("/api/request-logs?hours=24").json()["items"]
     assert {r["requested_model"] for r in all_rows} == {"编码", "doTest"}
 
-    only = local_client.get("/api/request-logs?hours=24&model=编码").json()["items"]
-    assert [r["trace_id"] for r in only] == ["t-real"]
-    assert only[0]["requested_model"] == "编码"
+    only = local_client.get("/api/request-logs?hours=24&model=编码").json()
+    assert [r["trace_id"] for r in only["items"]] == ["t-real"]
+    assert only["items"][0]["requested_model"] == "编码"
+    # 被过滤掉的其他路由也要报条数：页面停在单条路由时，新请求进别的路由
+    # （比如「立即检测」写的 doTest）会让用户以为自动刷新没生效
+    assert only["other_total"] == 1
 
     # 不存在的路由名应返回空，而不是退回全量
-    assert local_client.get("/api/request-logs?hours=24&model=不存在").json()["items"] == []
+    none = local_client.get("/api/request-logs?hours=24&model=不存在").json()
+    assert none["items"] == []
+    assert none["other_total"] == 2
+
+    # 不筛选时不带这个语义（保持 0）
+    assert local_client.get("/api/request-logs?hours=24").json()["other_total"] == 0
 
 
 def test_last_router_roundtrip(local_client, monkeypatch):
