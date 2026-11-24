@@ -774,18 +774,6 @@
       }
     }
 
-    async function refreshRequests(btn) {
-      const original = btn ? btn.textContent : '';
-      if (btn) { btn.disabled = true; btn.textContent = '刷新中...'; }
-      reqLastSig = '';              // 手动刷新一定重绘
-      try {
-        await loadRequestLogs();
-      } finally {
-        if (btn) { btn.disabled = false; btn.textContent = original; }
-        scheduleReqAuto();          // 手动刷新后重新计时，别等下一轮
-      }
-    }
-
     function switchLogRange(h) {
       logHours = h;
       document.querySelectorAll('.log-range').forEach(b => {
