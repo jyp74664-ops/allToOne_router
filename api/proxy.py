@@ -18,7 +18,7 @@ from services.health_service import health_state, RATE_LIMIT_STATUS_CODES
 from services.usage_service import append_usage
 from services.upstream_client import get_shared_client
 from services import cache_service
-from services.observability import new_trace_id, record_request
+from services.observability import mark_attempted, new_trace_id, record_request
 from services.virtual_key_service import add_tokens, check_limits, note_request, resolve as resolve_vkey
 
 logger = logging.getLogger("flowgate.proxy")
@@ -76,6 +76,8 @@ async def _record_safely(**kwargs) -> None:
     """
     task = asyncio.current_task()
     cancelling = task is not None and getattr(task, "cancelling", lambda: 0)() > 0
+    # 先打标记：中间件靠它判断「转发流程有没有走到记账」，避免重复补记
+    mark_attempted(kwargs.get("trace_id"))
     if cancelling:
         # 已经在取消流程里，await 一定是白费的，直接扔后台
         _spawn_bg(record_request(**kwargs))
@@ -853,6 +855,11 @@ async def proxy_chat(request: Request, force: bool = False):
     started = time.time()
     api_key_name = getattr(request.state, "api_key_name", "")
     model_hint = ""
+    # 交给中间件对账用：请求彻底结束后若这两个字段对应的 trace 从未尝试记账，
+    # 就由中间件补一条（覆盖「流式生成器从未启动、finally 不执行」的黑洞）
+    request.state.trace_id = trace_id
+    request.state.requested_model = ""
+    request.state.is_stream = False
     try:
         # 每个请求固定一次配置，避免流式响应期间切换开关导致处理方式变化。
         cfg = settings.load()
@@ -864,6 +871,8 @@ async def proxy_chat(request: Request, force: bool = False):
             raise HTTPException(400, "请求体必须是 JSON 对象")
         if isinstance(body.get("model"), str):
             model_hint = body["model"]
+        request.state.requested_model = model_hint
+        request.state.is_stream = bool(body.get("stream"))
         body = compress_hermes(body)
         body = ensure_lang_reply(body, str(getattr(cfg, "lang_hint", "auto") or "auto"))
         requested_model = body.get("model")
@@ -872,6 +881,7 @@ async def proxy_chat(request: Request, force: bool = False):
         if not isinstance(requested_model, str) or not requested_model:
             raise HTTPException(400, "请求缺少 model")
         model_hint = requested_model
+        request.state.requested_model = requested_model
         return await forward_chat(
             body, requested_model, bool(cfg.merge_reasoning), force=force,
             trace_id=trace_id,
@@ -880,6 +890,9 @@ async def proxy_chat(request: Request, force: bool = False):
             vkey_id=getattr(request.state, "vkey_id", None),
         )
     except HTTPException:
+        # 业务拒绝（400 缺 model / 401 / 429 …）按设计不记账，
+        # 打个标记让中间件不要补记，保持「转发前的拒绝不入表」的语义。
+        mark_attempted(trace_id)
         raise
     except Exception as exc:
         logger.exception(

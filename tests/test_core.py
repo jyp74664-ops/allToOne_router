@@ -2003,6 +2003,69 @@ def test_request_log_survives_client_cancel(initialized_db):
     assert "客户端断开" in (rows[0].error or "")
 
 
+def test_middleware_backfills_when_forward_never_logs(initialized_db, local_client, monkeypatch):
+    """转发流程一条都没记时，中间件要补一条。
+
+    病灶：流式响应已经 return，客户端在 body 迭代前断开 → async generator
+    从未启动 → 它的 finally 不执行 → 记账代码一行都跑不到。此时接口返回 200、
+    最近请求里却什么都没有。中间件在请求结束后对账补记。
+    """
+    from sqlalchemy import select
+    from fastapi.responses import JSONResponse
+    from api import proxy as proxy_mod
+    from database.models import RequestLog
+
+    seen: list[str] = []
+
+    async def fake_forward(*args, **kwargs):
+        seen.append(kwargs.get("trace_id"))
+        return JSONResponse({"ok": True})
+
+    monkeypatch.setattr(proxy_mod, "forward_chat", fake_forward)
+
+    from config.settings import settings
+    key = settings.load().local_api_key
+    r = local_client.post(
+        "/v1/chat/completions",
+        json={"model": "随便一个路由", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer " + key},
+    )
+    assert r.status_code == 200
+    assert seen and seen[0], "proxy_chat 必须把 trace_id 传给 forward_chat"
+
+    async def read_rows():
+        async with initialized_db.SessionLocal() as s:
+            res = await s.execute(select(RequestLog).where(RequestLog.trace_id == seen[0]))
+            return res.scalars().all()
+
+    rows = asyncio.run(read_rows())
+    assert len(rows) == 1, "没记账的请求也必须由中间件补一条"
+    assert "兜底补记" in (rows[0].error or "")
+    assert rows[0].ok is False
+
+
+def test_business_rejection_is_not_backfilled(initialized_db, local_client):
+    """转发前的业务拒绝（缺 model）按设计不入表，中间件不能补记。"""
+    from sqlalchemy import func, select
+    from database.models import RequestLog
+
+    async def count_rows():
+        async with initialized_db.SessionLocal() as s:
+            res = await s.execute(select(func.count()).select_from(RequestLog))
+            return res.scalar_one()
+
+    before = asyncio.run(count_rows())
+    from config.settings import settings
+    key = settings.load().local_api_key
+    r = local_client.post(
+        "/v1/chat/completions",
+        json={"messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": "Bearer " + key},
+    )
+    assert r.status_code == 400
+    assert asyncio.run(count_rows()) == before
+
+
 def test_pre_forward_exception_is_logged(local_client, initialized_db, monkeypatch):
     """转发前的处理抛异常（compress_hermes / ensure_lang_reply 这类）也要留痕。
 

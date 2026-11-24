@@ -1,4 +1,5 @@
 """FlowGate - 高性能 AI 模型网关"""
+import asyncio
 import logging
 import time
 from datetime import datetime
@@ -140,6 +141,45 @@ def _append_inbound_line(request, status: int, seconds: float, err: str = "") ->
         pass
 
 
+async def _backfill_missing_log(request, status: int) -> None:
+    """对账兜底：请求彻底结束后，若转发流程从未尝试记账，就补一条。
+
+    覆盖的真实场景：流式响应已经 `return StreamingResponse(...)`，但客户端
+    在响应体开始迭代前（或第一块之前）就断开，ASGI 直接结束请求、生成器从未
+    启动——Python 的 async generator 没被 `__anext__` 过，`finally` 是不执行的，
+    里面所有记账代码一行都跑不到。表现就是「返回了 200，最近请求里却没有」。
+
+    这里用 observability 的标记判断「有没有走过记账」，有就不再补（避免重复）。
+    """
+    path = request.url.path
+    if request.method != "POST" or not path.startswith("/v1/"):
+        return
+    trace_id = getattr(request.state, "trace_id", None)
+    if not trace_id:
+        return
+    from services.observability import mark_attempted, record_request, was_attempted
+
+    if was_attempted(trace_id):
+        return
+    mark_attempted(trace_id)
+    # 用 shield 保护：中间件的 finally 也可能处于取消流程里，
+    # 直接 await 会被立刻打断，补记就白做了。
+    fut = asyncio.ensure_future(record_request(
+        trace_id=trace_id,
+        requested_model=getattr(request.state, "requested_model", "") or "(unknown)",
+        endpoint=path,
+        stream=bool(getattr(request.state, "is_stream", False)),
+        ok=False,
+        status_code=status,
+        error="兜底补记：请求已结束，转发流程未执行记账（客户端在流开始前断开，或转发协程被取消）",
+    ))
+    try:
+        await asyncio.shield(fut)
+    except (asyncio.CancelledError, RuntimeError):
+        # fut 已被 shield 保护，会在后台把行写完
+        pass
+
+
 async def log_request_middleware(request, call_next):
     start_time = time.time()
     status = 500
@@ -161,6 +201,12 @@ async def log_request_middleware(request, call_next):
             client_info, request.method, full_path, status, process_time
         )
         _append_inbound_line(request, status, process_time, err)
+        try:
+            await _backfill_missing_log(request, status)
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # 对账失败绝不能影响响应
+            pass
 
 
 # 请求日志中间件（不启用 CORS：管理页与 API 同源，杜绝跨站凭据窃取）
