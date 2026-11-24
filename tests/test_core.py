@@ -2066,6 +2066,55 @@ def test_business_rejection_is_not_backfilled(initialized_db, local_client):
     assert asyncio.run(count_rows()) == before
 
 
+def test_stream_logging_runs_before_usage_when_cancelled(initialized_db, monkeypatch):
+    """流式 finally 里，记账必须排在 append_usage 之前。
+
+    病灶：append_usage 的 await 在前，且 except Exception 抓不住
+    CancelledError（3.8 起它继承 BaseException）。客户端一断开，取消从
+    usage 那里穿透出去，finally 直接中断，记账一行都不跑——09:54-09:59
+    那批「25 条进站 200、只有 2 条入表」就是这个原因。
+    """
+    import asyncio
+    import httpx
+    from api import proxy as proxy_mod
+
+    order: list[str] = []
+
+    async def spy_record(**kwargs):
+        order.append("record")
+
+    async def spy_usage(**kwargs):
+        order.append("usage")
+        raise asyncio.CancelledError()  # 模拟取消态下 usage 写库被打断
+
+    monkeypatch.setattr(proxy_mod, "_record_safely", spy_record)
+    monkeypatch.setattr(proxy_mod, "append_usage", spy_usage)
+
+    sse = (
+        b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'
+        b'data: {"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2}}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    def handler(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=sse)
+
+    c, key = _proxy_test_client(handler, [
+        {"name": "p-sse", "base_url": "https://sse/v1", "api_key": "k", "models": ["m1"]},
+    ])
+    try:
+        r = c.post(
+            "/v1/chat/completions",
+            json={"model": "m1", "messages": [{"role": "user", "content": "hi"}], "stream": True},
+            headers={"Authorization": "Bearer " + key},
+        )
+    finally:
+        c.__exit__(None, None, None)
+
+    assert r.status_code == 200
+    assert order[:2] == ["record", "usage"], f"记账必须排在用量之前，实际顺序 {order}"
+
+
 def test_pre_forward_exception_is_logged(local_client, initialized_db, monkeypatch):
     """转发前的处理抛异常（compress_hermes / ensure_lang_reply 这类）也要留痕。
 

@@ -690,47 +690,55 @@ async def forward_chat(
                                     logger.warning("\033[93m⚠ 流式事件处理异常: %s\033[0m", e)
                                     yield restore_hermes_text(line + "\n").encode("utf-8")
                         finally:
-                            # 顺序有讲究：**先记账、最后关连接**。
+                            # 顺序是硬的：**先记账 → 再记用量 → 最后关连接**。
                             # 客户端断开时整个协程带着 CancelledError 进 finally，
-                            # 这时第一个 await 就会立刻再抛取消异常，把日志代码
-                            # 全跳过——以前 aclose() 放在最前面，于是「调用了接口
-                            # 却没有任何记录」，日志永远停在几个小时前那条。
+                            # 取消态下每个 await 都会立刻再抛一次，谁排在前面谁
+                            # 就把后面的全带走。踩过两次：
+                            #   ① aclose() 排第一 → 记账永远跑不到（ccf5e1e 修）
+                            #   ② append_usage 排在记账前、且 except Exception 抓
+                            #      不住 CancelledError（3.8 起它继承 BaseException）
+                            #      → 取消时从 usage 那里穿透，finally 直接中断，
+                            #      记账照样跑不到（4b065bc 的兜底补记暴露的就是这条）
                             usage_obj = usage_obj or {}
-                            if _stream_ok:
-                                health_state.record_success(f"{provider.name}||{requested}")
-                                logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
-                                # 记录流式用量：上游 usage 可能在最后一个 chunk 里，不限 stream_options.include_usage
-                                if usage_obj:
-                                    try:
+                            pt = usage_obj.get("prompt_tokens", 0) or 0
+                            ct = usage_obj.get("completion_tokens", 0) or 0
+                            try:
+                                await _record_safely(
+                                    trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+                                    provider=provider.name, upstream_model=actual_model, stream=True,
+                                    ok=_stream_ok, status_code=200 if _stream_ok else None,
+                                    attempts=attempts,
+                                    latency_ms=int((time.time() - started) * 1000),
+                                    prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
+                                    error=None if _stream_ok else "流未正常结束（客户端断开或上游截断）",
+                                )
+                            except BaseException:
+                                # 取消异常不能把后面的清理也带走；原始异常仍会
+                                # 在 finally 结束后继续传播
+                                pass
+                            try:
+                                if _stream_ok:
+                                    health_state.record_success(f"{provider.name}||{requested}")
+                                    logger.info("\033[32m✓ 成功: %s · %s\033[0m", provider.name, actual_model)
+                                    # 记录流式用量：上游 usage 可能在最后一个 chunk 里，不限 stream_options.include_usage
+                                    if usage_obj:
                                         await append_usage(
                                             provider=provider.name,
                                             model=requested,
-                                            prompt_tokens=usage_obj.get("prompt_tokens", 0) or 0,
-                                            completion_tokens=usage_obj.get("completion_tokens", 0) or 0,
+                                            prompt_tokens=pt,
+                                            completion_tokens=ct,
                                             total_tokens=usage_obj.get("total_tokens", 0) or 0,
                                             upstream_model=actual_model,
                                         )
-                                    except Exception as e:
-                                        logger.warning(f"Failed to record stream usage: {e}")
-                            else:
-                                health_state.record_fail(f"{provider.name}||{requested}")
-                                logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
-                            pt = usage_obj.get("prompt_tokens", 0) or 0
-                            ct = usage_obj.get("completion_tokens", 0) or 0
-                            await _record_safely(
-                                trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
-                                provider=provider.name, upstream_model=actual_model, stream=True,
-                                ok=_stream_ok, status_code=200 if _stream_ok else None,
-                                attempts=attempts,
-                                latency_ms=int((time.time() - started) * 1000),
-                                prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
-                                error=None if _stream_ok else "流未正常结束（客户端断开或上游截断）",
-                            )
-                            if vkey_id:
-                                try:
+                                else:
+                                    health_state.record_fail(f"{provider.name}||{requested}")
+                                    logger.warning("\033[91m✗ 流中断: %s · %s\033[0m", provider.name, actual_model)
+                                if vkey_id:
                                     add_tokens(vkey_id, pt + ct)
-                                except asyncio.CancelledError:
-                                    pass
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as e:
+                                logger.warning(f"Failed to record stream usage: {e}")
                             for _conn in (upstream, stream_client):
                                 if _conn is None:
                                     continue
@@ -788,6 +796,17 @@ async def forward_chat(
                     usage = result.get("usage") or {}
                     pt = usage.get("prompt_tokens", 0) or 0
                     ct = usage.get("completion_tokens", 0) or 0
+                    # 先记账：理由同流式 finally，取消态下排在 await 后面就会被吞
+                    try:
+                        await _record_safely(
+                            trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
+                            provider=provider.name, upstream_model=actual_model, stream=False,
+                            ok=True, status_code=response.status_code, attempts=attempts,
+                            latency_ms=int((time.time() - started) * 1000),
+                            prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
+                        )
+                    except BaseException:
+                        pass
                     # 记录用量
                     try:
                         if usage:
@@ -799,19 +818,14 @@ async def forward_chat(
                                 total_tokens=usage.get("total_tokens", 0) or 0,
                                 upstream_model=actual_model,
                             )
+                    except asyncio.CancelledError:
+                        pass
                     except Exception as e:
                         logger.warning(f"Failed to record usage: {e}")
                     if cache_key is not None:
                         cached_value = dict(result)
                         cached_value["_fg_meta"] = {"provider": provider.name, "model": actual_model}
                         cache_service.put(cache_key, cached_value)
-                    await _record_safely(
-                        trace_id=trace_id, requested_model=requested_model, endpoint=endpoint,
-                        provider=provider.name, upstream_model=actual_model, stream=False,
-                        ok=True, status_code=response.status_code, attempts=attempts,
-                        latency_ms=int((time.time() - started) * 1000),
-                        prompt_tokens=pt, completion_tokens=ct, api_key_name=api_key_name,
-                    )
                     if vkey_id:
                         add_tokens(vkey_id, pt + ct)
                     return JSONResponse(result, status_code=response.status_code)
