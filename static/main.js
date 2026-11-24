@@ -210,10 +210,10 @@
         const r = await apiFetch('/api/providers');
         const list = await r.json();
         // 「上游提供商」列表排序，三级键：
-        //   ① 可用的排最前。不可用口径与卡片红名一致：上游报错、模型列表为空，
+        //   ① 已开启的排在关闭的之前。「已开启」= 卡片左侧那个检测开关没关
+        //      （check_enabled !== false）；关闭的家不参与巡检，平时也不看。
+        //   ② 可用的排前面。不可用口径与卡片红名一致：上游报错、模型列表为空，
         //      或所有模型都被探测为失败；从未探测过的一律算可用（没数据不等于不能用）。
-        //   ② 已开启的排在关闭的之前。「已开启」= 卡片左侧那个检测开关没关
-        //      （check_enabled !== false），关闭的家不参与巡检，平时也不看。
         //   ③ 同档内按中文正序（拼音）排，英文按字母。
         const _badStatus = new Set(['fail', 'error', 'deleted']);
         const _isUsableProvider = p => {
@@ -226,8 +226,8 @@
         const _isEnabledProvider = p => p.check_enabled !== false;
         const _zhCollator = new Intl.Collator('zh-Hans-CN');
         list.sort((a, b) =>
-          (_isUsableProvider(b) ? 1 : 0) - (_isUsableProvider(a) ? 1 : 0)
-          || (_isEnabledProvider(b) ? 1 : 0) - (_isEnabledProvider(a) ? 1 : 0)
+          (_isEnabledProvider(b) ? 1 : 0) - (_isEnabledProvider(a) ? 1 : 0)
+          || (_isUsableProvider(b) ? 1 : 0) - (_isUsableProvider(a) ? 1 : 0)
           || _zhCollator.compare(a.name || '', b.name || '')
         );
         data = [];
@@ -1436,6 +1436,8 @@
             else bCheck.title = '已关闭检测，请先打开左侧开关';
           }
         }
+        // 排序第一优先级就是这个开关，保存成功后立刻重排，别等下一轮 200 s 轮询
+        await load();
       } catch (e) {
         if (e.message !== 'Unauthorized') {
           console.error('toggleProviderCheck failed:', e);
